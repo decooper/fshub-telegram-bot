@@ -210,7 +210,7 @@ def send_weekly_top():
 
 def send_flight_invitation():
     message = (
-        "🛫 <b>СОВМЕСТНЫЙ ПОЛЁТ</b>\n\n"
+        "🛫 <b>СОВМЕСТНЫЙ ПОЛЁТ В СУББОТУ!</b>\n\n"
         "⏰ <b>Время:</b> сегодня, договариваемся в комментариях\n"
         "🌍 <b>Отличное время для всех:</b>\n"
         "   • Москва — 10:00 утра ☀️\n"
@@ -220,7 +220,7 @@ def send_flight_invitation():
         "Кто присоединится? 👇"
     )
     send_to_telegram(message)
-    print("[SCHEDULER] Flight invitation sent")
+    print("[SCHEDULER] Saturday flight invitation sent")
 
 def send_challenge():
     message = (
@@ -417,10 +417,19 @@ def setup_telegram_webhook():
 # ───────────────────────────────────────────
 
 scheduler = BackgroundScheduler()
+
+# Ежедневная статистика в 21:00 UTC
 scheduler.add_job(func=send_daily_stats, trigger="cron", hour=21, minute=0)
+
+# Еженедельный топ пилотов в воскресенье в 12:00 UTC
 scheduler.add_job(func=send_weekly_top, trigger="cron", day_of_week="sun", hour=12, minute=0)
-scheduler.add_job(func=send_flight_invitation, trigger="cron", hour=7, minute=0)
+
+# Приглашение на совместный полёт — ТОЛЬКО ПО СУББОТАМ в 07:00 UTC
+scheduler.add_job(func=send_flight_invitation, trigger="cron", day_of_week="sat", hour=7, minute=0)
+
+# Челлендж на неделю (каждый понедельник в 08:00 UTC)
 scheduler.add_job(func=send_challenge, trigger="cron", day_of_week="mon", hour=8, minute=0)
+
 scheduler.start()
 
 # ───────────────────────────────────────────
