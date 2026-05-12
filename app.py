@@ -187,12 +187,11 @@ def send_weekly_top():
 def send_flight_invitation():
     message = (
         "🛫 <b>СОВМЕСТНЫЙ ПОЛЁТ</b>\n\n"
-        "⏰ <b>Время:</b> сегодня, договариваемся в комментариях\n"
-        "🌍 <b>Отличное время для всех:</b>\n"
+        "⏰ <b>Время:</b> отличное время для полёта \n"
         "   • Москва — 10:00 утра ☀️\n"
         "   • Камчатка — 19:00 вечера 🌙\n\n"
         "✈️ <b>Куда полетим?</b>\n"
-        "Предлагайте маршруты в комментариях!\n\n"
+        "Предлагайте маршрут!\n\n"
         "Кто присоединится? 👇"
     )
     send_to_telegram(message)
@@ -276,7 +275,7 @@ def handle_departure(data):
     departure = plan.get('departure', '????')
     arrival = plan.get('arrival', '????')
     
-    message = f"🛫 <b>РЕЙС НАЧАЛСЯ</b>\n\n👨‍✈️ {pilot}\n🆔 {flight_no}\n🗺 {departure} → {arrival}"
+    message = f"🛫 <b>DEPARTURE</b>\n\n👨‍✈️ {pilot}\n🆔 {flight_no}\n🗺 {departure} → {arrival}"
     send_to_telegram(message)
 
 def handle_arrival(data):
@@ -298,7 +297,7 @@ def handle_arrival(data):
     if len(stats['flights']) > 500:
         stats['flights'] = stats['flights'][-500:]
     
-    message = f"🛬 <b>РЕЙС ЗАВЕРШЁН</b> {emoji}\n\n👨‍✈️ {pilot}\n🆔 {flight_no}\n🗺 {departure} → {arrival}\n📊 {landing_rate} fpm — {rating}"
+    message = f"🛬 <b>ARRIVAL</b> {emoji}\n\n👨‍✈️ {pilot}\n🆔 {flight_no}\n🗺 {departure} → {arrival}\n📊 {landing_rate} fpm — {rating}"
     send_to_telegram(message)
 
 def handle_screenshots(data):
