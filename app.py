@@ -1,3 +1,4 @@
+# v2 - polling enabled
 from flask import Flask, request, jsonify
 import requests
 import os
