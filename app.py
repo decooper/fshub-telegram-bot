@@ -78,63 +78,47 @@ def get_top_pilots():
     sorted_pilots = sorted(pilot_counts.items(), key=lambda x: x[1], reverse=True)[:10]
 
     if not sorted_pilots:
-        return (
-            "╔══════════════════════════╗\n"
-            "║   🏆 ТОП ПИЛОТОВ НЕДЕЛИ   ║\n"
-            "╚══════════════════════════╝\n\n"
-            "📭 За эту неделю рейсов пока нет."
-        )
+        return "🏆 <b>Топ пилотов недели</b>\n\nПока нет рейсов за эту неделю."
 
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     lines = []
     for i, (pilot, count) in enumerate(sorted_pilots, 1):
-        medal = medals.get(i, f"  {i}.")
+        medal = medals.get(i, f"{i}.")
         word = "рейс" if count == 1 else "рейса" if count in (2, 3, 4) else "рейсов"
         lines.append(f"{medal} <b>{pilot}</b> — {count} {word}")
 
-    return (
-        "╔══════════════════════════╗\n"
-        "║   🏆 ТОП ПИЛОТОВ НЕДЕЛИ   ║\n"
-        "╚══════════════════════════╝\n\n"
-        + "\n".join(lines)
-    )
+    return "🏆 <b>Топ пилотов недели</b>\n\n" + "\n".join(lines)
+
 
 def get_last_flights(limit=5):
     with stats_lock:
         recent = stats['flights'][-limit:][::-1]
 
     if not recent:
-        return (
-            "╔══════════════════════════╗\n"
-            "║    ✈️  ПОСЛЕДНИЕ РЕЙСЫ    ║\n"
-            "╚══════════════════════════╝\n\n"
-            "📭 Завершённых рейсов пока нет."
-        )
+        return "✈️ <b>Последние рейсы</b>\n\nЗавершённых рейсов пока нет."
 
     lines = []
     for flight in recent:
         rate = flight['landing_rate']
-        if rate < -300:
+        if rate < -600:
+            rating = "💥 Катастрофа"
+        elif rate < -400:
             rating = "⚠️ Жёсткая"
-        elif rate < -200:
+        elif rate < -300:
             rating = "🟡 Средняя"
-        elif rate > -50:
-            rating = "🌟 Идеальная"
-        else:
+        elif rate < -50:
             rating = "👍 Хорошая"
+        else:
+            rating = "🌟 Идеальная"
 
         lines.append(
-            f"┌ ✈️ <b>{flight['flight_no']}</b> · {flight['pilot']}\n"
-            f"├ 🛫 {flight['departure']} → {flight['arrival']}\n"
-            f"└ 📊 {rate} fpm — {rating}"
+            f"✈️ <b>{flight['flight_no']}</b> · {flight['pilot']}\n"
+            f"🛫 {flight['departure']} → {flight['arrival']}\n"
+            f"📊 {rate} fpm — {rating}"
         )
 
-    return (
-        "╔══════════════════════════╗\n"
-        "║    ✈️  ПОСЛЕДНИЕ РЕЙСЫ    ║\n"
-        "╚══════════════════════════╝\n\n"
-        + "\n\n".join(lines)
-    )
+    return "✈️ <b>Последние рейсы</b>\n\n" + "\n\n".join(lines)
+
 
 def get_stats():
     with stats_lock:
@@ -146,9 +130,7 @@ def get_stats():
     avg_rate = round(sum(rates) / len(rates)) if rates else 0
 
     return (
-        "╔══════════════════════════╗\n"
-        "║    📊 СТАТИСТИКА VA UP!   ║\n"
-        "╚══════════════════════════╝\n\n"
+        "📊 <b>Статистика VA UP!</b>\n\n"
         f"🛬 Всего рейсов: <b>{total}</b>\n"
         f"📅 За неделю: <b>{week_count}</b>\n"
         f"📐 Средняя посадка: <b>{avg_rate} fpm</b>"
@@ -160,37 +142,34 @@ def get_stats():
 
 def format_flight_departed(data):
     d = data.get('_data', {})
-    pilot_name = d.get('user', {}).get('name', 'Неизвестный пилот')
-    plan       = d.get('plan', {})
-    aircraft   = d.get('aircraft', {})
-    airport    = d.get('airport', {})
-
-    flight_no    = plan.get('flight_no', 'N/A')
-    departure    = plan.get('departure', '????')
-    arrival      = plan.get('arrival', '????')
+    pilot_name    = d.get('user', {}).get('name', 'Неизвестный пилот')
+    plan          = d.get('plan', {})
+    aircraft      = d.get('aircraft', {})
+    airport       = d.get('airport', {})
+    flight_no     = plan.get('flight_no', 'N/A')
+    departure     = plan.get('departure', '????')
+    arrival       = plan.get('arrival', '????')
     aircraft_name = aircraft.get('icao_name') or aircraft.get('icao', 'N/A')
-    airport_name = airport.get('name', departure)
+    airport_name  = airport.get('name', departure)
 
     return (
-        "╔══════════════════════════╗\n"
-        "║     🛫  РЕЙС НАЧАЛСЯ     ║\n"
-        "╚══════════════════════════╝\n\n"
-        f"👨‍✈️ Пилот:    <b>{pilot_name}</b>\n"
-        f"🆔 Рейс:     <b>{flight_no}</b>\n"
-        f"🗺 Маршрут:  <b>{departure} → {arrival}</b>\n"
-        f"✈️ Борт:     <b>{aircraft_name}</b>\n"
+        "🛫 <b>DEPARTURE</b>\n\n"
+        f"👨‍✈️ Пилот: <b>{pilot_name}</b>\n"
+        f"🆔 Рейс: <b>{flight_no}</b>\n"
+        f"🗺 Маршрут: <b>{departure} → {arrival}</b>\n"
+        f"✈️ Борт: <b>{aircraft_name}</b>\n"
         f"📍 Вылет из: <b>{airport_name}</b>\n\n"
         f"🕒 {datetime.utcnow().strftime('%H:%M UTC')}"
     )
 
+
 def format_flight_arrived(data):
     d = data.get('_data', {})
-    pilot_name   = d.get('user', {}).get('name', 'Неизвестный пилот')
-    plan         = d.get('plan', {})
-    aircraft     = d.get('aircraft', {})
-    airport      = d.get('airport', {})
-    landing_rate = d.get('landing_rate', 0)
-
+    pilot_name    = d.get('user', {}).get('name', 'Неизвестный пилот')
+    plan          = d.get('plan', {})
+    aircraft      = d.get('aircraft', {})
+    airport       = d.get('airport', {})
+    landing_rate  = d.get('landing_rate', 0)
     flight_no     = plan.get('flight_no', 'N/A')
     departure     = plan.get('departure', '????')
     arrival       = plan.get('arrival', '????')
@@ -209,29 +188,28 @@ def format_flight_arrived(data):
         if len(stats['flights']) > 200:
             stats['flights'] = stats['flights'][-200:]
 
-    if landing_rate < -500:
-        rating = "💥 Катастрофа!"
-    elif landing_rate < -300:
+    if landing_rate < -600:
+        rating = "💥 Катастрофа"
+    elif landing_rate < -400:
         rating = "⚠️ Жёсткая"
-    elif landing_rate < -200:
+    elif landing_rate < -300:
         rating = "🟡 Средняя"
     elif landing_rate < -50:
         rating = "👍 Хорошая"
     else:
-        rating = "🌟 Идеальная!"
+        rating = "🌟 Идеальная"
 
     return (
-        "╔══════════════════════════╗\n"
-        "║    🛬  РЕЙС ЗАВЕРШЁН     ║\n"
-        "╚══════════════════════════╝\n\n"
-        f"👨‍✈️ Пилот:    <b>{pilot_name}</b>\n"
-        f"🆔 Рейс:     <b>{flight_no}</b>\n"
-        f"🗺 Маршрут:  <b>{departure} → {arrival}</b>\n"
-        f"✈️ Борт:     <b>{aircraft_name}</b>\n"
+        "🛬 <b>ARRIVAL</b>\n\n"
+        f"👨‍✈️ Пилот: <b>{pilot_name}</b>\n"
+        f"🆔 Рейс: <b>{flight_no}</b>\n"
+        f"🗺 Маршрут: <b>{departure} → {arrival}</b>\n"
+        f"✈️ Борт: <b>{aircraft_name}</b>\n"
         f"📍 Прилёт в: <b>{airport_name}</b>\n"
-        f"📊 Посадка:  <b>{landing_rate} fpm</b> — {rating}\n\n"
+        f"📊 Посадка: <b>{landing_rate} fpm</b> — {rating}\n\n"
         f"🕒 {datetime.utcnow().strftime('%H:%M UTC')}"
     )
+
 
 def format_screenshots(data):
     screenshots = data.get('_data', [])
@@ -281,21 +259,17 @@ def poll_telegram():
 
             if text == '/start':
                 send_to_user(chat_id,
-                    "╔══════════════════════════╗\n"
-                    "║    ✈️  VA UP! BOT         ║\n"
-                    "╚══════════════════════════╝\n\n"
-                    "Привет! Я бот виртуальной авиакомпании <b>UP!</b>\n\n"
+                    "✈️ <b>VA UP! Bot</b>\n\n"
+                    "Привет! Я бот виртуальной авиакомпании UP!\n\n"
                     "Используй /help для списка команд."
                 )
             elif text == '/help':
                 send_to_user(chat_id,
-                    "╔══════════════════════════╗\n"
-                    "║      🤖 КОМАНДЫ БОТА      ║\n"
-                    "╚══════════════════════════╝\n\n"
+                    "🤖 <b>Команды бота</b>\n\n"
                     "/top — 🏆 топ пилотов недели\n"
                     "/last — ✈️ последние 5 рейсов\n"
                     "/stats — 📊 общая статистика\n"
-                    "/help — 🆘 эта справка"
+                    "/help — эта справка"
                 )
             elif text == '/top':
                 send_to_user(chat_id, get_top_pilots())
@@ -306,6 +280,7 @@ def poll_telegram():
 
     except Exception as e:
         print(f"[POLL ERROR] {e}")
+
 
 def start_polling():
     while True:
