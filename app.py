@@ -3,6 +3,7 @@ import requests
 import os
 import threading
 import time
+import traceback
 from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -19,6 +20,9 @@ CHAT_ID = os.environ.get('TG_CHAT_ID')
 if not BOT_TOKEN or not CHAT_ID:
     print("❌ Ошибка: не заданы BOT_TOKEN или CHAT_ID")
     exit(1)
+
+print(f"[CONFIG] BOT_TOKEN: {BOT_TOKEN[:10]}... (скрыто)")
+print(f"[CONFIG] CHAT_ID: {CHAT_ID}")
 
 # ───────────────────────────────────────────
 # STATE (в памяти, для одного процесса)
@@ -37,12 +41,13 @@ def send_to_telegram(message):
     
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={
+        response = requests.post(url, json={
             "chat_id": CHAT_ID,
             "text": message,
             "parse_mode": "HTML"
         }, timeout=10)
-        return True
+        print(f"[TG SENT] Status: {response.status_code}")
+        return response.status_code == 200
     except Exception as e:
         print(f"[TG ERROR] {e}")
         return False
@@ -89,12 +94,13 @@ def send_to_user(chat_id, text):
     
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={
+        response = requests.post(url, json={
             "chat_id": chat_id,
             "text": text,
             "parse_mode": "HTML"
         }, timeout=10)
-        return True
+        print(f"[USER MSG SENT] Status: {response.status_code}")
+        return response.status_code == 200
     except Exception as e:
         print(f"[USER MSG ERROR] {e}")
         return False
@@ -104,9 +110,9 @@ def send_to_user(chat_id, text):
 # ───────────────────────────────────────────
 
 def get_landing_rating(rate):
-    if rate < -1000:
+    if rate < -600:
         return "💥 Катастрофа", "💀"
-    elif rate < -600:
+    elif rate < -400:
         return "⚠️ Жёсткая", "😬"
     elif rate < -300:
         return "🟡 Средняя", "🤔"
@@ -210,14 +216,14 @@ def send_weekly_top():
 
 def send_flight_invitation():
     message = (
-        "🛫 <b>СУББОТНЯЯ БАМБАЛЕЙЛА!</b>\n\n"
-        "⏰ <b>Время:</b> то что надо\n"
-        "🌍 <b>Отличное время для полёта:</b>\n"
+        "🛫 <b>СОВМЕСТНЫЙ ПОЛЁТ В СУББОТУ!</b>\n\n"
+        "⏰ <b>Время:</b> сегодня, договариваемся в комментариях\n"
+        "🌍 <b>Отличное время для всех:</b>\n"
         "   • Москва — 10:00 утра ☀️\n"
         "   • Камчатка — 19:00 вечера 🌙\n\n"
         "✈️ <b>Куда полетим?</b>\n"
-        "Предлагайте маршрут!\n\n"
-        "Кто полетит? 👇"
+        "Предлагайте маршруты в комментариях!\n\n"
+        "Кто присоединится? 👇"
     )
     send_to_telegram(message)
     print("[SCHEDULER] Saturday flight invitation sent")
@@ -233,132 +239,199 @@ def send_challenge():
     print("[SCHEDULER] Challenge sent")
 
 # ───────────────────────────────────────────
-# WEBHOOK EVENTS
+# WEBHOOK EVENTS (С ДЕТАЛЬНЫМ ЛОГИРОВАНИЕМ)
 # ───────────────────────────────────────────
 
-@app.route('/webhook', methods=['POST'])
+@app.route('/webhook', methods=['GET', 'POST'])
 def fshub_webhook():
+    # Логируем каждый запрос
+    print(f"[WEBHOOK] === НОВЫЙ ЗАПРОС ===")
+    print(f"[WEBHOOK] Method: {request.method}")
+    print(f"[WEBHOOK] Headers: {dict(request.headers)}")
+    
+    # GET-запросы — для проверки работоспособности
+    if request.method == 'GET':
+        print("[WEBHOOK] GET request received, returning OK")
+        return jsonify({"status": "ok", "message": "Webhook is active"}), 200
+    
+    # Обработка POST-запросов
     try:
+        # Пробуем получить JSON
         data = request.get_json()
+        print(f"[WEBHOOK] Raw data type: {type(data)}")
+        print(f"[WEBHOOK] Raw data: {str(data)[:500]}")  # первые 500 символов
+        
         if not data:
+            print("[WEBHOOK] No JSON data, returning 400")
             return jsonify({"error": "no data"}), 400
 
         event_type = data.get('_type')
         print(f"[FSHUB EVENT] {event_type}")
-
+        
+        # Обработка по типу события
         if event_type == 'flight.departed':
+            print("[WEBHOOK] Calling handle_departure")
             handle_departure(data)
+            print("[WEBHOOK] handle_departure completed")
+            
         elif event_type == 'flight.arrived':
+            print("[WEBHOOK] Calling handle_arrival")
             handle_arrival(data)
+            print("[WEBHOOK] handle_arrival completed")
+            
         elif event_type == 'screenshots.uploaded':
+            print("[WEBHOOK] Calling handle_screenshots")
             handle_screenshots(data)
+            print("[WEBHOOK] handle_screenshots completed")
+            
         elif event_type == 'airline.achievement':
+            print("[WEBHOOK] Calling handle_achievement")
             handle_achievement(data)
+            print("[WEBHOOK] handle_achievement completed")
+            
+        else:
+            print(f"[WEBHOOK] Unknown event type: {event_type}")
 
+        print("[WEBHOOK] Request processed successfully, returning 200")
         return jsonify({"ok": True}), 200
+        
     except Exception as e:
-        print(f"[WEBHOOK ERROR] {e}")
+        # Логируем ошибку с подробностями
+        print(f"[WEBHOOK CRITICAL ERROR] {type(e).__name__}: {e}")
+        print("[WEBHOOK] Traceback:")
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 def handle_departure(data):
-    d = data.get('_data', {})
-    pilot = d.get('user', {}).get('name', 'Пилот')
-    plan = d.get('plan', {})
-    flight_no = plan.get('flight_no', 'N/A')
-    departure = plan.get('departure', '????')
-    arrival = plan.get('arrival', '????')
-    aircraft = d.get('aircraft', {}).get('icao_name', 'N/A')
-    
-    message = (
-        f"🛫 <b>DEPARTURE</b>\n\n"
-        f"👨‍✈️ Пилот: <b>{pilot}</b>\n"
-        f"🆔 Рейс: <b>{flight_no}</b>\n"
-        f"🗺 Маршрут: <b>{departure} → {arrival}</b>\n"
-        f"✈️ Борт: <b>{aircraft}</b>\n\n"
-        f"🕒 {datetime.utcnow().strftime('%H:%M UTC')}"
-    )
-    send_to_telegram(message)
+    try:
+        d = data.get('_data', {})
+        print(f"[DEPARTURE] Raw _data: {d}")
+        
+        pilot = d.get('user', {}).get('name', 'Пилот')
+        plan = d.get('plan', {})
+        flight_no = plan.get('flight_no', 'N/A')
+        departure = plan.get('departure', '????')
+        arrival = plan.get('arrival', '????')
+        aircraft = d.get('aircraft', {}).get('icao_name', 'N/A')
+        
+        print(f"[DEPARTURE] Pilot: {pilot}, Flight: {flight_no}, Route: {departure}->{arrival}")
+        
+        message = (
+            f"🛫 <b>РЕЙС НАЧАЛСЯ</b>\n\n"
+            f"👨‍✈️ Пилот: <b>{pilot}</b>\n"
+            f"🆔 Рейс: <b>{flight_no}</b>\n"
+            f"🗺 Маршрут: <b>{departure} → {arrival}</b>\n"
+            f"✈️ Борт: <b>{aircraft}</b>\n\n"
+            f"🕒 {datetime.utcnow().strftime('%H:%M UTC')}"
+        )
+        send_to_telegram(message)
+    except Exception as e:
+        print(f"[DEPARTURE ERROR] {e}")
+        traceback.print_exc()
 
 def handle_arrival(data):
-    d = data.get('_data', {})
-    pilot = d.get('user', {}).get('name', 'Пилот')
-    plan = d.get('plan', {})
-    flight_no = plan.get('flight_no', 'N/A')
-    departure = plan.get('departure', '????')
-    arrival = plan.get('arrival', '????')
-    landing_rate = d.get('landing_rate', 0)
-    aircraft = d.get('aircraft', {}).get('icao_name', 'N/A')
-    airport = d.get('airport', {}).get('name', arrival)
-    flight_id = d.get('id')
-    
-    rating, emoji = get_landing_rating(landing_rate)
-    
-    with stats_lock:
-        stats['flights'].append({
-            'pilot': pilot,
-            'flight_no': flight_no,
-            'departure': departure,
-            'arrival': arrival,
-            'landing_rate': landing_rate,
-            'date': datetime.now(),
-            'flight_id': flight_id
-        })
-        if len(stats['flights']) > 500:
-            stats['flights'] = stats['flights'][-500:]
-    
-    message = (
-        f"🛬 <b>ARRIVAL</b> {emoji}\n\n"
-        f"👨‍✈️ Пилот: <b>{pilot}</b>\n"
-        f"🆔 Рейс: <b>{flight_no}</b>\n"
-        f"🗺 Маршрут: <b>{departure} → {arrival}</b>\n"
-        f"✈️ Борт: <b>{aircraft}</b>\n"
-        f"📍 Прилёт: <b>{airport}</b>\n"
-        f"📊 Посадка: <b>{landing_rate} fpm</b> — {rating}\n\n"
-        f"🕒 {datetime.utcnow().strftime('%H:%M UTC')}"
-    )
-    send_to_telegram(message)
+    try:
+        d = data.get('_data', {})
+        print(f"[ARRIVAL] Raw _data keys: {list(d.keys())}")
+        
+        pilot = d.get('user', {}).get('name', 'Пилот')
+        plan = d.get('plan', {})
+        flight_no = plan.get('flight_no', 'N/A')
+        departure = plan.get('departure', '????')
+        arrival = plan.get('arrival', '????')
+        landing_rate = d.get('landing_rate', 0)
+        aircraft = d.get('aircraft', {}).get('icao_name', 'N/A')
+        airport = d.get('airport', {}).get('name', arrival)
+        flight_id = d.get('id')
+        
+        rating, emoji = get_landing_rating(landing_rate)
+        
+        print(f"[ARRIVAL] Pilot: {pilot}, Flight: {flight_no}, Landing rate: {landing_rate}")
+        
+        with stats_lock:
+            stats['flights'].append({
+                'pilot': pilot,
+                'flight_no': flight_no,
+                'departure': departure,
+                'arrival': arrival,
+                'landing_rate': landing_rate,
+                'date': datetime.now(),
+                'flight_id': flight_id
+            })
+            if len(stats['flights']) > 500:
+                stats['flights'] = stats['flights'][-500:]
+        
+        message = (
+            f"🛬 <b>РЕЙС ЗАВЕРШЁН</b> {emoji}\n\n"
+            f"👨‍✈️ Пилот: <b>{pilot}</b>\n"
+            f"🆔 Рейс: <b>{flight_no}</b>\n"
+            f"🗺 Маршрут: <b>{departure} → {arrival}</b>\n"
+            f"✈️ Борт: <b>{aircraft}</b>\n"
+            f"📍 Прилёт: <b>{airport}</b>\n"
+            f"📊 Посадка: <b>{landing_rate} fpm</b> — {rating}\n\n"
+            f"🕒 {datetime.utcnow().strftime('%H:%M UTC')}"
+        )
+        send_to_telegram(message)
+    except Exception as e:
+        print(f"[ARRIVAL ERROR] {e}")
+        traceback.print_exc()
 
 def handle_screenshots(data):
-    screenshots = data.get('_data', [])
-    if not screenshots:
-        return
-    
-    first = screenshots[0]
-    flight_id = first.get('flight_id')
-    
-    # Пытаемся найти рейс в сохранённой статистике
-    flight_info = None
-    with stats_lock:
-        for f in stats['flights']:
-            if str(f.get('flight_id')) == str(flight_id):
-                flight_info = f
-                break
-    
-    if flight_info:
-        pilot = flight_info.get('pilot', 'Пилот')
-        dep = flight_info.get('departure', '???')
-        arr = flight_info.get('arrival', '???')
-        flight_no = flight_info.get('flight_no', flight_id)
-        caption = f"📸 <b>Скриншот рейса {flight_no}</b>\n✈️ {dep} → {arr}\n👨‍✈️ {pilot}"
-    else:
-        caption = f"📸 <b>Скриншот рейса #{flight_id}</b>"
-    
-    for scr in screenshots[:3]:
-        image_url = scr.get('screenshot_url')
-        if image_url:
-            send_photo(image_url, caption)
-            time.sleep(1)
-    
-    if len(screenshots) > 3:
-        send_to_telegram(f"📸 <b>И ещё {len(screenshots) - 3} скриншотов</b> к рейсу #{flight_id}")
+    try:
+        screenshots = data.get('_data', [])
+        print(f"[SCREENSHOTS] Count: {len(screenshots)}")
+        
+        if not screenshots:
+            return
+        
+        first = screenshots[0]
+        flight_id = first.get('flight_id')
+        print(f"[SCREENSHOTS] Flight ID: {flight_id}")
+        
+        # Пытаемся найти рейс в сохранённой статистике
+        flight_info = None
+        with stats_lock:
+            for f in stats['flights']:
+                if str(f.get('flight_id')) == str(flight_id):
+                    flight_info = f
+                    break
+        
+        if flight_info:
+            pilot = flight_info.get('pilot', 'Пилот')
+            dep = flight_info.get('departure', '???')
+            arr = flight_info.get('arrival', '???')
+            flight_no = flight_info.get('flight_no', flight_id)
+            caption = f"📸 <b>Скриншот рейса {flight_no}</b>\n✈️ {dep} → {arr}\n👨‍✈️ {pilot}"
+        else:
+            caption = f"📸 <b>Скриншот рейса #{flight_id}</b>"
+        
+        print(f"[SCREENSHOTS] Caption: {caption[:100]}...")
+        
+        for scr in screenshots[:3]:
+            image_url = scr.get('screenshot_url')
+            if image_url:
+                print(f"[SCREENSHOTS] Sending photo: {image_url[:100]}...")
+                send_photo(image_url, caption)
+                time.sleep(1)
+        
+        if len(screenshots) > 3:
+            send_to_telegram(f"📸 <b>И ещё {len(screenshots) - 3} скриншотов</b> к рейсу #{flight_id}")
+    except Exception as e:
+        print(f"[SCREENSHOTS ERROR] {e}")
+        traceback.print_exc()
 
 def handle_achievement(data):
-    d = data.get('_data', {})
-    achievement = d.get('achievement', {})
-    flight = d.get('flight', {})
-    pilot = flight.get('user', {}).get('name', 'Пилот')
-    title = achievement.get('title', 'Достижение')
-    send_to_telegram(f"🏆 <b>АЧИВКА!</b>\n\n👨‍✈️ {pilot}\n🎯 {title}\n\nПоздравляем!")
+    try:
+        d = data.get('_data', {})
+        achievement = d.get('achievement', {})
+        flight = d.get('flight', {})
+        pilot = flight.get('user', {}).get('name', 'Пилот')
+        title = achievement.get('title', 'Достижение')
+        print(f"[ACHIEVEMENT] Pilot: {pilot}, Title: {title}")
+        send_to_telegram(f"🏆 <b>ДОСТИЖЕНИЕ!</b>\n\n👨‍✈️ {pilot}\n🎯 {title}\n\nПоздравляем!")
+    except Exception as e:
+        print(f"[ACHIEVEMENT ERROR] {e}")
+        traceback.print_exc()
 
 # ───────────────────────────────────────────
 # TELEGRAM WEBHOOK (COMMANDS)
@@ -374,6 +447,8 @@ def telegram_webhook():
         message = data['message']
         chat_id = message.get('chat', {}).get('id')
         text = message.get('text', '')
+        
+        print(f"[TG_COMMAND] Chat: {chat_id}, Text: {text}")
         
         if not chat_id or str(chat_id) == str(CHAT_ID):
             return jsonify({"ok": True}), 200
@@ -391,7 +466,8 @@ def telegram_webhook():
         
         return jsonify({"ok": True}), 200
     except Exception as e:
-        print(f"[TG WEBHOOK ERROR] {e}")
+        print(f"[TG COMMAND ERROR] {e}")
+        traceback.print_exc()
         return jsonify({"ok": True}), 200
 
 @app.route('/')
@@ -408,7 +484,7 @@ def setup_telegram_webhook():
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={webhook_url}"
     try:
         response = requests.get(url, timeout=10)
-        print(f"[TG WEBHOOK] {response.json()}")
+        print(f"[TG WEBHOOK SETUP] {response.json()}")
     except Exception as e:
         print(f"[TG WEBHOOK ERROR] {e}")
 
@@ -431,6 +507,8 @@ scheduler.add_job(func=send_flight_invitation, trigger="cron", day_of_week="sat"
 scheduler.add_job(func=send_challenge, trigger="cron", day_of_week="mon", hour=8, minute=0)
 
 scheduler.start()
+
+print("[SCHEDULER] Запущен")
 
 # ───────────────────────────────────────────
 # START
