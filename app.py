@@ -4,6 +4,7 @@ import os
 import threading
 import time
 from datetime import datetime, timedelta
+from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 
@@ -137,6 +138,45 @@ def get_stats():
     )
 
 # ───────────────────────────────────────────
+#  АВТОМАТИЧЕСКИЕ СООБЩЕНИЯ ПО РАСПИСАНИЮ
+# ───────────────────────────────────────────
+
+def send_daily_stats():
+    """Отправляет статистику за сегодня в канал"""
+    today = datetime.now().date()
+    with stats_lock:
+        today_flights = [f for f in stats['flights'] if f['date'].date() == today]
+    
+    count = len(today_flights)
+    if count == 0:
+        message = "📊 <b>Статистика за сегодня</b>\n\n✈️ Сегодня рейсов пока нет. Время взлетать!"
+    elif count == 1:
+        message = f"📊 <b>Статистика за сегодня</b>\n\n✈️ Выполнен <b>1 рейс</b>\n🛬 Посадок: 1\n\nСпасибо пилоту за отличную работу! 👏"
+    else:
+        message = f"📊 <b>Статистика за сегодня</b>\n\n✈️ Выполнено рейсов: <b>{count}</b>\n🛬 Посадок: {count}\n\nСпасибо пилотам за отличную работу! 👏"
+    
+    send_to_telegram(message)
+    print(f"[SCHEDULER] Daily stats sent: {count} flights")
+
+def send_weekly_top():
+    """Отправляет топ пилотов недели в канал"""
+    message = get_top_pilots()
+    send_to_telegram(message)
+    print("[SCHEDULER] Weekly top sent")
+
+def send_morning_greeting():
+    """Утреннее приветствие"""
+    message = "☀️ <b>Доброе утро, пилоты UP!</b>\n\nНовый день — новые маршруты. Кто сегодня в небе?\n\n✈️ Удачных полётов!"
+    send_to_telegram(message)
+    print("[SCHEDULER] Morning greeting sent")
+
+def send_evening_greeting():
+    """Вечернее завершение дня"""
+    message = "🌙 <b>Добрый вечер, пилоты UP!</b>\n\nСпасибо за отличные полёты сегодня. Завтра новые приключения!\n\n🛬 Спокойной ночи и мягких посадок!"
+    send_to_telegram(message)
+    print("[SCHEDULER] Evening greeting sent")
+
+# ───────────────────────────────────────────
 #  ФОРМАТИРОВАНИЕ СОБЫТИЙ FSHUB
 # ───────────────────────────────────────────
 
@@ -153,7 +193,7 @@ def format_flight_departed(data):
     airport_name  = airport.get('name', departure)
 
     return (
-        "🛫 <b>DEPARTURE</b>\n\n"
+        "🛫 <b>РЕЙС НАЧАЛСЯ</b>\n\n"
         f"👨‍✈️ Пилот: <b>{pilot_name}</b>\n"
         f"🆔 Рейс: <b>{flight_no}</b>\n"
         f"🗺 Маршрут: <b>{departure} → {arrival}</b>\n"
@@ -200,7 +240,7 @@ def format_flight_arrived(data):
         rating = "🌟 Идеальная"
 
     return (
-        "🛬 <b>ARRIVAL</b>\n\n"
+        "🛬 <b>РЕЙС ЗАВЕРШЁН</b>\n\n"
         f"👨‍✈️ Пилот: <b>{pilot_name}</b>\n"
         f"🆔 Рейс: <b>{flight_no}</b>\n"
         f"🗺 Маршрут: <b>{departure} → {arrival}</b>\n"
@@ -322,5 +362,29 @@ def fshub_webhook():
 #  СТАРТ
 # ───────────────────────────────────────────
 
+# Запускаем планировщик
+scheduler = BackgroundScheduler()
+
+# Ежедневная статистика в 21:00
+scheduler.add_job(func=send_daily_stats, trigger="cron", hour=21, minute=0)
+
+# Еженедельный топ пилотов в воскресенье в 12:00
+scheduler.add_job(func=send_weekly_top, trigger="cron", day_of_week="sun", hour=12, minute=0)
+
+# Утреннее приветствие каждый день в 09:00
+scheduler.add_job(func=send_morning_greeting, trigger="cron", hour=9, minute=0)
+
+# Вечернее приветствие каждый день в 20:00
+scheduler.add_job(func=send_evening_greeting, trigger="cron", hour=20, minute=0)
+
+scheduler.start()
+print("[SCHEDULER] Запущен:")
+print("  - Утреннее приветствие: каждый день в 09:00")
+print("  - Вечернее приветствие: каждый день в 20:00")
+print("  - Статистика за день: каждый день в 21:00")
+print("  - Топ пилотов недели: каждое воскресенье в 12:00")
+
+# Запускаем polling для команд
 polling_thread = threading.Thread(target=start_polling, daemon=True)
 polling_thread.start()
+print("[BOT] Polling thread started")
