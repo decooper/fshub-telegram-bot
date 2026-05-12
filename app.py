@@ -149,9 +149,9 @@ def send_daily_stats():
     
     count = len(today_flights)
     if count == 0:
-        message = "📊 <b>Статистика за сегодня</b>\n\n✈️ Сегодня рейсов пока нет. Время взлетать!"
+        message = "📊 <b>Статистика за сегодня</b>\n\n✈️ Сегодня рейсов пока нет. Самое время поднять шасси в небо!"
     elif count == 1:
-        message = f"📊 <b>Статистика за сегодня</b>\n\n✈️ Выполнен <b>1 рейс</b>\n🛬 Посадок: 1\n\nСпасибо пилоту за отличную работу! 👏"
+        message = f"📊 <b>Статистика за сегодня</b>\n\n✈️ Выполнен <b>1 рейс</b>\n🛬 Посадок: 1\n\nСпасибо пилоту! 👏"
     else:
         message = f"📊 <b>Статистика за сегодня</b>\n\n✈️ Выполнено рейсов: <b>{count}</b>\n🛬 Посадок: {count}\n\nСпасибо пилотам за отличную работу! 👏"
     
@@ -164,17 +164,34 @@ def send_weekly_top():
     send_to_telegram(message)
     print("[SCHEDULER] Weekly top sent")
 
-def send_morning_greeting():
-    """Утреннее приветствие"""
-    message = "☀️ <b>Доброе утро, пилоты UP!</b>\n\nНовый день — новые маршруты. Кто сегодня в небе?\n\n✈️ Удачных полётов!"
+def send_flight_invitation():
+    """Отправляет приглашение к совместному полёту в 07:00 UTC (10:00 Москва / 19:00 Камчатка)"""
+    message = (
+        "🛫 <b>СОВМЕСТНЫЙ ПОЛЁТ</b>\n\n"
+        "⏰ <b>Время:</b> сегодня, договариваемся в комментариях\n"
+        "🌍 <b>Отличное время для всех:</b>\n"
+        "   • Москва — 10:00 утра ☀️\n"
+        "   • Камчатка — 19:00 вечера 🌙\n"
+        "   • Калининград — 09:00 утра ☀️\n\n"
+        "✈️ <b>Куда полетим?</b>\n"
+        "Предлагайте маршруты в комментариях!\n\n"
+        "Кто присоединится — отмечайтесь 👇\n"
+        "⬇️ Пишите, кто с нами!"
+    )
     send_to_telegram(message)
-    print("[SCHEDULER] Morning greeting sent")
+    print("[SCHEDULER] Flight invitation sent")
 
-def send_evening_greeting():
-    """Вечернее завершение дня"""
-    message = "🌙 <b>Добрый вечер, пилоты UP!</b>\n\nСпасибо за отличные полёты сегодня. Завтра новые приключения!\n\n🛬 Спокойной ночи и мягких посадок!"
+def send_challenge():
+    """Отправляет челлендж на неделю"""
+    message = (
+        "🏆 <b>НЕДЕЛЬНЫЙ ЧЕЛЛЕНДЖ VA UP!</b>\n\n"
+        "🔹 <b>Цель:</b> выполнить 3 рейса за 7 дней\n"
+        "🔹 <b>Бонус:</b> лучшая посадка недели\n"
+        "🔹 <b>Приз:</b> упоминание в топе пилотов\n\n"
+        "Кто готов принять вызов? Отмечайтесь! 💪"
+    )
     send_to_telegram(message)
-    print("[SCHEDULER] Evening greeting sent")
+    print("[SCHEDULER] Challenge sent")
 
 # ───────────────────────────────────────────
 #  ФОРМАТИРОВАНИЕ СОБЫТИЙ FSHUB
@@ -268,7 +285,7 @@ def format_screenshots(data):
             time.sleep(0.5)
 
 # ───────────────────────────────────────────
-#  POLLING TELEGRAM
+#  POLLING TELEGRAM (ИСПРАВЛЕНАЯ ВЕРСИЯ)
 # ───────────────────────────────────────────
 
 def poll_telegram():
@@ -287,7 +304,10 @@ def poll_telegram():
             return
 
         for update in data.get('result', []):
+            # Сразу обновляем ID, чтобы не обработать повторно
             with update_id_lock:
+                if update['update_id'] <= last_update_id:
+                    continue
                 last_update_id = update['update_id']
 
             message = update.get('message', {})
@@ -365,24 +385,25 @@ def fshub_webhook():
 # Запускаем планировщик
 scheduler = BackgroundScheduler()
 
-# Ежедневная статистика в 21:00
+# Ежедневная статистика в 21:00 UTC
 scheduler.add_job(func=send_daily_stats, trigger="cron", hour=21, minute=0)
 
-# Еженедельный топ пилотов в воскресенье в 12:00
+# Еженедельный топ пилотов в воскресенье в 12:00 UTC
 scheduler.add_job(func=send_weekly_top, trigger="cron", day_of_week="sun", hour=12, minute=0)
 
-# Утреннее приветствие каждый день в 09:00
-scheduler.add_job(func=send_morning_greeting, trigger="cron", hour=9, minute=0)
+# Приглашение к совместному полёту (каждый день в 07:00 UTC)
+# Москва 10:00, Камчатка 19:00, Калининград 09:00
+scheduler.add_job(func=send_flight_invitation, trigger="cron", hour=7, minute=0)
 
-# Вечернее приветствие каждый день в 20:00
-scheduler.add_job(func=send_evening_greeting, trigger="cron", hour=20, minute=0)
+# Челлендж на неделю (каждый понедельник в 08:00 UTC)
+scheduler.add_job(func=send_challenge, trigger="cron", day_of_week="mon", hour=8, minute=0)
 
 scheduler.start()
 print("[SCHEDULER] Запущен:")
-print("  - Утреннее приветствие: каждый день в 09:00")
-print("  - Вечернее приветствие: каждый день в 20:00")
-print("  - Статистика за день: каждый день в 21:00")
-print("  - Топ пилотов недели: каждое воскресенье в 12:00")
+print("  - Статистика за день: каждый день в 21:00 UTC")
+print("  - Топ пилотов недели: каждое воскресенье в 12:00 UTC")
+print("  - Приглашение к полёту: каждый день в 07:00 UTC (Москва 10:00, Камчатка 19:00)")
+print("  - Челлендж недели: каждый понедельник в 08:00 UTC")
 
 # Запускаем polling для команд
 polling_thread = threading.Thread(target=start_polling, daemon=True)
