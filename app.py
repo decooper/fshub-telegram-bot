@@ -104,9 +104,9 @@ def send_to_user(chat_id, text):
 # ───────────────────────────────────────────
 
 def get_landing_rating(rate):
-    if rate < -600:
+    if rate < -1000:
         return "💥 Катастрофа", "💀"
-    elif rate < -400:
+    elif rate < -600:
         return "⚠️ Жёсткая", "😬"
     elif rate < -300:
         return "🟡 Средняя", "🤔"
@@ -210,14 +210,14 @@ def send_weekly_top():
 
 def send_flight_invitation():
     message = (
-        "🛫 <b>СОВМЕСТНЫЙ ПОЛЁТ В СУББОТУ!</b>\n\n"
-        "⏰ <b>Время:</b> сегодня, договариваемся в комментариях\n"
-        "🌍 <b>Отличное время для всех:</b>\n"
+        "🛫 <b>СУББОТНЯЯ БАМБАЛЕЙЛА!</b>\n\n"
+        "⏰ <b>Время:</b> то что надо\n"
+        "🌍 <b>Отличное время для полёта:</b>\n"
         "   • Москва — 10:00 утра ☀️\n"
         "   • Камчатка — 19:00 вечера 🌙\n\n"
         "✈️ <b>Куда полетим?</b>\n"
-        "Предлагайте маршруты в комментариях!\n\n"
-        "Кто присоединится? 👇"
+        "Предлагайте маршрут!\n\n"
+        "Кто полетит? 👇"
     )
     send_to_telegram(message)
     print("[SCHEDULER] Saturday flight invitation sent")
@@ -270,7 +270,7 @@ def handle_departure(data):
     aircraft = d.get('aircraft', {}).get('icao_name', 'N/A')
     
     message = (
-        f"🛫 <b>РЕЙС НАЧАЛСЯ</b>\n\n"
+        f"🛫 <b>DEPARTURE</b>\n\n"
         f"👨‍✈️ Пилот: <b>{pilot}</b>\n"
         f"🆔 Рейс: <b>{flight_no}</b>\n"
         f"🗺 Маршрут: <b>{departure} → {arrival}</b>\n"
@@ -307,7 +307,7 @@ def handle_arrival(data):
             stats['flights'] = stats['flights'][-500:]
     
     message = (
-        f"🛬 <b>РЕЙС ЗАВЕРШЁН</b> {emoji}\n\n"
+        f"🛬 <b>ARRIVAL</b> {emoji}\n\n"
         f"👨‍✈️ Пилот: <b>{pilot}</b>\n"
         f"🆔 Рейс: <b>{flight_no}</b>\n"
         f"🗺 Маршрут: <b>{departure} → {arrival}</b>\n"
@@ -358,7 +358,7 @@ def handle_achievement(data):
     flight = d.get('flight', {})
     pilot = flight.get('user', {}).get('name', 'Пилот')
     title = achievement.get('title', 'Достижение')
-    send_to_telegram(f"🏆 <b>ДОСТИЖЕНИЕ!</b>\n\n👨‍✈️ {pilot}\n🎯 {title}\n\nПоздравляем!")
+    send_to_telegram(f"🏆 <b>АЧИВКА!</b>\n\n👨‍✈️ {pilot}\n🎯 {title}\n\nПоздравляем!")
 
 # ───────────────────────────────────────────
 # TELEGRAM WEBHOOK (COMMANDS)
