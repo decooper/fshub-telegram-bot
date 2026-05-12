@@ -317,7 +317,7 @@ def handle_departure(data):
         print(f"[DEPARTURE] Pilot: {pilot}, Flight: {flight_no}, Route: {departure}->{arrival}")
         
         message = (
-            f"🛫 <b>РЕЙС НАЧАЛСЯ</b>\n\n"
+            f"🛫 <b>DEPARTURE</b>\n\n"
             f"👨‍✈️ Пилот: <b>{pilot}</b>\n"
             f"🆔 Рейс: <b>{flight_no}</b>\n"
             f"🗺 Маршрут: <b>{departure} → {arrival}</b>\n"
@@ -362,7 +362,7 @@ def handle_arrival(data):
                 stats['flights'] = stats['flights'][-500:]
         
         message = (
-            f"🛬 <b>РЕЙС ЗАВЕРШЁН</b> {emoji}\n\n"
+            f"🛬 <b>ARRIVAL</b> {emoji}\n\n"
             f"👨‍✈️ Пилот: <b>{pilot}</b>\n"
             f"🆔 Рейс: <b>{flight_no}</b>\n"
             f"🗺 Маршрут: <b>{departure} → {arrival}</b>\n"
