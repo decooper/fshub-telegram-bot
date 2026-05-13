@@ -397,34 +397,39 @@ def fmt_active_flights() -> str:
     return f"🛫 <b>AIRBORNE AIRCRAFT ({len(flights)})</b>\n\n" + "\n".join(lines)
 
 # ═══════════════════════════════════════════════════════════════
-# FSHUB EVENT HANDLERS (ENGLISH VERSION)
+# FSHUB EVENT HANDLERS (FIXED WITH NONE PROTECTION)
 # ═══════════════════════════════════════════════════════════════
 
 def handle_departure(data: Dict) -> None:
-    d  = data.get("_data", {})
-    pl = d.get("plan", {})
+    d = data.get("_data", {}) or {}
+    pl = d.get("plan") or {}
+    user = d.get("user") or {}
+    aircraft = d.get("aircraft") or {}
 
     tg_send(
         f"🛫 <b>DEPARTURE CONFIRMED</b>\n\n"
-        f"👨‍✈️ Captain: <b>{d.get('user',{}).get('name','Unknown')}</b>\n"
-        f"🆔 Flight: <b>{pl.get('flight_no','N/A')}</b>\n"
-        f"🗺 Route: <b>{pl.get('departure','????')} → {pl.get('arrival','????')}</b>\n"
-        f"✈️ Aircraft: <b>{d.get('aircraft',{}).get('icao_name','N/A')}</b>\n\n"
+        f"👨‍✈️ Captain: <b>{user.get('name', 'Unknown')}</b>\n"
+        f"🆔 Flight: <b>{pl.get('flight_no', 'N/A')}</b>\n"
+        f"🗺 Route: <b>{pl.get('departure', '????')} → {pl.get('arrival', '????')}</b>\n"
+        f"✈️ Aircraft: <b>{aircraft.get('icao_name', 'N/A')}</b>\n\n"
         f"🕒 OFF BLOCK: {datetime.utcnow().strftime('%H:%M UTC')}"
     )
 
 def handle_arrival(data: Dict) -> None:
-    d    = data.get("_data", {})
-    pl   = d.get("plan", {})
+    d = data.get("_data", {}) or {}
+    pl = d.get("plan") or {}
+    user = d.get("user") or {}
+    aircraft = d.get("aircraft") or {}
+    airport = d.get("airport") or {}
     rate = int(d.get("landing_rate", 0))
 
     rating, emoji = landing_rating(rate)
 
     _add_flight(FlightRecord(
-        pilot        = d.get("user", {}).get("name", "Unknown"),
+        pilot        = user.get("name", "Unknown"),
         flight_no    = pl.get("flight_no", "N/A"),
         departure    = pl.get("departure", "????"),
-        arrival      = pl.get("arrival",   "????"),
+        arrival      = pl.get("arrival", "????"),
         landing_rate = rate,
         date         = datetime.now(),
         flight_id    = str(d.get("id")) if d.get("id") else None,
@@ -432,23 +437,22 @@ def handle_arrival(data: Dict) -> None:
 
     tg_send(
         f"🛬 <b>ARRIVAL CONFIRMED</b> {emoji}\n\n"
-        f"👨‍✈️ Captain: <b>{d.get('user',{}).get('name','Unknown')}</b>\n"
-        f"🆔 Flight: <b>{pl.get('flight_no','N/A')}</b>\n"
-        f"🗺 Route: <b>{pl.get('departure','????')} → {pl.get('arrival','????')}</b>\n"
-        f"✈️ Aircraft: <b>{d.get('aircraft',{}).get('icao_name','N/A')}</b>\n"
-        f"📍 Destination: <b>{d.get('airport',{}).get('name', pl.get('arrival','????'))}</b>\n"
+        f"👨‍✈️ Captain: <b>{user.get('name', 'Unknown')}</b>\n"
+        f"🆔 Flight: <b>{pl.get('flight_no', 'N/A')}</b>\n"
+        f"🗺 Route: <b>{pl.get('departure', '????')} → {pl.get('arrival', '????')}</b>\n"
+        f"✈️ Aircraft: <b>{aircraft.get('icao_name', 'N/A')}</b>\n"
+        f"📍 Destination: <b>{airport.get('name', pl.get('arrival', '????'))}</b>\n"
         f"📊 Landing Rate: <b>{rate} fpm</b> — {rating}\n\n"
         f"🕒 ON BLOCK: {datetime.utcnow().strftime('%H:%M UTC')}"
     )
 
 def handle_screenshots(data: Dict) -> None:
     screenshots = data.get("_data", [])
-
     if not screenshots:
         return
 
     flight_id = screenshots[0].get("flight_id")
-    flight    = _find_flight(str(flight_id)) if flight_id else None
+    flight = _find_flight(str(flight_id)) if flight_id else None
 
     if flight:
         caption = (
@@ -469,12 +473,15 @@ def handle_screenshots(data: Dict) -> None:
         tg_send(f"📸 <b>{extra} additional media attachment(s)</b>\nFlight ID: #{flight_id}")
 
 def handle_achievement(data: Dict) -> None:
-    d = data.get("_data", {})
+    d = data.get("_data", {}) or {}
+    flight = d.get("flight") or {}
+    user = flight.get("user") or {}
+    achievement = d.get("achievement") or {}
 
     tg_send(
         f"🏆 <b>CREW ACHIEVEMENT UNLOCKED</b>\n\n"
-        f"👨‍✈️ {d.get('flight',{}).get('user',{}).get('name','Unknown')}\n"
-        f"🎯 {d.get('achievement',{}).get('title','Achievement')}\n\n"
+        f"👨‍✈️ {user.get('name', 'Unknown')}\n"
+        f"🎯 {achievement.get('title', 'Achievement')}\n\n"
         f"Operations Control congratulates the crew."
     )
 
@@ -512,7 +519,7 @@ TG_COMMANDS = {
 
 def handle_tg_command(message: Dict) -> None:
     chat_id = message.get("chat", {}).get("id")
-    text    = (message.get("text") or "").strip()
+    text = (message.get("text") or "").strip()
     if not chat_id or not text:
         return
     if str(chat_id) == str(CHAT_ID):
@@ -557,7 +564,7 @@ def fshub_webhook():
 @app.route(f"/bot/{BOT_TOKEN}", methods=["POST"])
 def tg_webhook():
     try:
-        data    = request.get_json(force=True) or {}
+        data = request.get_json(force=True) or {}
         message = data.get("message") or data.get("channel_post") or {}
         handle_tg_command(message)
     except Exception:
