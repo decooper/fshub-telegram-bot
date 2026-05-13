@@ -649,23 +649,34 @@ def setup_telegram_webhook():
 
 scheduler = BackgroundScheduler()
 
-# Ежедневная статистика в 21:00 UTC
+# Ежедневная статистика FSHub в 21:00 UTC
 scheduler.add_job(func=send_daily_stats, trigger="cron", hour=21, minute=0)
 
 # Еженедельный топ пилотов в воскресенье в 12:00 UTC
 scheduler.add_job(func=send_weekly_top, trigger="cron", day_of_week="sun", hour=12, minute=0)
 
-# Приглашение на совместный полёт — ТОЛЬКО ПО СУББОТАМ в 06:00 UTC
+# Приглашение на совместный полёт — по субботам в 06:00 UTC
 scheduler.add_job(func=send_flight_invitation, trigger="cron", day_of_week="sat", hour=6, minute=0)
 
-# Челлендж на неделю (каждый понедельник в 08:00 UTC)
+# Челлендж на неделю — по понедельникам в 08:00 UTC
 scheduler.add_job(func=send_challenge, trigger="cron", day_of_week="mon", hour=8, minute=0)
 
-# Ежемесячный экономический дайджест (1-го числа каждого месяца в 12:00 UTC)
-if FSA_API_KEY:
-    scheduler.add_job(func=send_monthly_economic_digest, trigger="cron", day=1, hour=12, minute=0)
-    print("[SCHEDULER] Monthly economic digest scheduled for 1st of each month at 12:00 UTC")
+# ЕЖЕДНЕВНЫЙ ЭКОНОМИЧЕСКИЙ ОТЧЁТ — каждый день в 07:00 UTC (10:00 МСК)
+scheduler.add_job(func=send_daily_economy_report, trigger="cron", hour=7, minute=0)
 
+# ЕЖЕМЕСЯЧНЫЙ ЭКОНОМИЧЕСКИЙ ОТЧЁТ — 1-го числа в 21:00 UTC (00:00 МСК)
+if FSA_API_KEY:
+    scheduler.add_job(func=send_monthly_economic_digest, trigger="cron", day=1, hour=21, minute=0)
+
+scheduler.start()
+
+print("[SCHEDULER] Запущен:")
+print("  - Ежедневная статистика FSHub: 21:00 UTC")
+print("  - Топ пилотов: воскресенье 12:00 UTC")
+print("  - Совместный полёт: суббота 06:00 UTC")
+print("  - Челлендж: понедельник 08:00 UTC")
+print("  - Ежедневный экономический отчёт: 07:00 UTC (10:00 МСК)")
+print("  - Ежемесячный экономический отчёт: 1-го числа 21:00 UTC (00:00 МСК)")
 scheduler.start()
 
 print("[SCHEDULER] Запущен")
