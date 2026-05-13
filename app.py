@@ -17,12 +17,21 @@ PORT = int(os.environ.get("PORT", 10000))
 BOT_TOKEN = os.environ.get('TG_BOT_TOKEN')
 CHAT_ID = os.environ.get('TG_CHAT_ID')
 
+# FSAirlines настройки (добавь эти переменные в Render)
+FSA_API_KEY = os.environ.get('FSA_API_KEY')
+FSA_VA_ID = os.environ.get('FSA_VA_ID', '5911')  # твой VA ID в FSAirlines
+
 if not BOT_TOKEN or not CHAT_ID:
     print("❌ Ошибка: не заданы BOT_TOKEN или CHAT_ID")
     exit(1)
 
 print(f"[CONFIG] BOT_TOKEN: {BOT_TOKEN[:10]}... (скрыто)")
 print(f"[CONFIG] CHAT_ID: {CHAT_ID}")
+if FSA_API_KEY:
+    print(f"[CONFIG] FSA_API_KEY: {FSA_API_KEY[:10]}... (скрыто)")
+    print(f"[CONFIG] FSA_VA_ID: {FSA_VA_ID}")
+else:
+    print("[CONFIG] FSA_API_KEY не задан (экономические функции будут недоступны)")
 
 # ───────────────────────────────────────────
 # STATE (в памяти, для одного процесса)
@@ -30,6 +39,179 @@ print(f"[CONFIG] CHAT_ID: {CHAT_ID}")
 
 stats = {'flights': []}
 stats_lock = threading.Lock()
+
+# ───────────────────────────────────────────
+# FSAirlines API HELPER
+# ───────────────────────────────────────────
+
+def call_fsa_api(function, extra_params=None):
+    """Универсальная функция вызова FSAirlines API"""
+    if not FSA_API_KEY:
+        print("[FSA] API ключ не задан")
+        return None
+    
+    url = "https://www.fsairlines.net/va_interface2.php"
+    params = {
+        "function": function,
+        "va_id": FSA_VA_ID,
+        "apikey": FSA_API_KEY,
+        "format": "json"
+    }
+    if extra_params:
+        params.update(extra_params)
+    
+    try:
+        response = requests.get(url, params=params, timeout=15)
+        data = response.json()
+        if data.get('status') == 'SUCCESS':
+            return data.get('data')
+        else:
+            print(f"[FSA API] Ошибка: {data.get('status')}")
+            return None
+    except Exception as e:
+        print(f"[FSA API ERROR] {e}")
+        return None
+
+# ───────────────────────────────────────────
+# FSAirlines ECONOMIC FUNCTIONS
+# ───────────────────────────────────────────
+
+def get_daily_economy():
+    """Получает экономику за сегодня (доходы/расходы)"""
+    today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_ts = int(today_start.timestamp())
+    
+    transactions = call_fsa_api("getDailyTransactions", {"from_ts": today_ts})
+    if not transactions:
+        return None
+    
+    total_income = 0
+    total_expense = 0
+    income_by_reason = {}
+    expense_by_reason = {}
+    
+    for t in transactions:
+        value = t.get('value', 0)
+        reason = t.get('reason', 'Other')
+        if value > 0:
+            total_income += value
+            income_by_reason[reason] = income_by_reason.get(reason, 0) + value
+        else:
+            total_expense += abs(value)
+            expense_by_reason[reason] = expense_by_reason.get(reason, 0) + abs(value)
+    
+    return {
+        'total_income': total_income,
+        'total_expense': total_expense,
+        'net': total_income - total_expense,
+        'income_by_reason': income_by_reason,
+        'expense_by_reason': expense_by_reason
+    }
+
+def get_monthly_economy():
+    """Получает экономику за последние 30 дней"""
+    month_ago = int((datetime.now() - timedelta(days=30)).timestamp())
+    
+    transactions = call_fsa_api("getDailyTransactions", {"from_ts": month_ago})
+    if not transactions:
+        return None
+    
+    total_income = 0
+    total_expense = 0
+    daily_net = {}
+    
+    for t in transactions:
+        value = t.get('value', 0)
+        ts = t.get('ts', 0)
+        day = datetime.fromtimestamp(ts).strftime('%Y-%m-%d')
+        
+        if value > 0:
+            total_income += value
+        else:
+            total_expense += abs(value)
+        
+        daily_net[day] = daily_net.get(day, 0) + value
+    
+    best_day = max(daily_net.items(), key=lambda x: x[1]) if daily_net else (None, 0)
+    worst_day = min(daily_net.items(), key=lambda x: x[1]) if daily_net else (None, 0)
+    
+    return {
+        'total_income': total_income,
+        'total_expense': total_expense,
+        'net': total_income - total_expense,
+        'best_day': best_day,
+        'worst_day': worst_day,
+        'days_count': len(daily_net)
+    }
+
+def get_flight_profit(report_id):
+    """Получает прибыль от конкретного рейса"""
+    report = call_fsa_api("getReportDetail", {"report_id": report_id})
+    if not report:
+        return None
+    return {
+        'profit': report.get('profit', 0),
+        'salary': report.get('salary', 0),
+        'bonus': report.get('bonus', 0),
+        'fuel_used': report.get('fuel_used', 0),
+        'pax': report.get('pax', 0)
+    }
+
+def format_daily_economy():
+    """Форматирует ежедневную экономику для отправки в Telegram"""
+    data = get_daily_economy()
+    if not data:
+        return "📊 <b>Экономика VA UP! (FSAirlines)</b>\n\nДанные временно недоступны. Проверьте API ключ."
+    
+    net_emoji = "📈" if data['net'] > 0 else "📉" if data['net'] < 0 else "➡️"
+    
+    message = f"📊 <b>Экономика VA UP! за сегодня</b>\n\n"
+    message += f"💰 Доходы: <b>+{data['total_income']:,.0f} v$</b>\n"
+    message += f"📉 Расходы: <b>-{data['total_expense']:,.0f} v$</b>\n"
+    message += f"{net_emoji} <b>ИТОГО: {net_emoji} {data['net']:+,.0f} v$</b>\n\n"
+    
+    if data['income_by_reason']:
+        top_income = sorted(data['income_by_reason'].items(), key=lambda x: x[1], reverse=True)[:3]
+        message += "🔝 <b>Основные доходы:</b>\n"
+        for reason, amount in top_income:
+            message += f"   • {reason}: <b>+{amount:,.0f} v$</b>\n"
+    
+    if data['expense_by_reason']:
+        top_expense = sorted(data['expense_by_reason'].items(), key=lambda x: x[1], reverse=True)[:3]
+        message += "\n⚠️ <b>Основные расходы:</b>\n"
+        for reason, amount in top_expense:
+            message += f"   • {reason}: <b>-{amount:,.0f} v$</b>\n"
+    
+    return message
+
+def format_monthly_economy():
+    """Форматирует ежемесячную экономику для отправки в Telegram"""
+    data = get_monthly_economy()
+    if not data:
+        return "📊 <b>Экономика VA UP! за месяц</b>\n\nДанные временно недоступны."
+    
+    net_emoji = "📈" if data['net'] > 0 else "📉" if data['net'] < 0 else "➡️"
+    
+    message = f"🏆 <b>ЭКОНОМИЧЕСКИЙ ДАЙДЖЕСТ VA UP!</b>\n"
+    message += f"📅 {datetime.now().strftime('%B %Y')}\n\n"
+    message += f"💰 Доходы за месяц: <b>+{data['total_income']:,.0f} v$</b>\n"
+    message += f"📉 Расходы: <b>-{data['total_expense']:,.0f} v$</b>\n"
+    message += f"{net_emoji} <b>ИТОГО: {net_emoji} {data['net']:+,.0f} v$</b>\n\n"
+    
+    if data['best_day'][0]:
+        message += f"🌟 Лучший день: <b>{data['best_day'][0]}</b> (+{data['best_day'][1]:,.0f} v$)\n"
+    if data['worst_day'][0]:
+        message += f"⚠️ Худший день: <b>{data['worst_day'][0]}</b> ({data['worst_day'][1]:+,.0f} v$)\n"
+    
+    message += f"\n📊 Всего дней с операциями: <b>{data['days_count']}</b>"
+    
+    return message
+
+def send_monthly_economic_digest():
+    """Отправляет ежемесячный экономический дайджест в канал"""
+    message = format_monthly_economy()
+    send_to_telegram(message)
+    print("[SCHEDULER] Monthly economic digest sent")
 
 # ───────────────────────────────────────────
 # TELEGRAM SENDING
@@ -106,7 +288,7 @@ def send_to_user(chat_id, text):
         return False
 
 # ───────────────────────────────────────────
-# STATISTICS
+# STATISTICS (FSHub)
 # ───────────────────────────────────────────
 
 def get_landing_rating(rate):
@@ -171,7 +353,7 @@ def get_full_stats():
         avg_rate = round(sum(rates) / len(rates)) if rates else 0
 
     return (
-        "📊 <b>Статистика VA UP!</b>\n\n"
+        "📊 <b>Статистика VA UP! (FSHub)</b>\n\n"
         f"🛬 Всего рейсов: <b>{total}</b>\n"
         f"📅 За неделю: <b>{week_count}</b>\n"
         f"📐 Средняя посадка: <b>{avg_rate} fpm</b>"
@@ -183,7 +365,7 @@ def get_daily_report():
         today_flights = [f for f in stats['flights'] if f['date'].date() == today]
     
     if not today_flights:
-        return "📊 <b>Статистика за сегодня</b>\n\n✈️ Сегодня рейсов пока нет."
+        return "📊 <b>Статистика за сегодня (FSHub)</b>\n\n✈️ Сегодня рейсов пока нет."
     
     pilot_counts = {}
     for f in today_flights:
@@ -194,7 +376,7 @@ def get_daily_report():
     avg_rate = round(sum(rates) / len(rates))
     
     return (
-        f"📊 <b>Статистика за сегодня</b>\n\n"
+        f"📊 <b>Статистика за сегодня (FSHub)</b>\n\n"
         f"✈️ Рейсов: <b>{len(today_flights)}</b>\n"
         f"👨‍✈️ Пилот дня: <b>{top_pilot[0]}</b> ({top_pilot[1]} рейсов)\n"
         f"📊 Средняя посадка: <b>{avg_rate} fpm</b>"
@@ -238,28 +420,20 @@ def send_challenge():
     print("[SCHEDULER] Challenge sent")
 
 # ───────────────────────────────────────────
-# WEBHOOK EVENTS (С ДЕТАЛЬНЫМ ЛОГИРОВАНИЕМ)
+# WEBHOOK EVENTS (FSHub)
 # ───────────────────────────────────────────
 
 @app.route('/webhook', methods=['GET', 'POST'])
 def fshub_webhook():
-    # Логируем каждый запрос
     print(f"[WEBHOOK] === НОВЫЙ ЗАПРОС ===")
     print(f"[WEBHOOK] Method: {request.method}")
-    print(f"[WEBHOOK] Headers: {dict(request.headers)}")
     
-    # GET-запросы — для проверки работоспособности
     if request.method == 'GET':
         print("[WEBHOOK] GET request received, returning OK")
         return jsonify({"status": "ok", "message": "Webhook is active"}), 200
     
-    # Обработка POST-запросов
     try:
-        # Пробуем получить JSON
         data = request.get_json()
-        print(f"[WEBHOOK] Raw data type: {type(data)}")
-        print(f"[WEBHOOK] Raw data: {str(data)[:500]}")  # первые 500 символов
-        
         if not data:
             print("[WEBHOOK] No JSON data, returning 400")
             return jsonify({"error": "no data"}), 400
@@ -267,45 +441,27 @@ def fshub_webhook():
         event_type = data.get('_type')
         print(f"[FSHUB EVENT] {event_type}")
         
-        # Обработка по типу события
         if event_type == 'flight.departed':
-            print("[WEBHOOK] Calling handle_departure")
             handle_departure(data)
-            print("[WEBHOOK] handle_departure completed")
-            
         elif event_type == 'flight.arrived':
-            print("[WEBHOOK] Calling handle_arrival")
             handle_arrival(data)
-            print("[WEBHOOK] handle_arrival completed")
-            
         elif event_type == 'screenshots.uploaded':
-            print("[WEBHOOK] Calling handle_screenshots")
             handle_screenshots(data)
-            print("[WEBHOOK] handle_screenshots completed")
-            
         elif event_type == 'airline.achievement':
-            print("[WEBHOOK] Calling handle_achievement")
             handle_achievement(data)
-            print("[WEBHOOK] handle_achievement completed")
-            
         else:
             print(f"[WEBHOOK] Unknown event type: {event_type}")
 
-        print("[WEBHOOK] Request processed successfully, returning 200")
         return jsonify({"ok": True}), 200
         
     except Exception as e:
-        # Логируем ошибку с подробностями
         print(f"[WEBHOOK CRITICAL ERROR] {type(e).__name__}: {e}")
-        print("[WEBHOOK] Traceback:")
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 def handle_departure(data):
     try:
         d = data.get('_data', {})
-        print(f"[DEPARTURE] Raw _data: {d}")
-        
         pilot = d.get('user', {}).get('name', 'Пилот')
         plan = d.get('plan', {})
         flight_no = plan.get('flight_no', 'N/A')
@@ -313,10 +469,8 @@ def handle_departure(data):
         arrival = plan.get('arrival', '????')
         aircraft = d.get('aircraft', {}).get('icao_name', 'N/A')
         
-        print(f"[DEPARTURE] Pilot: {pilot}, Flight: {flight_no}, Route: {departure}->{arrival}")
-        
         message = (
-            f"🛫 <b>DEPARTURE</b>\n\n"
+            f"🛫 <b>РЕЙС НАЧАЛСЯ</b>\n\n"
             f"👨‍✈️ Пилот: <b>{pilot}</b>\n"
             f"🆔 Рейс: <b>{flight_no}</b>\n"
             f"🗺 Маршрут: <b>{departure} → {arrival}</b>\n"
@@ -331,8 +485,6 @@ def handle_departure(data):
 def handle_arrival(data):
     try:
         d = data.get('_data', {})
-        print(f"[ARRIVAL] Raw _data keys: {list(d.keys())}")
-        
         pilot = d.get('user', {}).get('name', 'Пилот')
         plan = d.get('plan', {})
         flight_no = plan.get('flight_no', 'N/A')
@@ -344,8 +496,6 @@ def handle_arrival(data):
         flight_id = d.get('id')
         
         rating, emoji = get_landing_rating(landing_rate)
-        
-        print(f"[ARRIVAL] Pilot: {pilot}, Flight: {flight_no}, Landing rate: {landing_rate}")
         
         with stats_lock:
             stats['flights'].append({
@@ -361,7 +511,7 @@ def handle_arrival(data):
                 stats['flights'] = stats['flights'][-500:]
         
         message = (
-            f"🛬 <b>ARRIVAL</b> {emoji}\n\n"
+            f"🛬 <b>РЕЙС ЗАВЕРШЁН</b> {emoji}\n\n"
             f"👨‍✈️ Пилот: <b>{pilot}</b>\n"
             f"🆔 Рейс: <b>{flight_no}</b>\n"
             f"🗺 Маршрут: <b>{departure} → {arrival}</b>\n"
@@ -378,16 +528,12 @@ def handle_arrival(data):
 def handle_screenshots(data):
     try:
         screenshots = data.get('_data', [])
-        print(f"[SCREENSHOTS] Count: {len(screenshots)}")
-        
         if not screenshots:
             return
         
         first = screenshots[0]
         flight_id = first.get('flight_id')
-        print(f"[SCREENSHOTS] Flight ID: {flight_id}")
         
-        # Пытаемся найти рейс в сохранённой статистике
         flight_info = None
         with stats_lock:
             for f in stats['flights']:
@@ -404,12 +550,9 @@ def handle_screenshots(data):
         else:
             caption = f"📸 <b>Скриншот рейса #{flight_id}</b>"
         
-        print(f"[SCREENSHOTS] Caption: {caption[:100]}...")
-        
         for scr in screenshots[:3]:
             image_url = scr.get('screenshot_url')
             if image_url:
-                print(f"[SCREENSHOTS] Sending photo: {image_url[:100]}...")
                 send_photo(image_url, caption)
                 time.sleep(1)
         
@@ -426,7 +569,6 @@ def handle_achievement(data):
         flight = d.get('flight', {})
         pilot = flight.get('user', {}).get('name', 'Пилот')
         title = achievement.get('title', 'Достижение')
-        print(f"[ACHIEVEMENT] Pilot: {pilot}, Title: {title}")
         send_to_telegram(f"🏆 <b>ДОСТИЖЕНИЕ!</b>\n\n👨‍✈️ {pilot}\n🎯 {title}\n\nПоздравляем!")
     except Exception as e:
         print(f"[ACHIEVEMENT ERROR] {e}")
@@ -455,13 +597,27 @@ def telegram_webhook():
         if text == '/start':
             send_to_user(chat_id, "✈️ <b>VA UP! Bot</b>\n\nИспользуй /help для списка команд")
         elif text == '/help':
-            send_to_user(chat_id, "/stats — статистика\n/top — топ пилотов\n/last — последние рейсы")
+            help_text = (
+                "<b>🤖 Команды бота VA UP!</b>\n\n"
+                "📊 <b>FSHub статистика:</b>\n"
+                "/stats — общая статистика рейсов\n"
+                "/top — топ пилотов недели\n"
+                "/last — последние 5 рейсов\n\n"
+                "💰 <b>FSAirlines экономика:</b>\n"
+                "/economy — экономика за сегодня\n"
+                "/monthly — экономический дайджест за месяц"
+            )
+            send_to_user(chat_id, help_text)
         elif text == '/stats':
             send_to_user(chat_id, get_full_stats())
         elif text == '/top':
             send_to_user(chat_id, get_top_pilots())
         elif text == '/last':
             send_to_user(chat_id, get_last_flights())
+        elif text == '/economy':
+            send_to_user(chat_id, format_daily_economy())
+        elif text == '/monthly':
+            send_to_user(chat_id, format_monthly_economy())
         
         return jsonify({"ok": True}), 200
     except Exception as e:
@@ -504,6 +660,11 @@ scheduler.add_job(func=send_flight_invitation, trigger="cron", day_of_week="sat"
 
 # Челлендж на неделю (каждый понедельник в 08:00 UTC)
 scheduler.add_job(func=send_challenge, trigger="cron", day_of_week="mon", hour=8, minute=0)
+
+# Ежемесячный экономический дайджест (1-го числа каждого месяца в 12:00 UTC)
+if FSA_API_KEY:
+    scheduler.add_job(func=send_monthly_economic_digest, trigger="cron", day=1, hour=12, minute=0)
+    print("[SCHEDULER] Monthly economic digest scheduled for 1st of each month at 12:00 UTC")
 
 scheduler.start()
 
