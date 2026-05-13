@@ -19,7 +19,7 @@ CHAT_ID = os.environ.get('TG_CHAT_ID')
 
 # FSAirlines настройки (добавь эти переменные в Render)
 FSA_API_KEY = os.environ.get('FSA_API_KEY')
-FSA_VA_ID = os.environ.get('FSA_VA_ID', '5911')  # твой VA ID в FSAirlines
+FSA_VA_ID = os.environ.get('FSA_VA_ID', '56177')  # твой VA ID в FSAirlines
 
 if not BOT_TOKEN or not CHAT_ID:
     print("❌ Ошибка: не заданы BOT_TOKEN или CHAT_ID")
@@ -206,12 +206,6 @@ def format_monthly_economy():
     message += f"\n📊 Всего дней с операциями: <b>{data['days_count']}</b>"
     
     return message
-
-def send_monthly_economic_digest():
-    """Отправляет ежемесячный экономический дайджест в канал"""
-    message = format_monthly_economy()
-    send_to_telegram(message)
-    print("[SCHEDULER] Monthly economic digest sent")
 
 # ───────────────────────────────────────────
 # TELEGRAM SENDING
@@ -418,6 +412,18 @@ def send_challenge():
     )
     send_to_telegram(message)
     print("[SCHEDULER] Challenge sent")
+
+def send_daily_economy_report():
+    """Отправляет ежедневный экономический отчёт за сегодня"""
+    message = format_daily_economy()
+    send_to_telegram(message)
+    print("[SCHEDULER] Daily economy report sent")
+
+def send_monthly_economic_digest():
+    """Отправляет ежемесячный экономический дайджест в канал"""
+    message = format_monthly_economy()
+    send_to_telegram(message)
+    print("[SCHEDULER] Monthly economic digest sent")
 
 # ───────────────────────────────────────────
 # WEBHOOK EVENTS (FSHub)
@@ -677,9 +683,6 @@ print("  - Совместный полёт: суббота 06:00 UTC")
 print("  - Челлендж: понедельник 08:00 UTC")
 print("  - Ежедневный экономический отчёт: 07:00 UTC (10:00 МСК)")
 print("  - Ежемесячный экономический отчёт: 1-го числа 21:00 UTC (00:00 МСК)")
-scheduler.start()
-
-print("[SCHEDULER] Запущен")
 
 # ───────────────────────────────────────────
 # START
