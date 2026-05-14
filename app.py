@@ -1,8 +1,3 @@
-"""
-VA UP! VATSIM Bot — PostgreSQL Edition
-FSHub webhook + FSAirlines API + Telegram + Scheduler
-"""
-
 import os
 import sys
 import time
@@ -34,6 +29,7 @@ FSA_KEY    = os.environ.get("FSA_API_KEY", "")
 FSA_VA_ID  = os.environ.get("FSA_VA_ID", "56177")
 PORT       = int(os.environ.get("PORT", 10000))
 HOSTNAME   = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "fshub-bot.onrender.com")
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")  # ← добавлено
 
 MAX_DB_FLIGHTS = int(os.environ.get("MAX_DB_FLIGHTS", "5000"))
 DATABASE_URL   = os.environ.get("DATABASE_URL", "")
@@ -95,15 +91,6 @@ session.mount("http://",  _adapter)
 
 # ═══════════════════════════════════════════════════════════════
 # DATABASE — PostgreSQL connection pool
-#
-# ИСПРАВЛЕНИЕ: SSL соединение может умереть в любой момент.
-# get_conn() теперь правильно пересоздаёт мёртвое соединение:
-#   1. Проверяет соединение через SELECT 1
-#   2. При ошибке закрывает его с close=True (помечает как умершее)
-#   3. Берёт новое соединение из пула
-#
-# db_execute() при ошибке теперь гарантированно возвращает
-# соединение в пул через finally, даже если rollback тоже упал.
 # ═══════════════════════════════════════════════════════════════
 
 _pool: Optional[psycopg2.pool.ThreadedConnectionPool] = None
@@ -120,7 +107,6 @@ def _create_pool() -> None:
             maxconn=5,
             dsn=DATABASE_URL,
             cursor_factory=psycopg2.extras.RealDictCursor,
-            # keepalives убирают зависшие SSL-соединения на уровне TCP
             keepalives=1,
             keepalives_idle=30,
             keepalives_interval=10,
@@ -130,34 +116,24 @@ def _create_pool() -> None:
 
 
 def _get_conn():
-    """
-    Берёт соединение из пула и проверяет что оно живо.
-    Если SSL умерло — закрывает и берёт новое.
-    """
     if _pool is None:
         _create_pool()
-
     conn = _pool.getconn()
     try:
-        # Быстрая проверка: соединение живо?
         with conn.cursor() as cur:
             cur.execute("SELECT 1")
-        conn.rollback()  # сбрасываем состояние транзакции после проверки
+        conn.rollback()
         return conn
     except Exception:
-        # Соединение мёртвое (SSL error, timeout и т.д.)
-        # close=True говорит пулу: это соединение нельзя переиспользовать
         try:
             _pool.putconn(conn, close=True)
         except Exception:
             pass
-        # Берём свежее соединение
         logger.info("Reconnecting to PostgreSQL (previous connection was dead)")
         return _pool.getconn()
 
 
 def _put_conn(conn, close: bool = False) -> None:
-    """Возвращает соединение в пул."""
     try:
         if _pool:
             _pool.putconn(conn, close=close)
@@ -166,13 +142,6 @@ def _put_conn(conn, close: bool = False) -> None:
 
 
 def db_execute(query: str, params=None, fetch: str = "none"):
-    """
-    Выполняет запрос с retry при SSL/network ошибках.
-    fetch: "none" | "one" | "all"
-
-    ИСПРАВЛЕНИЕ: rollback и возврат соединения в пул теперь
-    гарантированы даже если само соединение уже умерло.
-    """
     max_retries = 3
     last_error  = None
 
@@ -188,9 +157,7 @@ def db_execute(query: str, params=None, fetch: str = "none"):
                 if fetch == "all":
                     return cur.fetchall()
                 return None
-
         except psycopg2.OperationalError as e:
-            # SSL decryption failed, connection reset и подобные сетевые ошибки
             last_error = e
             logger.warning(f"DB operational error (attempt {attempt+1}/{max_retries}): {e}")
             if conn:
@@ -198,12 +165,10 @@ def db_execute(query: str, params=None, fetch: str = "none"):
                     conn.rollback()
                 except Exception:
                     pass
-                # Помечаем соединение как мёртвое — пул создаст новое
                 _put_conn(conn, close=True)
                 conn = None
             if attempt < max_retries - 1:
                 time.sleep(0.5 * (attempt + 1))
-
         except Exception as e:
             last_error = e
             logger.warning(f"DB error (attempt {attempt+1}/{max_retries}): {e}")
@@ -214,12 +179,9 @@ def db_execute(query: str, params=None, fetch: str = "none"):
                     pass
             if attempt == max_retries - 1:
                 raise
-
         finally:
-            # Всегда возвращаем соединение если оно ещё не было возвращено
             if conn is not None:
                 _put_conn(conn)
-
     raise last_error
 
 
@@ -317,10 +279,11 @@ def db_save_daily_economy(day: str, income: int, expense: int, detail: Dict) -> 
 
 
 def db_get_monthly_economy(days: int = 30) -> List:
+    # Исправлено: надёжный INTERVAL для всех версий PostgreSQL
     return db_execute(
         """
         SELECT * FROM daily_economy
-        WHERE day >= CURRENT_DATE - (%s * INTERVAL '1 day')
+        WHERE day >= CURRENT_DATE - (%s || ' days')::INTERVAL
         ORDER BY day ASC
         """,
         (days,), fetch="all",
@@ -394,18 +357,9 @@ def tg_setup_webhook() -> None:
 
 # ═══════════════════════════════════════════════════════════════
 # FSA API
-#
-# ИСПРАВЛЕНИЕ: get_flight_profit() теперь НЕ блокирует Flask-поток.
-# handle_arrival() запускает его в отдельном потоке и сразу
-# отвечает FSHub. Прибыль отправляется отдельным сообщением
-# когда FSAirlines её посчитает.
-#
-# ИСПРАВЛЕНИЕ: FSA failure NOT FOUND больше не логируется как WARNING —
-# это нормально для новых рейсов пока FSAirlines их не обработала.
 # ═══════════════════════════════════════════════════════════════
 
 def fsa_call(function: str, extra: Optional[Dict] = None):
-    """Вызывает FSAirlines API. NOT FOUND — не ошибка, не логируем как WARNING."""
     if not FSA_KEY:
         return None
     params = {
@@ -423,7 +377,6 @@ def fsa_call(function: str, extra: Optional[Dict] = None):
         if body.get("status") == "SUCCESS":
             return body.get("data")
         if body.get("status") == "NOT FOUND":
-            # Нормально для новых рейсов — FSAirlines ещё не обработала
             logger.debug(f"FSA {function}: NOT FOUND (normal for new flights)")
         else:
             logger.warning(f"FSA {function} failure: {body}")
@@ -433,10 +386,24 @@ def fsa_call(function: str, extra: Optional[Dict] = None):
         return None
 
 
+def _safe_ts(ts) -> Optional[datetime]:
+    try:
+        return datetime.fromtimestamp(float(ts))
+    except Exception:
+        return None
+
+
 def fsa_daily_transactions() -> List[Dict]:
-    """getDailyTransactions — только va_id, без from_ts (по документации API)."""
+    """
+    Возвращает транзакции за сегодня.
+    API getDailyTransactions возвращает только сегодняшние транзакции.
+    """
     data = fsa_call("getDailyTransactions")
-    return data if isinstance(data, list) else []
+    if not isinstance(data, list):
+        logger.warning(f"fsa_daily_transactions: unexpected data type {type(data)}")
+        return []
+    logger.info(f"fsa_daily_transactions: {len(data)} transactions for today")
+    return data
 
 
 def fsa_active_flights() -> List[Dict]:
@@ -452,14 +419,7 @@ def fsa_airline_data() -> Optional[Dict]:
 
 
 def _fetch_profit_and_notify(flight_id: str, pilot: str, flight_no: str) -> None:
-    """
-    Запрашивает прибыль рейса из FSAirlines и отправляет в канал.
-    Запускается в фоновом потоке — НЕ блокирует Flask.
-
-    Стратегия: ждём нарастающими интервалами (5, 10, 20 сек),
-    даём FSAirlines время обработать рейс.
-    """
-    delays = [5, 10, 20]  # секунды между попытками
+    delays = [5, 10, 20]
     for i, delay in enumerate(delays):
         time.sleep(delay)
         data = fsa_call("getReportDetail", {"report_id": flight_id})
@@ -475,7 +435,6 @@ def _fetch_profit_and_notify(flight_id: str, pilot: str, flight_no: str) -> None
                         f"💰 Profit: <b>{p:+,.0f} v$</b>\n"
                         f"🔗 <a href='https://fshub.io/flight/{flight_id}'>Flight Report</a>"
                     )
-                    # Обновляем profit в БД
                     try:
                         db_execute(
                             "UPDATE flights SET profit = %s WHERE flight_id = %s",
@@ -487,7 +446,6 @@ def _fetch_profit_and_notify(flight_id: str, pilot: str, flight_no: str) -> None
             except (ValueError, TypeError) as e:
                 logger.warning(f"Could not parse profit: {e}")
         logger.debug(f"Profit attempt {i+1}/{len(delays)} for flight {flight_id}: not ready yet")
-
     logger.info(f"Profit not available for flight {flight_id} after all retries")
 
 # ═══════════════════════════════════════════════════════════════
@@ -525,8 +483,8 @@ def _nem(net: float) -> str:
 
 
 def snapshot_daily_economy() -> None:
-    """Сохраняет снимок экономики дня в БД. Вызывается планировщиком в 23:50 UTC."""
     if not FSA_KEY:
+        logger.warning("snapshot_daily_economy: FSA_KEY not set")
         return
     txs = fsa_daily_transactions()
     if not txs:
@@ -734,7 +692,6 @@ def handle_arrival(data: Dict) -> None:
     d         = data.get("_data", {}) or {}
     flight_id = str(d.get("id", ""))
 
-    # Дедупликация: FSHub может прислать одно событие дважды
     if flight_id:
         with processed_lock:
             if flight_id in processed_flight_ids:
@@ -752,7 +709,6 @@ def handle_arrival(data: Dict) -> None:
 
     rating, emoji = landing_rating(rate)
 
-    # Сохраняем рейс (profit = None, обновится позже из фонового потока)
     db_add_flight(
         flight_id    = flight_id or None,
         pilot        = pilot,
@@ -764,7 +720,6 @@ def handle_arrival(data: Dict) -> None:
         profit       = None,
     )
 
-    # Немедленно отвечаем в канал (без прибыли — она придёт отдельно)
     tg_send(
         f"🛬 <b>ARRIVAL CONFIRMED</b> {emoji}\n\n"
         f"👨‍✈️ Captain: <b>{pilot}</b>\n"
@@ -775,7 +730,6 @@ def handle_arrival(data: Dict) -> None:
         f"📊 Landing Rate: <b>{rate} fpm</b> — {rating}"
     )
 
-    # Hard landing alert
     if rate < -600:
         tg_send(
             f"⚠️ <b>HARD LANDING ALERT</b>\n\n"
@@ -784,7 +738,6 @@ def handle_arrival(data: Dict) -> None:
             f"✈️ Aircraft inspection recommended."
         )
 
-    # Прибыль запрашиваем в фоне — не блокируем Flask
     if FSA_KEY and flight_id and flight_id.isdigit():
         threading.Thread(
             target=_fetch_profit_and_notify,
@@ -873,6 +826,12 @@ def handle_tg_command(message: Dict) -> None:
     logger.info(f"Command from {chat_id}: {text}")
     cmd = text.split("@")[0]
 
+    # Команда для принудительного сохранения экономики (только для администратора)
+    if text == '/force_economy' and ADMIN_CHAT_ID and str(chat_id) == ADMIN_CHAT_ID:
+        snapshot_daily_economy()
+        tg_send("✅ Принудительное сохранение экономики выполнено. Проверь логи и таблицу daily_economy.", chat_id)
+        return
+
     if cmd.startswith("/start"):
         tg_send("✈️ <b>VA UP! PostgreSQL Edition</b>\n\nUse /help for commands.", chat_id)
         return
@@ -907,7 +866,6 @@ def home():
 
 @app.route("/health")
 def health():
-    """Healthcheck — также проверяет БД."""
     try:
         db_execute("SELECT 1", fetch="one")
         return jsonify({"ok": True, "db": "ok"}), 200
@@ -942,7 +900,7 @@ def tg_webhook():
         handle_tg_command(message)
     except Exception as e:
         logger.exception(f"Telegram webhook failure: {e}")
-    return jsonify({"ok": True})  # всегда 200, иначе Telegram будет повторять
+    return jsonify({"ok": True})
 
 # ═══════════════════════════════════════════════════════════════
 # SCHEDULER
@@ -953,26 +911,35 @@ scheduler = BackgroundScheduler(
     timezone="UTC",
 )
 
+# Daily economy snapshot at 23:50 UTC
 scheduler.add_job(
     snapshot_daily_economy, "cron",
     hour=23, minute=50, id="daily_economy_snapshot",
     replace_existing=True, misfire_grace_time=300,
 )
+
+# Daily stats at 00:30 UTC
 scheduler.add_job(
     lambda: tg_send(fmt_stats()), "cron",
-    hour=21, minute=00, id="daily_stats",
+    hour=0, minute=30, id="daily_stats",
     replace_existing=True, misfire_grace_time=300,
 )
+
+# Weekly top landings — Sunday 12:00 UTC
 scheduler.add_job(
     lambda: tg_send(fmt_top_landings()), "cron",
     day_of_week="sun", hour=12, minute=0, id="weekly_landing_ranking",
     replace_existing=True, misfire_grace_time=300,
 )
+
+# Weekly top pilots — Sunday 10:00 UTC
 scheduler.add_job(
     lambda: tg_send(fmt_top_pilots()), "cron",
     day_of_week="sun", hour=10, minute=0, id="weekly_top_pilots",
     replace_existing=True, misfire_grace_time=300,
 )
+
+# Saturday joint flight invitation — 06:00 UTC
 scheduler.add_job(
     lambda: tg_send(
         "🛫 <b>SATURDAY JOINT FLIGHT OPERATION!</b>\n\n"
@@ -982,6 +949,8 @@ scheduler.add_job(
     "cron", day_of_week="sat", hour=6, minute=0, id="saturday_inv",
     replace_existing=True, misfire_grace_time=300,
 )
+
+# Weekly challenge — Monday 08:00 UTC
 scheduler.add_job(
     lambda: tg_send(
         "🏆 <b>WEEKLY CREW CHALLENGE!</b>\n\n"
@@ -991,6 +960,8 @@ scheduler.add_job(
     "cron", day_of_week="mon", hour=8, minute=0, id="monday_challenge",
     replace_existing=True, misfire_grace_time=300,
 )
+
+# Monthly digest — 1st of month at 09:00 UTC
 scheduler.add_job(
     lambda: tg_send(fmt_monthly_economy()), "cron",
     day=1, hour=9, minute=0, id="monthly_digest",
