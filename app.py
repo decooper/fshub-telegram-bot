@@ -960,7 +960,7 @@ scheduler.add_job(
 )
 scheduler.add_job(
     lambda: tg_send(fmt_stats()), "cron",
-    hour=21, minute=0, id="daily_stats",
+    hour=0, minute=20, id="daily_stats",
     replace_existing=True, misfire_grace_time=300,
 )
 scheduler.add_job(
