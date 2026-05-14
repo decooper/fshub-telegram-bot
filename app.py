@@ -152,6 +152,7 @@ def fsa_call(function: str, extra: Optional[Dict] = None):
         return None
 
 def fsa_daily_transactions() -> List[Dict]:
+    """Транзакции за сегодня"""
     data = fsa_call("getDailyTransactions")
     if not isinstance(data, list):
         return []
@@ -165,19 +166,20 @@ def fsa_daily_transactions() -> List[Dict]:
                 result.append(t)
     return result
 
-def fsa_pos_sums() -> List[Dict]:
-    data = fsa_call("getPosTransactionSums")
-    return data if isinstance(data, list) else []
-
-def fsa_neg_sums() -> List[Dict]:
-    data = fsa_call("getNegTransactionSums")
-    return data if isinstance(data, list) else []
-
-def fsa_airline_stats() -> Optional[Dict]:
-    data = fsa_call("getAirlineStats")
-    if isinstance(data, list) and data:
-        return data[0]
-    return data if isinstance(data, dict) else None
+def fsa_monthly_transactions() -> List[Dict]:
+    """Транзакции за последние 30 дней"""
+    data = fsa_call("getDailyTransactions")
+    if not isinstance(data, list):
+        return []
+    month_ago = datetime.now() - timedelta(days=30)
+    result = []
+    for t in data:
+        ts = t.get("ts")
+        if ts:
+            date = datetime.fromtimestamp(ts)
+            if date >= month_ago:
+                result.append(t)
+    return result
 
 def fsa_active_flights() -> List[Dict]:
     data = fsa_call("getActiveFlights")
@@ -302,7 +304,7 @@ def fmt_daily_report() -> str:
     )
 
 # ═══════════════════════════════════════════════════════════════
-# FINANCIAL FORMATTING (ENGLISH VERSION)
+# FINANCIAL FORMATTING
 # ═══════════════════════════════════════════════════════════════
 
 def fmt_daily_economy() -> str:
@@ -338,43 +340,50 @@ def fmt_daily_economy() -> str:
     return msg
 
 def fmt_monthly_economy() -> str:
-    pos   = fsa_pos_sums()
-    neg   = fsa_neg_sums()
-    stats = fsa_airline_stats()
-
-    if not pos and not neg:
-        return (
-            "📊 <b>MONTHLY FINANCIAL SUMMARY</b>\n\n"
-            "Financial data unavailable."
-        )
-
-    inc = sum(float(t.get("value", 0)) for t in pos)
-    exp = sum(abs(float(t.get("value", 0))) for t in neg)
-    net = inc - exp
-    em  = _nem(net)
-
+    """Ежемесячный экономический дайджест за последние 30 дней"""
+    txs = fsa_monthly_transactions()
+    
+    if not txs:
+        return "📊 <b>MONTHLY FINANCIAL SUMMARY</b>\n\nNo financial data available for the last 30 days."
+    
+    # Суммируем за месяц
+    total_inc = 0
+    total_exp = 0
+    daily_net: Dict[str, float] = {}
+    
+    for t in txs:
+        value = float(t.get("value", 0))
+        ts = t.get("ts")
+        if ts:
+            day = datetime.fromtimestamp(ts).strftime('%Y-%m-%d')
+            daily_net[day] = daily_net.get(day, 0) + value
+            if value >= 0:
+                total_inc += value
+            else:
+                total_exp += abs(value)
+    
+    net = total_inc - total_exp
+    em = _nem(net)
+    
+    # Находим лучший и худший день
+    best_day = max(daily_net.items(), key=lambda x: x[1]) if daily_net else (None, 0)
+    worst_day = min(daily_net.items(), key=lambda x: x[1]) if daily_net else (None, 0)
+    
     msg = (
-        f"📈 <b>MONTHLY FINANCIAL SUMMARY</b>\n"
+        f"🏆 <b>MONTHLY FINANCIAL DIGEST</b>\n"
         f"📅 {datetime.now().strftime('%B %Y')}\n\n"
-        f"💰 Total Revenue: <b>+{inc:,.0f} v$</b>\n"
-        f"📉 Total Expenses: <b>-{exp:,.0f} v$</b>\n"
-        f"{em} <b>Net Balance: {net:+,.0f} v$</b>\n"
+        f"💰 Revenue: <b>+{total_inc:,.0f} v$</b>\n"
+        f"📉 Expenses: <b>-{total_exp:,.0f} v$</b>\n"
+        f"{em} <b>NET: {em} {net:+,.0f} v$</b>\n"
     )
-
-    if pos:
-        msg += "\n🔝 <b>TOP REVENUE SOURCES:</b>\n"
-        for t in sorted(pos, key=lambda x: float(x.get("value", 0)), reverse=True)[:3]:
-            msg += f"   • {t.get('reason','?')}: <b>+{float(t.get('value',0)):,.0f} v$</b>\n"
-
-    if stats:
-        msg += (
-            f"\n📊 <b>FLEET OPERATIONS DATA:</b>\n"
-            f"   ✈️ Flights: <b>{stats.get('flights', 0)}</b>\n"
-            f"   ⏱ Hours: <b>{float(stats.get('hours', 0)):.0f}</b>\n"
-            f"   👥 Passengers: <b>{stats.get('pax', 0)}</b>\n"
-            f"   ⭐ Rating: <b>{float(stats.get('rating', 0)):.1f}</b>"
-        )
-
+    
+    if best_day[0]:
+        msg += f"\n🌟 Best Day: <b>{best_day[0]}</b> (+{best_day[1]:,.0f} v$)\n"
+    if worst_day[0]:
+        msg += f"⚠️ Worst Day: <b>{worst_day[0]}</b> ({worst_day[1]:+,.0f} v$)\n"
+    
+    msg += f"\n📊 Days with activity: <b>{len(daily_net)}</b>"
+    
     return msg
 
 def fmt_active_flights() -> str:
@@ -415,7 +424,6 @@ def get_flight_profit_from_fsa(report_id: int, retries: int = 3) -> Optional[int
     
     for attempt in range(retries):
         try:
-            # Ждём перед первым запросом, чтобы FSAirlines успел обработать рейс
             if attempt == 0:
                 time.sleep(3)
             else:
@@ -544,7 +552,7 @@ FSHUB_HANDLERS = {
 }
 
 # ═══════════════════════════════════════════════════════════════
-# TELEGRAM COMMANDS (ENGLISH VERSION)
+# TELEGRAM COMMANDS
 # ═══════════════════════════════════════════════════════════════
 
 _HELP = (
@@ -555,7 +563,7 @@ _HELP = (
     "/last    — latest flight reports\n\n"
     "💰 <b>Financial Operations:</b>\n"
     "/economy — daily financial report\n"
-    "/monthly — monthly financial summary\n"
+    "/monthly — monthly financial digest (last 30 days)\n"
     "/live    — active flight operations"
 )
 
