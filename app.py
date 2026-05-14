@@ -1,215 +1,384 @@
+# VA UP! Stable Edition — Production-Oriented Single File Bot
+
+```python
 """
-VA UP! VATSIM Bot — Unified Operations Bot
-FSHub webhook + FSAirlines API + Telegram + Scheduler
+VA UP! Operations Bot — Stable Edition
+Optimized for Render Free + Telegram + FSHub + FSAirlines
+
+Features:
+- Stable webhook handling
+- Safe memory limits
+- SQLite persistence
+- Retry sessions
+- Telegram fail protection
+- APScheduler safe jobs
+- Logging
+- Health endpoints
+- Low RAM footprint
+- Thread-safe storage
+- Hard landing alerts
+- Flight links
+- Graceful shutdown behavior
+
+Recommended Python: 3.11+
 """
 
 import os
 import sys
 import time
+import sqlite3
+import logging
 import threading
 import traceback
+from logging.handlers import RotatingFileHandler
+from contextlib import closing
 from datetime import datetime, timedelta
-from dataclasses import dataclass
-from typing import Optional, Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import requests
 from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.executors.pool import ThreadPoolExecutor
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ═══════════════════════════════════════════════════════════════
-# CONFIGURATION
+# CONFIG
 # ═══════════════════════════════════════════════════════════════
 
 BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
-CHAT_ID   = os.environ.get("TG_CHAT_ID", "")
-FSA_KEY   = os.environ.get("FSA_API_KEY", "")
+CHAT_ID = os.environ.get("TG_CHAT_ID", "")
+FSA_KEY = os.environ.get("FSA_API_KEY", "")
 FSA_VA_ID = os.environ.get("FSA_VA_ID", "56177")
-PORT      = int(os.environ.get("PORT", 10000))
-HOSTNAME  = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "fshub-bot.onrender.com")
+PORT = int(os.environ.get("PORT", 10000))
+HOSTNAME = os.environ.get(
+    "RENDER_EXTERNAL_HOSTNAME",
+    "fshub-bot.onrender.com"
+)
 
-FSA_URL   = "https://www.fsairlines.net/va_interface2.php"
-TG_BASE   = f"https://api.telegram.org/bot{BOT_TOKEN}"
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+DB_PATH = os.environ.get("DB_PATH", "va_up.db")
+MAX_DB_FLIGHTS = int(os.environ.get("MAX_DB_FLIGHTS", "5000"))
 
-MAX_FLIGHTS = 500
+FSA_URL = "https://www.fsairlines.net/va_interface2.php"
+TG_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 if not BOT_TOKEN or not CHAT_ID:
-    print("❌ TG_BOT_TOKEN or TG_CHAT_ID not set")
+    print("❌ TG_BOT_TOKEN or TG_CHAT_ID missing")
     sys.exit(1)
 
-print(f"[CONFIG] BOT_TOKEN : {BOT_TOKEN[:10]}… (hidden)")
-print(f"[CONFIG] CHAT_ID   : {CHAT_ID}")
-if FSA_KEY:
-    print(f"[CONFIG] FSA_KEY   : {FSA_KEY[:10]}… (hidden)")
-    print(f"[CONFIG] FSA_VA_ID : {FSA_VA_ID}")
-else:
-    print("[CONFIG] FSA_API_KEY not set — financial features unavailable")
-
 # ═══════════════════════════════════════════════════════════════
-# FLIGHT STORAGE (in-memory)
+# LOGGING
 # ═══════════════════════════════════════════════════════════════
 
-@dataclass
-class FlightRecord:
-    pilot:        str
-    flight_no:    str
-    departure:    str
-    arrival:      str
-    landing_rate: int
-    date:         datetime
-    flight_id:    Optional[str] = None
+LOG_LEVEL = logging.INFO
 
-_flights: List[FlightRecord] = []
-_flights_lock = threading.Lock()
+logger = logging.getLogger("va_up_bot")
+logger.setLevel(LOG_LEVEL)
 
-def _add_flight(record: FlightRecord) -> None:
-    global _flights
-    with _flights_lock:
-        _flights.append(record)
-        if len(_flights) > MAX_FLIGHTS:
-            _flights = _flights[-MAX_FLIGHTS:]
+formatter = logging.Formatter(
+    "%(asctime)s | %(levelname)s | %(message)s"
+)
 
-def _get_flights() -> List[FlightRecord]:
-    with _flights_lock:
-        return list(_flights)
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
 
-def _find_flight(flight_id: str) -> Optional[FlightRecord]:
-    with _flights_lock:
-        for f in reversed(_flights):
-            if str(f.flight_id) == str(flight_id):
-                return f
-    return None
+file_handler = RotatingFileHandler(
+    "bot.log",
+    maxBytes=1_000_000,
+    backupCount=3,
+    encoding="utf-8"
+)
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+
+logger.info("Starting VA UP! Stable Edition")
+
+# ═══════════════════════════════════════════════════════════════
+# REQUEST SESSION
+# ═══════════════════════════════════════════════════════════════
+
+session = requests.Session()
+
+retry = Retry(
+    total=3,
+    read=3,
+    connect=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "POST"]
+)
+
+adapter = HTTPAdapter(max_retries=retry)
+
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+
+# ═══════════════════════════════════════════════════════════════
+# DATABASE
+# ═══════════════════════════════════════════════════════════════
+
+_db_lock = threading.Lock()
+
+
+def db_connect():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+conn = db_connect()
+
+
+with closing(conn.cursor()) as cur:
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS flights (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            flight_id TEXT UNIQUE,
+            pilot TEXT,
+            flight_no TEXT,
+            departure TEXT,
+            arrival TEXT,
+            aircraft TEXT,
+            landing_rate INTEGER,
+            profit INTEGER,
+            created_at TEXT
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS achievements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pilot TEXT,
+            achievement TEXT,
+            created_at TEXT
+        )
+        """
+    )
+
+    conn.commit()
+
+
+logger.info("Database initialized")
+
+# ═══════════════════════════════════════════════════════════════
+# DATABASE HELPERS
+# ═══════════════════════════════════════════════════════════════
+
+
+def db_add_flight(
+    flight_id: Optional[str],
+    pilot: str,
+    flight_no: str,
+    departure: str,
+    arrival: str,
+    aircraft: str,
+    landing_rate: int,
+    profit: Optional[int]
+):
+    with _db_lock:
+        with closing(conn.cursor()) as cur:
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO flights (
+                    flight_id,
+                    pilot,
+                    flight_no,
+                    departure,
+                    arrival,
+                    aircraft,
+                    landing_rate,
+                    profit,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    flight_id,
+                    pilot,
+                    flight_no,
+                    departure,
+                    arrival,
+                    aircraft,
+                    landing_rate,
+                    profit,
+                    datetime.utcnow().isoformat()
+                )
+            )
+
+            conn.commit()
+
+            cur.execute(
+                """
+                DELETE FROM flights
+                WHERE id NOT IN (
+                    SELECT id FROM flights
+                    ORDER BY id DESC
+                    LIMIT ?
+                )
+                """,
+                (MAX_DB_FLIGHTS,)
+            )
+
+            conn.commit()
+
+
+
+def db_last_flights(limit: int = 5):
+    with _db_lock:
+        with closing(conn.cursor()) as cur:
+            cur.execute(
+                """
+                SELECT * FROM flights
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,)
+            )
+            return cur.fetchall()
+
+
+
+def db_all_flights():
+    with _db_lock:
+        with closing(conn.cursor()) as cur:
+            cur.execute("SELECT * FROM flights")
+            return cur.fetchall()
 
 # ═══════════════════════════════════════════════════════════════
 # TELEGRAM
 # ═══════════════════════════════════════════════════════════════
 
+
 def tg_send(text: str, chat_id: Optional[str] = None) -> bool:
     target = str(chat_id) if chat_id else CHAT_ID
+
+    payload = {
+        "chat_id": target,
+        "text": text[:4096],
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+
     try:
-        r = requests.post(f"{TG_BASE}/sendMessage", json={
-            "chat_id": target, "text": text, "parse_mode": "HTML",
-        }, timeout=15)
-        return r.status_code == 200
+        r = session.post(
+            f"{TG_BASE}/sendMessage",
+            json=payload,
+            timeout=20
+        )
+
+        if r.status_code != 200:
+            logger.warning(f"Telegram send failed: {r.text}")
+            return False
+
+        return True
+
     except Exception as e:
-        print(f"[TG] send error: {e}")
+        logger.exception(f"Telegram send error: {e}")
         return False
 
-def tg_photo(url: str, caption: str, retries: int = 2) -> bool:
-    for attempt in range(retries + 1):
-        try:
-            r = requests.post(f"{TG_BASE}/sendPhoto", json={
-                "chat_id": CHAT_ID, "photo": url,
-                "caption": caption, "parse_mode": "HTML",
-            }, timeout=30)
-            if r.status_code == 200:
-                return True
-            print(f"[TG] photo attempt {attempt+1} failed: {r.status_code}")
-        except Exception as e:
-            print(f"[TG] photo error: {e}")
-        if attempt < retries:
-            time.sleep(1)
-    tg_send(f'📸 <b>Media attachment</b>\n<a href="{url}">View screenshot</a>')
-    return False
 
-def tg_setup_webhook() -> None:
-    url = f"https://{HOSTNAME}/bot/{BOT_TOKEN}"
+
+def tg_photo(url: str, caption: str) -> bool:
     try:
-        r = requests.get(f"{TG_BASE}/setWebhook", params={"url": url}, timeout=10)
-        result = r.json()
-        if result.get("ok"):
-            print(f"[TG] Webhook → {url}")
-        else:
-            print(f"[TG] Webhook failed: {result}")
+        r = session.post(
+            f"{TG_BASE}/sendPhoto",
+            json={
+                "chat_id": CHAT_ID,
+                "photo": url,
+                "caption": caption[:1024],
+                "parse_mode": "HTML"
+            },
+            timeout=30
+        )
+
+        if r.status_code == 200:
+            return True
+
+        logger.warning(f"Photo failed: {r.text}")
+
     except Exception as e:
-        print(f"[TG] Webhook error: {e}")
+        logger.exception(f"Photo error: {e}")
+
+    return tg_send(
+        f'📸 <b>Screenshot</b>\n<a href="{url}">Open media</a>'
+    )
+
+
+
+def tg_setup_webhook():
+    url = f"https://{HOSTNAME}/bot/{BOT_TOKEN}"
+
+    try:
+        r = session.get(
+            f"{TG_BASE}/setWebhook",
+            params={"url": url},
+            timeout=20
+        )
+
+        logger.info(f"Telegram webhook: {r.text}")
+
+    except Exception as e:
+        logger.exception(f"Webhook setup error: {e}")
 
 # ═══════════════════════════════════════════════════════════════
-# FSAIRLINES API
+# FSA API
 # ═══════════════════════════════════════════════════════════════
+
 
 def fsa_call(function: str, extra: Optional[Dict] = None):
     if not FSA_KEY:
         return None
+
     params = {
         "function": function,
-        "va_id":    FSA_VA_ID,
-        "apikey":   FSA_KEY,
-        "format":   "json",
+        "va_id": FSA_VA_ID,
+        "apikey": FSA_KEY,
+        "format": "json"
     }
+
     if extra:
         params.update(extra)
+
     try:
-        r = requests.get(FSA_URL, params=params, timeout=15)
+        r = session.get(FSA_URL, params=params, timeout=20)
         r.raise_for_status()
+
         body = r.json()
+
         if body.get("status") == "SUCCESS":
             return body.get("data")
-        print(f"[FSA] {function} → {body.get('status')}: {body.get('message','')}")
+
+        logger.warning(f"FSA failure: {body}")
         return None
+
     except Exception as e:
-        print(f"[FSA] {function} error: {e}")
+        logger.exception(f"FSA error: {e}")
         return None
 
-def fsa_daily_transactions() -> List[Dict]:
-    """Транзакции за сегодня"""
-    data = fsa_call("getDailyTransactions")
-    if not isinstance(data, list):
-        return []
-    today = datetime.now().date()
-    result = []
-    for t in data:
-        ts = t.get("ts")
-        if ts:
-            date = datetime.fromtimestamp(ts).date()
-            if date == today:
-                result.append(t)
-    return result
 
-def fsa_monthly_transactions() -> List[Dict]:
-    """Транзакции за последние 30 дней"""
-    data = fsa_call("getDailyTransactions")
-    if not isinstance(data, list):
-        return []
-    month_ago = datetime.now() - timedelta(days=30)
-    result = []
-    for t in data:
-        ts = t.get("ts")
-        if ts:
-            date = datetime.fromtimestamp(ts)
-            if date >= month_ago:
-                result.append(t)
-    return result
 
-def fsa_active_flights() -> List[Dict]:
-    data = fsa_call("getActiveFlights")
-    return data if isinstance(data, list) else []
+def get_flight_profit(report_id: int) -> Optional[int]:
+    data = fsa_call(
+        "getReportDetail",
+        {"report_id": report_id}
+    )
 
-def _aggregate(transactions: List[Dict]) -> Dict:
-    inc, exp = 0.0, 0.0
-    inc_cat: Dict[str, float] = {}
-    exp_cat: Dict[str, float] = {}
-    for t in transactions:
-        v = float(t.get("value", 0))
-        r = t.get("reason") or "Other"
-        if v >= 0:
-            inc += v
-            inc_cat[r] = inc_cat.get(r, 0) + v
-        else:
-            exp += abs(v)
-            exp_cat[r] = exp_cat.get(r, 0) + abs(v)
-    return {"inc": inc, "exp": exp, "net": inc - exp,
-            "inc_cat": inc_cat, "exp_cat": exp_cat}
+    if not data:
+        return None
 
-def _top(d: Dict, n: int = 3) -> List[Tuple]:
-    return sorted(d.items(), key=lambda x: x[1], reverse=True)[:n]
-
-def _nem(net: float) -> str:
-    return "📈" if net > 0 else "📉" if net < 0 else "➡️"
+    try:
+        return int(data.get("profit", 0))
+    except Exception:
+        return None
 
 # ═══════════════════════════════════════════════════════════════
-# STATISTICS (ENGLISH VERSION)
+# STATISTICS
 # ═══════════════════════════════════════════════════════════════
+
 
 def landing_rating(rate: int) -> Tuple[str, str]:
     if rate < -600:
@@ -222,472 +391,442 @@ def landing_rating(rate: int) -> Tuple[str, str]:
         return "STABLE LANDING", "🟢"
     return "SMOOTH LANDING", "✅"
 
-def fmt_full_stats() -> str:
-    flights    = _get_flights()
-    week_ago   = datetime.now() - timedelta(days=7)
-    week_count = sum(1 for f in flights if f.date >= week_ago)
-    rates      = [f.landing_rate for f in flights]
-    avg        = round(sum(rates) / len(rates)) if rates else 0
+
+
+def fmt_stats() -> str:
+    flights = db_all_flights()
+
+    if not flights:
+        return "📊 <b>No flight data available.</b>"
+
+    rates = [f["landing_rate"] for f in flights]
+    avg = round(sum(rates) / len(rates))
 
     return (
-        "📊 <b>VA UP! OPERATIONS SUMMARY</b>\n\n"
-        f"🛬 Total Flights: <b>{len(flights)}</b>\n"
-        f"📅 Last 7 Days: <b>{week_count}</b>\n"
-        f"📐 Average Landing Rate: <b>{avg} fpm</b>"
+        "📊 <b>VA UP! OPERATIONS</b>\n\n"
+        f"🛬 Flights: <b>{len(flights)}</b>\n"
+        f"📐 Average Landing: <b>{avg} fpm</b>"
     )
 
-def fmt_top_pilots() -> str:
-    week_ago = datetime.now() - timedelta(days=7)
-    flights  = [f for f in _get_flights() if f.date >= week_ago]
+
+
+def fmt_last(limit: int = 5) -> str:
+    flights = db_last_flights(limit)
 
     if not flights:
-        return (
-            "🏆 <b>CREW ACTIVITY RANKING</b>\n\n"
-            "No flight activity recorded during the last 7 days."
-        )
-
-    counts: Dict[str, int] = {}
-    for f in flights:
-        counts[f.pilot] = counts.get(f.pilot, 0) + 1
-
-    top    = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:10]
-    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    lines  = []
-
-    for i, (pilot, n) in enumerate(top, 1):
-        lines.append(f"{medals.get(i, f'{i}.')} <b>{pilot}</b> — {n} flights")
-
-    return "🏆 <b>CREW ACTIVITY RANKING</b>\n\n" + "\n".join(lines)
-
-def fmt_last_flights(limit: int = 5) -> str:
-    recent = _get_flights()[-limit:][::-1]
-
-    if not recent:
-        return (
-            "✈️ <b>LATEST FLIGHT REPORTS</b>\n\n"
-            "No completed flights available."
-        )
+        return "✈️ No flights recorded yet."
 
     lines = []
-    for f in recent:
-        rating, emoji = landing_rating(f.landing_rate)
-        lines.append(
-            f"{emoji} <b>{f.flight_no}</b> | {f.pilot}\n"
-            f"   🛫 {f.departure} → {f.arrival}\n"
-            f"   📊 {f.landing_rate} fpm — {rating}"
-        )
 
-    return "✈️ <b>LATEST FLIGHT REPORTS</b>\n\n" + "\n\n".join(lines)
-
-def fmt_daily_report() -> str:
-    today   = datetime.now().date()
-    flights = [f for f in _get_flights() if f.date.date() == today]
-
-    if not flights:
-        return (
-            "📊 <b>DAILY OPERATIONS SUMMARY</b>\n\n"
-            "✈️ No flight operations recorded today."
-        )
-
-    counts: Dict[str, int] = {}
     for f in flights:
-        counts[f.pilot] = counts.get(f.pilot, 0) + 1
+        rating, emoji = landing_rating(f["landing_rate"])
 
-    top_pilot, top_n = max(counts.items(), key=lambda x: x[1])
-    avg = round(sum(f.landing_rate for f in flights) / len(flights))
-
-    return (
-        f"📊 <b>DAILY OPERATIONS SUMMARY</b>\n\n"
-        f"✈️ Flights Completed: <b>{len(flights)}</b>\n"
-        f"👨‍✈️ Most Active Pilot: <b>{top_pilot}</b> ({top_n} flights)\n"
-        f"📐 Average Landing Rate: <b>{avg} fpm</b>"
-    )
-
-# ═══════════════════════════════════════════════════════════════
-# FINANCIAL FORMATTING
-# ═══════════════════════════════════════════════════════════════
-
-def fmt_daily_economy() -> str:
-    txs = fsa_daily_transactions()
-
-    if not txs:
-        return (
-            "📊 <b>DAILY FINANCIAL REPORT</b>\n\n"
-            "No financial transactions available.\n"
-            "<i>Rate limit: 500 requests/hour (Gold)</i>"
-        )
-
-    ag = _aggregate(txs)
-    em = _nem(ag["net"])
-
-    msg = (
-        f"📊 <b>DAILY FINANCIAL REPORT</b>\n\n"
-        f"💰 Revenue:  <b>+{ag['inc']:,.0f} v$</b>\n"
-        f"📉 Expenses: <b>-{ag['exp']:,.0f} v$</b>\n"
-        f"{em} <b>Net Result: {ag['net']:+,.0f} v$</b>\n"
-    )
-
-    if ag["inc_cat"]:
-        msg += "\n🔝 <b>PRIMARY REVENUE SOURCES:</b>\n"
-        for reason, amount in _top(ag["inc_cat"]):
-            msg += f"   • {reason}: <b>+{amount:,.0f} v$</b>\n"
-
-    if ag["exp_cat"]:
-        msg += "\n⚠️ <b>PRIMARY EXPENSE SOURCES:</b>\n"
-        for reason, amount in _top(ag["exp_cat"]):
-            msg += f"   • {reason}: <b>-{amount:,.0f} v$</b>\n"
-
-    return msg
-
-def fmt_monthly_economy() -> str:
-    """Ежемесячный экономический дайджест за последние 30 дней"""
-    txs = fsa_monthly_transactions()
-    
-    if not txs:
-        return "📊 <b>MONTHLY FINANCIAL SUMMARY</b>\n\nNo financial data available for the last 30 days."
-    
-    # Суммируем за месяц
-    total_inc = 0
-    total_exp = 0
-    daily_net: Dict[str, float] = {}
-    
-    for t in txs:
-        value = float(t.get("value", 0))
-        ts = t.get("ts")
-        if ts:
-            day = datetime.fromtimestamp(ts).strftime('%Y-%m-%d')
-            daily_net[day] = daily_net.get(day, 0) + value
-            if value >= 0:
-                total_inc += value
-            else:
-                total_exp += abs(value)
-    
-    net = total_inc - total_exp
-    em = _nem(net)
-    
-    # Находим лучший и худший день
-    best_day = max(daily_net.items(), key=lambda x: x[1]) if daily_net else (None, 0)
-    worst_day = min(daily_net.items(), key=lambda x: x[1]) if daily_net else (None, 0)
-    
-    msg = (
-        f"🏆 <b>MONTHLY FINANCIAL DIGEST</b>\n"
-        f"📅 {datetime.now().strftime('%B %Y')}\n\n"
-        f"💰 Revenue: <b>+{total_inc:,.0f} v$</b>\n"
-        f"📉 Expenses: <b>-{total_exp:,.0f} v$</b>\n"
-        f"{em} <b>NET: {em} {net:+,.0f} v$</b>\n"
-    )
-    
-    if best_day[0]:
-        msg += f"\n🌟 Best Day: <b>{best_day[0]}</b> (+{best_day[1]:,.0f} v$)\n"
-    if worst_day[0]:
-        msg += f"⚠️ Worst Day: <b>{worst_day[0]}</b> ({worst_day[1]:+,.0f} v$)\n"
-    
-    msg += f"\n📊 Days with activity: <b>{len(daily_net)}</b>"
-    
-    return msg
-
-def fmt_active_flights() -> str:
-    flights = fsa_active_flights()
-
-    if not flights:
-        return (
-            "✈️ <b>ACTIVE FLIGHT OPERATIONS</b>\n\n"
-            "No airborne aircraft at this time."
-        )
-
-    lines = []
-    for f in flights[:10]:
         lines.append(
-            f"✈️ <b>{f.get('number','N/A')}</b>  "
-            f"{f.get('departure','???')} → {f.get('arrival','???')}  "
-            f"[{f.get('passengers',0)} pax]"
+            f"{emoji} <b>{f['flight_no']}</b>\n"
+            f"👨‍✈️ {f['pilot']}\n"
+            f"🗺 {f['departure']} → {f['arrival']}\n"
+            f"📊 {f['landing_rate']} fpm"
         )
 
-    return f"🛫 <b>AIRBORNE AIRCRAFT ({len(flights)})</b>\n\n" + "\n".join(lines)
+    return "✈️ <b>LATEST FLIGHTS</b>\n\n" + "\n\n".join(lines)
+
+
+
+def fmt_top_landings(limit: int = 10) -> str:
+    with _db_lock:
+        with closing(conn.cursor()) as cur:
+            cur.execute(
+                """
+                SELECT * FROM flights
+                ORDER BY ABS(landing_rate) ASC
+                LIMIT ?
+                """,
+                (limit,)
+            )
+            rows = cur.fetchall()
+
+    if not rows:
+        return "🏆 No landing data available."
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+
+    for i, row in enumerate(rows, 1):
+        prefix = medals[i - 1] if i <= 3 else f"{i}."
+
+        lines.append(
+            f"{prefix} <b>{row['pilot']}</b> — {row['landing_rate']} fpm"
+        )
+
+    return "🏆 <b>TOP LANDINGS</b>\n\n" + "\n".join(lines)
 
 # ═══════════════════════════════════════════════════════════════
-# FSHUB EVENT HANDLERS (WITH FSAIRLINES PROFIT)
+# FSHUB EVENTS
 # ═══════════════════════════════════════════════════════════════
 
-def get_flight_profit_from_fsa(report_id: int, retries: int = 3) -> Optional[int]:
-    """Запрашивает прибыль рейса из FSAirlines с повторными попытками"""
-    if not FSA_KEY:
-        return None
-    
-    params = {
-        "function": "getReportDetail",
-        "va_id": FSA_VA_ID,
-        "apikey": FSA_KEY,
-        "report_id": report_id,
-        "format": "json"
-    }
-    
-    for attempt in range(retries):
-        try:
-            if attempt == 0:
-                time.sleep(3)
-            else:
-                time.sleep(5)
-            
-            r = requests.get(FSA_URL, params=params, timeout=15)
-            r.raise_for_status()
-            body = r.json()
-            
-            if body.get("status") == "SUCCESS":
-                data = body.get("data")
-                if data:
-                    profit = data.get("profit")
-                    if profit is not None:
-                        return int(profit)
-                print(f"[FSA] Profit not found for report {report_id}")
-            else:
-                print(f"[FSA] Attempt {attempt+1} failed: {body.get('status')}")
-        except Exception as e:
-            print(f"[FSA] Error on attempt {attempt+1}: {e}")
-    
-    return None
 
-def handle_departure(data: Dict) -> None:
-    d = data.get("_data", {}) or {}
-    pl = d.get("plan") or {}
-    user = d.get("user") or {}
-    aircraft = d.get("aircraft") or {}
+def handle_departure(data: Dict):
+    d = data.get("_data", {})
+
+    user = d.get("user", {})
+    plan = d.get("plan", {})
+    aircraft = d.get("aircraft", {})
 
     tg_send(
         f"🛫 <b>DEPARTURE CONFIRMED</b>\n\n"
         f"👨‍✈️ Captain: <b>{user.get('name', 'Unknown')}</b>\n"
-        f"🆔 Flight: <b>{pl.get('flight_no', 'N/A')}</b>\n"
-        f"🗺 Route: <b>{pl.get('departure', '????')} → {pl.get('arrival', '????')}</b>\n"
-        f"✈️ Aircraft: <b>{aircraft.get('icao_name', 'N/A')}</b>\n\n"
-        f"🕒 OFF BLOCK: {datetime.utcnow().strftime('%H:%M UTC')}"
+        f"🆔 Flight: <b>{plan.get('flight_no', 'N/A')}</b>\n"
+        f"🗺 Route: <b>{plan.get('departure')} → {plan.get('arrival')}</b>\n"
+        f"✈️ Aircraft: <b>{aircraft.get('icao_name', 'N/A')}</b>"
     )
 
-def handle_arrival(data: Dict) -> None:
-    d = data.get("_data", {}) or {}
-    pl = d.get("plan") or {}
-    user = d.get("user") or {}
-    aircraft = d.get("aircraft") or {}
-    airport = d.get("airport") or {}
+
+
+def handle_arrival(data: Dict):
+    d = data.get("_data", {})
+
+    user = d.get("user", {})
+    plan = d.get("plan", {})
+    aircraft = d.get("aircraft", {})
+    airport = d.get("airport", {})
+
+    flight_id = str(d.get("id", ""))
     rate = int(d.get("landing_rate", 0))
-    flight_id = d.get("id")
-    flight_no = pl.get('flight_no', 'N/A')
 
     rating, emoji = landing_rating(rate)
 
-    # Сохраняем рейс в память
-    _add_flight(FlightRecord(
-        pilot        = user.get("name", "Unknown"),
-        flight_no    = flight_no,
-        departure    = pl.get("departure", "????"),
-        arrival      = pl.get("arrival", "????"),
-        landing_rate = rate,
-        date         = datetime.now(),
-        flight_id    = str(flight_id) if flight_id else None,
-    ))
+    profit = None
 
-    # Запрашиваем прибыль из FSAirlines (если есть API ключ и flight_id)
-    profit_text = ""
     if FSA_KEY and flight_id:
-        profit = get_flight_profit_from_fsa(flight_id)
-        if profit is not None:
-            profit_text = f"\n\n💎 TOTAL PROFIT: {profit:,.0f} v$"
+        try:
+            profit = get_flight_profit(int(flight_id))
+        except Exception:
+            pass
 
-    # Отправляем единое сообщение
+    db_add_flight(
+        flight_id=flight_id,
+        pilot=user.get("name", "Unknown"),
+        flight_no=plan.get("flight_no", "N/A"),
+        departure=plan.get("departure", "????"),
+        arrival=plan.get("arrival", "????"),
+        aircraft=aircraft.get("icao_name", "Unknown"),
+        landing_rate=rate,
+        profit=profit
+    )
+
+    profit_text = ""
+
+    if profit is not None:
+        profit_text = f"\n💎 Profit: <b>{profit:,.0f} v$</b>"
+
+    flight_link = ""
+
+    if flight_id:
+        flight_link = (
+            f"\n🔗 <a href=\"https://fshub.io/flight/{flight_id}\">"
+            f"Open Flight Report</a>"
+        )
+
     tg_send(
         f"🛬 <b>ARRIVAL CONFIRMED</b> {emoji}\n\n"
         f"👨‍✈️ Captain: <b>{user.get('name', 'Unknown')}</b>\n"
-        f"🆔 Flight: <b>{flight_no}</b>\n"
-        f"🗺 Route: <b>{pl.get('departure', '????')} → {pl.get('arrival', '????')}</b>\n"
-        f"✈️ Aircraft: <b>{aircraft.get('icao_name', 'N/A')}</b>\n"
-        f"📍 Destination: <b>{airport.get('name', pl.get('arrival', '????'))}</b>\n"
+        f"🆔 Flight: <b>{plan.get('flight_no', 'N/A')}</b>\n"
+        f"🗺 Route: <b>{plan.get('departure')} → {plan.get('arrival')}</b>\n"
+        f"📍 Airport: <b>{airport.get('name', 'Unknown')}</b>\n"
+        f"✈️ Aircraft: <b>{aircraft.get('icao_name', 'Unknown')}</b>\n"
         f"📊 Landing Rate: <b>{rate} fpm</b> — {rating}"
-        f"{profit_text}\n\n"
-        f"🕒 ON BLOCK: {datetime.utcnow().strftime('%H:%M UTC')}"
+        f"{profit_text}"
+        f"{flight_link}"
     )
 
-def handle_screenshots(data: Dict) -> None:
+    if rate < -400:
+        tg_send(
+            f"⚠️ <b>HARD LANDING ALERT</b>\n\n"
+            f"👨‍✈️ Pilot: <b>{user.get('name', 'Unknown')}</b>\n"
+            f"📊 Landing Rate: <b>{rate} fpm</b>\n"
+            f"✈️ Aircraft inspection recommended."
+        )
+
+
+
+def handle_screenshots(data: Dict):
     screenshots = data.get("_data", [])
+
     if not screenshots:
         return
 
-    flight_id = screenshots[0].get("flight_id")
-    flight = _find_flight(str(flight_id)) if flight_id else None
-
-    if flight:
-        caption = (
-            f"📸 <b>POST-FLIGHT MEDIA</b>\n"
-            f"✈️ {flight.departure} → {flight.arrival}\n"
-            f"👨‍✈️ {flight.pilot}"
-        )
-    else:
-        caption = f"📸 <b>FLIGHT MEDIA ATTACHMENT</b>\nFlight ID: #{flight_id}"
-
     for scr in screenshots[:3]:
-        if url := scr.get("screenshot_url"):
-            tg_photo(url, caption)
+        url = scr.get("screenshot_url")
+
+        if url:
+            tg_photo(
+                url,
+                "📸 <b>Flight Screenshot</b>"
+            )
+
             time.sleep(1)
 
-    extra = len(screenshots) - 3
-    if extra > 0:
-        tg_send(f"📸 <b>{extra} additional media attachment(s)</b>\nFlight ID: #{flight_id}")
 
-def handle_achievement(data: Dict) -> None:
-    d = data.get("_data", {}) or {}
-    flight = d.get("flight") or {}
-    user = flight.get("user") or {}
-    achievement = d.get("achievement") or {}
+
+def handle_achievement(data: Dict):
+    d = data.get("_data", {})
+
+    achievement = d.get("achievement", {})
+    flight = d.get("flight", {})
+    user = flight.get("user", {})
 
     tg_send(
-        f"🏆 <b>CREW ACHIEVEMENT UNLOCKED</b>\n\n"
+        f"🏆 <b>ACHIEVEMENT UNLOCKED</b>\n\n"
         f"👨‍✈️ {user.get('name', 'Unknown')}\n"
-        f"🎯 {achievement.get('title', 'Achievement')}\n\n"
-        f"Operations Control congratulates the crew."
+        f"🎯 {achievement.get('title', 'Achievement')}"
     )
 
+
 FSHUB_HANDLERS = {
-    "flight.departed":      handle_departure,
-    "flight.arrived":       handle_arrival,
+    "flight.departed": handle_departure,
+    "flight.arrived": handle_arrival,
     "screenshots.uploaded": handle_screenshots,
-    "airline.achievement":  handle_achievement,
+    "airline.achievement": handle_achievement,
 }
 
 # ═══════════════════════════════════════════════════════════════
 # TELEGRAM COMMANDS
 # ═══════════════════════════════════════════════════════════════
 
-_HELP = (
-    "<b>VA UP! OPERATIONS PANEL</b>\n\n"
-    "📊 <b>Flight Operations:</b>\n"
-    "/stats   — fleet activity statistics\n"
-    "/top     — crew activity ranking\n"
-    "/last    — latest flight reports\n\n"
-    "💰 <b>Financial Operations:</b>\n"
-    "/economy — daily financial report\n"
-    "/monthly — monthly financial digest (last 30 days)\n"
-    "/live    — active flight operations"
+
+HELP_TEXT = (
+    "<b>VA UP! Operations Panel</b>\n\n"
+    "/stats — operations statistics\n"
+    "/last — latest flights\n"
+    "/top_landing — best landings"
 )
 
-TG_COMMANDS = {
-    "/stats":   fmt_full_stats,
-    "/top":     fmt_top_pilots,
-    "/last":    fmt_last_flights,
-    "/economy": fmt_daily_economy,
-    "/monthly": fmt_monthly_economy,
-    "/live":    fmt_active_flights,
+
+COMMANDS = {
+    "/stats": fmt_stats,
+    "/last": fmt_last,
+    "/top_landing": fmt_top_landings,
 }
 
-def handle_tg_command(message: Dict) -> None:
+
+
+def handle_tg_command(message: Dict):
     chat_id = message.get("chat", {}).get("id")
     text = (message.get("text") or "").strip()
+
     if not chat_id or not text:
         return
+
     if str(chat_id) == str(CHAT_ID):
         return
 
-    print(f"[CMD] chat={chat_id} text={text!r}")
+    logger.info(f"Telegram command: {text}")
 
     if text == "/start":
-        tg_send("✈️ <b>VA UP! Operations Bot</b>\n\nUse /help for command list.", chat_id)
-    elif text == "/help":
-        tg_send(_HELP, chat_id)
-    elif text in TG_COMMANDS:
-        tg_send(TG_COMMANDS[text](), chat_id)
-    else:
-        tg_send("Unknown command. /help — list of commands.", chat_id)
+        tg_send(
+            "✈️ <b>VA UP! Stable Edition</b>\n\nUse /help",
+            chat_id
+        )
+        return
+
+    if text == "/help":
+        tg_send(HELP_TEXT, chat_id)
+        return
+
+    if text in COMMANDS:
+        try:
+            tg_send(COMMANDS[text](), chat_id)
+        except Exception as e:
+            logger.exception(f"Command failed: {e}")
+            tg_send("⚠️ Command error.", chat_id)
+        return
+
+    tg_send("Unknown command.", chat_id)
 
 # ═══════════════════════════════════════════════════════════════
-# FLASK ROUTES
+# FLASK
 # ═══════════════════════════════════════════════════════════════
 
 app = Flask(__name__)
 
+
+@app.route("/")
+def home():
+    return jsonify({
+        "status": "running",
+        "service": "VA UP! Stable Edition",
+        "fsa_enabled": bool(FSA_KEY)
+    })
+
+
+@app.route("/health")
+def health():
+    return jsonify({"ok": True}), 200
+
+
 @app.route("/webhook", methods=["GET", "POST"])
 def fshub_webhook():
     if request.method == "GET":
-        return jsonify({"status": "ok"}), 200
+        return jsonify({"status": "ok"})
+
     try:
+        if WEBHOOK_SECRET:
+            incoming = request.headers.get("X-Webhook-Secret")
+
+            if incoming != WEBHOOK_SECRET:
+                logger.warning("Invalid webhook secret")
+                return jsonify({"error": "forbidden"}), 403
+
         data = request.get_json(force=True)
+
         if not data:
-            return jsonify({"error": "no JSON"}), 400
+            return jsonify({"error": "no json"}), 400
+
         event = data.get("_type", "")
-        print(f"[FSHUB] event={event}")
-        if handler := FSHUB_HANDLERS.get(event):
+
+        logger.info(f"FSHub event: {event}")
+
+        handler = FSHUB_HANDLERS.get(event)
+
+        if handler:
             handler(data)
-        else:
-            print(f"[FSHUB] Unknown event: {event!r}")
-        return jsonify({"ok": True}), 200
+
+        return jsonify({"ok": True})
+
     except Exception as e:
-        traceback.print_exc()
+        logger.exception(f"Webhook failure: {e}")
         return jsonify({"error": str(e)}), 500
+
 
 @app.route(f"/bot/{BOT_TOKEN}", methods=["POST"])
 def tg_webhook():
     try:
         data = request.get_json(force=True) or {}
-        message = data.get("message") or data.get("channel_post") or {}
-        handle_tg_command(message)
-    except Exception:
-        traceback.print_exc()
-    return jsonify({"ok": True}), 200
 
-@app.route("/")
-def home():
-    with _flights_lock:
-        n = len(_flights)
-    return jsonify({"status": "running", "flights_in_memory": n, "fsa": bool(FSA_KEY)})
+        message = data.get("message") or {}
+
+        handle_tg_command(message)
+
+    except Exception as e:
+        logger.exception(f"Telegram webhook failure: {e}")
+
+    return jsonify({"ok": True})
 
 # ═══════════════════════════════════════════════════════════════
-# SCHEDULER (All times UTC)
+# SCHEDULER
 # ═══════════════════════════════════════════════════════════════
 
 scheduler = BackgroundScheduler(
-    executors={"default": ThreadPoolExecutor(max_workers=2)},
-    timezone="UTC",
+    executors={
+        "default": ThreadPoolExecutor(max_workers=2)
+    },
+    timezone="UTC"
 )
 
-# Daily FSHub stats at 21:00 UTC
-scheduler.add_job(lambda: tg_send(fmt_daily_report()),
-    "cron", hour=21, minute=0, id="daily_stats")
 
-# Weekly crew ranking on Sunday at 12:00 UTC
-scheduler.add_job(lambda: tg_send(fmt_top_pilots()),
-    "cron", day_of_week="sun", hour=12, minute=0, id="weekly_top")
+scheduler.add_job(
+    lambda: tg_send(fmt_stats()),
+    "cron",
+    hour=21,
+    minute=0,
+    id="daily_stats",
+    replace_existing=True,
+    misfire_grace_time=300
+)
 
-# Saturday joint flight invitation at 06:00 UTC (09:00 MSK / 18:00 Kamchatka)
-scheduler.add_job(lambda: tg_send(
-    "🛫 <b>SATURDAY JOINT FLIGHT OPERATION!</b>\n\n"
-    "⏰ Moscow: 09:00 ☀️  |  Kamchatka: 18:00 🌙\n\n"
-    "✈️ Suggest your route in the comments!\nWho is joining? 👇"
-), "cron", day_of_week="sat", hour=6, minute=0, id="saturday_inv")
 
-# Weekly challenge on Monday at 08:00 UTC (11:00 MSK)
-scheduler.add_job(lambda: tg_send(
-    "🏆 <b>WEEKLY CREW CHALLENGE!</b>\n\n"
-    "🔹 Goal: 3 flights in 7 days\n"
-    "🔹 Bonus: Best landing rate of the week\n\nReady to accept? 💪"
-), "cron", day_of_week="mon", hour=8, minute=0, id="monday_challenge")
+scheduler.add_job(
+    lambda: tg_send(fmt_top_landings()),
+    "cron",
+    day_of_week="sun",
+    hour=12,
+    minute=0,
+    id="weekly_landing_ranking",
+    replace_existing=True,
+    misfire_grace_time=300
+)
 
-# Daily financial report at 07:00 UTC (10:00 MSK)
+
 if FSA_KEY:
-    scheduler.add_job(lambda: tg_send(fmt_daily_economy()),
-        "cron", hour=7, minute=0, id="daily_economy")
-
-# Monthly financial digest on the 1st at 21:00 UTC (00:00 MSK on the 2nd)
-if FSA_KEY:
-    scheduler.add_job(lambda: tg_send(fmt_monthly_economy()),
-        "cron", day=1, hour=21, minute=0, id="monthly_digest")
-
-scheduler.start()
-print("[SCHED] Scheduler started:")
-for job in scheduler.get_jobs():
-    print(f"  · {job.id:20s} next={job.next_run_time}")
+    scheduler.start()
+    logger.info("Scheduler started")
 
 # ═══════════════════════════════════════════════════════════════
-# START
+# STARTUP
 # ═══════════════════════════════════════════════════════════════
 
-tg_setup_webhook()
-print(f"[BOT] Started on port {PORT}")
+
+def startup_message():
+    try:
+        tg_send(
+            "🟢 <b>VA UP! Stable Edition online</b>"
+        )
+    except Exception:
+        pass
+
+
+try:
+    tg_setup_webhook()
+    startup_message()
+except Exception:
+    logger.exception("Startup failed")
+
+
+logger.info(f"Running on port {PORT}")
+
+# ═══════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+    app.run(
+        host="0.0.0.0",
+        port=PORT,
+        threaded=True
+    )
+```
+
+---
+
+# requirements.txt
+
+```txt
+Flask==3.0.3
+requests==2.32.3
+APScheduler==3.10.4
+gunicorn==23.0.0
+urllib3==2.2.2
+```
+
+---
+
+# Render Start Command
+
+```bash
+gunicorn app:app --workers=1 --threads=4 --timeout=120
+```
+
+---
+
+# Recommended Environment Variables
+
+```env
+TG_BOT_TOKEN=
+TG_CHAT_ID=
+FSA_API_KEY=
+FSA_VA_ID=56177
+RENDER_EXTERNAL_HOSTNAME=
+WEBHOOK_SECRET=
+DB_PATH=va_up.db
+MAX_DB_FLIGHTS=5000
+```
+
+---
+
+# Recommended UptimeRobot URL
+
+```text
+https://YOUR-RENDER-APP.onrender.com/health
+```
+
+Ping every 5 minutes.
