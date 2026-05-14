@@ -955,12 +955,12 @@ scheduler = BackgroundScheduler(
 
 scheduler.add_job(
     snapshot_daily_economy, "cron",
-    hour=23, minute=50, id="daily_economy_snapshot",
+    hour=0, minute=24, id="daily_economy_snapshot",
     replace_existing=True, misfire_grace_time=300,
 )
 scheduler.add_job(
     lambda: tg_send(fmt_stats()), "cron",
-    hour=0, minute=20, id="daily_stats",
+    hour=0, minute=23, id="daily_stats",
     replace_existing=True, misfire_grace_time=300,
 )
 scheduler.add_job(
