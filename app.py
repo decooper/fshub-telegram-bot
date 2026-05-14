@@ -1,28 +1,3 @@
-# VA UP! Stable Edition — Production-Oriented Single File Bot
-
-```python
-"""
-VA UP! Operations Bot — Stable Edition
-Optimized for Render Free + Telegram + FSHub + FSAirlines
-
-Features:
-- Stable webhook handling
-- Safe memory limits
-- SQLite persistence
-- Retry sessions
-- Telegram fail protection
-- APScheduler safe jobs
-- Logging
-- Health endpoints
-- Low RAM footprint
-- Thread-safe storage
-- Hard landing alerts
-- Flight links
-- Graceful shutdown behavior
-
-Recommended Python: 3.11+
-"""
-
 import os
 import sys
 import time
