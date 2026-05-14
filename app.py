@@ -22,18 +22,17 @@ from urllib3.util.retry import Retry
 # CONFIG
 # ═══════════════════════════════════════════════════════════════
 
-BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN", "")
-CHAT_ID    = os.environ.get("TG_CHAT_ID", "")
-FSA_KEY    = os.environ.get("FSA_API_KEY", "")
-FSA_VA_ID  = os.environ.get("FSA_VA_ID", "56177")
-PORT       = int(os.environ.get("PORT", 10000))
-HOSTNAME   = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "fshub-bot.onrender.com")
+BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
+CHAT_ID = os.environ.get("TG_CHAT_ID", "")
+FSA_KEY = os.environ.get("FSA_API_KEY", "")
+FSA_VA_ID = os.environ.get("FSA_VA_ID", "56177")
+PORT = int(os.environ.get("PORT", 10000))
+HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "fshub-bot.onrender.com")
 
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 MAX_DB_FLIGHTS = int(os.environ.get("MAX_DB_FLIGHTS", "5000"))
 
 # PostgreSQL connection string from Neon / Render / any provider
-# Example: postgresql://user:password@host/dbname?sslmode=require
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 FSA_URL = "https://www.fsairlines.net/va_interface2.php"
@@ -87,7 +86,6 @@ session.mount("http://", adapter)
 
 # ═══════════════════════════════════════════════════════════════
 # DATABASE  —  PostgreSQL with connection pool
-# Pool size 1-3 is enough for Free tier (0.1 CPU, 512 MB RAM)
 # ═══════════════════════════════════════════════════════════════
 
 _pool: psycopg2.pool.ThreadedConnectionPool = None
@@ -106,6 +104,8 @@ def _create_pool():
 
 def get_conn():
     """Borrow a connection from the pool."""
+    if _pool is None:
+        _create_pool()
     return _pool.getconn()
 
 
@@ -166,7 +166,6 @@ def _init_db():
         """
     )
     # Stores one row per calendar day with aggregated financials.
-    # This is how /monthly works accurately over 30 days.
     db_execute(
         """
         CREATE TABLE IF NOT EXISTS daily_economy (
@@ -180,6 +179,7 @@ def _init_db():
         """
     )
     logger.info("Database tables ready")
+
 
 # ═══════════════════════════════════════════════════════════════
 # DB HELPERS — FLIGHTS
@@ -240,15 +240,12 @@ def db_top_landings(limit: int = 10) -> List:
         fetch="all",
     ) or []
 
+
 # ═══════════════════════════════════════════════════════════════
 # DB HELPERS — DAILY ECONOMY
 # ═══════════════════════════════════════════════════════════════
 
 def db_save_daily_economy(day: str, income: int, expense: int, detail: Dict):
-    """
-    Upsert today's economy snapshot.
-    day format: 'YYYY-MM-DD'
-    """
     db_execute(
         """
         INSERT INTO daily_economy (day, income, expense, net, detail)
@@ -264,7 +261,6 @@ def db_save_daily_economy(day: str, income: int, expense: int, detail: Dict):
 
 
 def db_get_monthly_economy(days: int = 30) -> List:
-    """Return economy rows for the last N days."""
     return db_execute(
         f"""
         SELECT * FROM daily_economy
@@ -280,6 +276,7 @@ def db_get_today_economy() -> Optional[Dict]:
         "SELECT * FROM daily_economy WHERE day = CURRENT_DATE",
         fetch="one",
     )
+
 
 # ═══════════════════════════════════════════════════════════════
 # TELEGRAM
@@ -339,6 +336,7 @@ def tg_setup_webhook():
     except Exception as e:
         logger.exception(f"Webhook setup error: {e}")
 
+
 # ═══════════════════════════════════════════════════════════════
 # FSA API
 # ═══════════════════════════════════════════════════════════════
@@ -382,6 +380,15 @@ def fsa_daily_transactions() -> List[Dict]:
     return [t for t in data if (dt := _safe_ts(t.get("ts"))) and dt.date() == today]
 
 
+def fsa_monthly_transactions() -> List[Dict]:
+    """Транзакции за последние 30 дней через API (если есть)"""
+    data = fsa_call("getDailyTransactions")
+    if not isinstance(data, list):
+        return []
+    threshold = datetime.now() - timedelta(days=30)
+    return [t for t in data if (dt := _safe_ts(t.get("ts"))) and dt >= threshold]
+
+
 def fsa_active_flights() -> List[Dict]:
     data = fsa_call("getActiveFlights")
     return data if isinstance(data, list) else []
@@ -402,6 +409,7 @@ def get_flight_profit(report_id: int) -> Optional[int]:
         return int(float(data.get("profit", 0)))
     except (ValueError, TypeError):
         return None
+
 
 # ═══════════════════════════════════════════════════════════════
 # FINANCIAL AGGREGATION
@@ -436,10 +444,7 @@ def _nem(net: float) -> str:
 
 
 def snapshot_daily_economy():
-    """
-    Called every day at 23:50 UTC by scheduler.
-    Pulls today's FSA transactions, aggregates, saves to DB.
-    """
+    """Вызывается каждый день в 23:50 UTC"""
     if not FSA_KEY:
         return
     txs = fsa_daily_transactions()
@@ -457,16 +462,22 @@ def snapshot_daily_economy():
     )
     logger.info(f"Economy snapshot saved for {day}: net={ag['net']:,.0f}")
 
+
 # ═══════════════════════════════════════════════════════════════
 # LANDING RATING
 # ═══════════════════════════════════════════════════════════════
 
 def landing_rating(rate: int) -> Tuple[str, str]:
-    if rate < -600: return "UNSAFE LANDING", "🔴"
-    if rate < -400: return "HARD LANDING", "🟠"
-    if rate < -250: return "FIRM LANDING", "🟡"
-    if rate < -100: return "STABLE LANDING", "🟢"
+    if rate < -600:
+        return "UNSAFE LANDING", "🔴"
+    if rate < -400:
+        return "HARD LANDING", "🟠"
+    if rate < -250:
+        return "FIRM LANDING", "🟡"
+    if rate < -100:
+        return "STABLE LANDING", "🟢"
     return "SMOOTH LANDING", "✅"
+
 
 # ═══════════════════════════════════════════════════════════════
 # COMMAND FORMATTERS
@@ -524,7 +535,6 @@ def fmt_top_pilots() -> str:
             ca = f["created_at"]
             if isinstance(ca, str):
                 ca = datetime.fromisoformat(ca)
-            # strip timezone for comparison
             if ca.replace(tzinfo=None) >= week_ago:
                 counts[f["pilot"]] = counts.get(f["pilot"], 0) + 1
         except Exception:
@@ -541,20 +551,15 @@ def fmt_top_pilots() -> str:
 
 
 def fmt_daily_economy() -> str:
-    """
-    Shows today's data: first tries DB snapshot,
-    falls back to live FSA call if snapshot not yet saved today.
-    """
     row = db_get_today_economy()
     if row:
-        inc  = row["income"]
-        exp  = row["expense"]
-        net  = row["net"]
+        inc = row["income"]
+        exp = row["expense"]
+        net = row["net"]
         detail = row["detail"] or {}
         inc_cat = detail.get("inc_cat", {})
         exp_cat = detail.get("exp_cat", {})
     else:
-        # Live fallback
         txs = fsa_daily_transactions()
         if not txs:
             return "📊 No financial data for today."
@@ -581,24 +586,14 @@ def fmt_daily_economy() -> str:
 
 
 def fmt_monthly_economy() -> str:
-    """
-    Uses our own DB history — accurate up to 30 days.
-    Each day is a snapshot saved at 23:50 UTC.
-    """
     rows = db_get_monthly_economy(days=30)
     if not rows:
-        return (
-            "📊 No monthly data yet.\n\n"
-            "ℹ️ History is collected daily at 23:50 UTC. "
-            "Data will appear from tomorrow."
-        )
+        return "📊 No monthly data yet.\n\nℹ️ History is collected daily at 23:50 UTC. Data will appear from tomorrow."
 
-    total_inc = sum(r["income"]  for r in rows)
+    total_inc = sum(r["income"] for r in rows)
     total_exp = sum(r["expense"] for r in rows)
     net = total_inc - total_exp
-
-    # best/worst by net per day
-    best_row  = max(rows, key=lambda r: r["net"])
+    best_row = max(rows, key=lambda r: r["net"])
     worst_row = min(rows, key=lambda r: r["net"])
 
     msg = (
@@ -607,10 +602,8 @@ def fmt_monthly_economy() -> str:
         f"💰 Revenue: <b>+{total_inc:,.0f} v$</b>\n"
         f"📉 Expenses: <b>-{total_exp:,.0f} v$</b>\n"
         f"{_nem(net)} <b>Net: {net:+,.0f} v$</b>\n\n"
-        f"🌟 Best Day: <b>{best_row['day']}</b> "
-        f"(+{best_row['net']:,.0f} v$)\n"
-        f"⚠️ Worst Day: <b>{worst_row['day']}</b> "
-        f"({worst_row['net']:+,.0f} v$)\n\n"
+        f"🌟 Best Day: <b>{best_row['day']}</b> (+{best_row['net']:,.0f} v$)\n"
+        f"⚠️ Worst Day: <b>{worst_row['day']}</b> ({worst_row['net']:+,.0f} v$)\n\n"
         f"📊 Days with data: <b>{len(rows)}</b>"
     )
     return msg
@@ -642,14 +635,15 @@ def fmt_va_info() -> str:
         f"✈️ Code: <b>{data.get('code', 'N/A')}</b>"
     )
 
+
 # ═══════════════════════════════════════════════════════════════
 # FSHUB EVENT HANDLERS
 # ═══════════════════════════════════════════════════════════════
 
 def handle_departure(data: Dict):
-    d        = data.get("_data", {})
-    user     = d.get("user", {})
-    plan     = d.get("plan", {})
+    d = data.get("_data", {})
+    user = d.get("user", {})
+    plan = d.get("plan", {})
     aircraft = d.get("aircraft", {})
     tg_send(
         f"🛫 <b>DEPARTURE CONFIRMED</b>\n\n"
@@ -661,14 +655,14 @@ def handle_departure(data: Dict):
 
 
 def handle_arrival(data: Dict):
-    d        = data.get("_data", {})
-    user     = d.get("user", {})
-    plan     = d.get("plan", {})
+    d = data.get("_data", {})
+    user = d.get("user", {})
+    plan = d.get("plan", {})
     aircraft = d.get("aircraft", {})
-    airport  = d.get("airport", {})
+    airport = d.get("airport", {})
 
-    flight_id     = str(d.get("id", ""))
-    rate          = int(d.get("landing_rate", 0))
+    flight_id = str(d.get("id", ""))
+    rate = int(d.get("landing_rate", 0))
     rating, emoji = landing_rating(rate)
 
     profit = None
@@ -679,19 +673,17 @@ def handle_arrival(data: Dict):
             logger.exception("Failed to get flight profit")
 
     db_add_flight(
-        flight_id    = flight_id or None,
-        pilot        = user.get("name", "Unknown"),
-        flight_no    = plan.get("flight_no", "N/A"),
-        departure    = plan.get("departure", "????"),
-        arrival      = plan.get("arrival", "????"),
-        aircraft     = aircraft.get("icao_name", "Unknown"),
-        landing_rate = rate,
-        profit       = profit,
+        flight_id=flight_id or None,
+        pilot=user.get("name", "Unknown"),
+        flight_no=plan.get("flight_no", "N/A"),
+        departure=plan.get("departure", "????"),
+        arrival=plan.get("arrival", "????"),
+        aircraft=aircraft.get("icao_name", "Unknown"),
+        landing_rate=rate,
+        profit=profit,
     )
 
-    profit_text = (
-        f"\n💎 Profit: <b>{profit:,.0f} v$</b>" if profit is not None else ""
-    )
+    profit_text = f"\n💎 Profit: <b>{profit:,.0f} v$</b>" if profit is not None else ""
     flight_link = (
         f"\n🔗 <a href='https://fshub.io/flight/{flight_id}'>Open Flight Report</a>"
         if flight_id else ""
@@ -737,10 +729,10 @@ def handle_screenshots(data: Dict):
 
 
 def handle_achievement(data: Dict):
-    d           = data.get("_data", {})
+    d = data.get("_data", {})
     achievement = d.get("achievement", {})
-    flight      = d.get("flight", {})
-    user        = flight.get("user", {})
+    flight = d.get("flight", {})
+    user = flight.get("user", {})
     tg_send(
         f"🏆 <b>ACHIEVEMENT UNLOCKED</b>\n\n"
         f"👨‍✈️ {user.get('name', 'Unknown')}\n"
@@ -749,10 +741,10 @@ def handle_achievement(data: Dict):
 
 
 FSHUB_HANDLERS = {
-    "flight.departed":      handle_departure,
-    "flight.arrived":       handle_arrival,
+    "flight.departed": handle_departure,
+    "flight.arrived": handle_arrival,
     "screenshots.uploaded": handle_screenshots,
-    "airline.achievement":  handle_achievement,
+    "airline.achievement": handle_achievement,
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -760,14 +752,14 @@ FSHUB_HANDLERS = {
 # ═══════════════════════════════════════════════════════════════
 
 COMMANDS = {
-    "/stats":       fmt_stats,
-    "/last":        fmt_last,
+    "/stats": fmt_stats,
+    "/last": fmt_last,
     "/top_landing": fmt_top_landings,
-    "/top":         fmt_top_pilots,
-    "/economy":     fmt_daily_economy,
-    "/monthly":     fmt_monthly_economy,
-    "/live":        fmt_active_flights,
-    "/va":          fmt_va_info,
+    "/top": fmt_top_pilots,
+    "/economy": fmt_daily_economy,
+    "/monthly": fmt_monthly_economy,
+    "/live": fmt_active_flights,
+    "/va": fmt_va_info,
 }
 
 HELP_TEXT = (
@@ -778,8 +770,8 @@ HELP_TEXT = (
     "/top — top pilots (7 days)\n"
     "/top_landing — best landings\n\n"
     "💰 <b>Financial Operations:</b>\n"
-    "/economy — today's financial report\n"
-    "/monthly — 30-day financial digest\n"
+    "/economy — daily financial report\n"
+    "/monthly — monthly financial digest\n"
     "/live — active flights\n"
     "/va — VA information"
 )
@@ -787,7 +779,7 @@ HELP_TEXT = (
 
 def handle_tg_command(message: Dict):
     chat_id = message.get("chat", {}).get("id")
-    text    = (message.get("text") or "").strip()
+    text = (message.get("text") or "").strip()
 
     if not chat_id or not text:
         return
@@ -813,6 +805,7 @@ def handle_tg_command(message: Dict):
         return
 
     tg_send("Unknown command. Use /help", chat_id)
+
 
 # ═══════════════════════════════════════════════════════════════
 # FLASK
@@ -865,12 +858,13 @@ def fshub_webhook():
 @app.route(f"/bot/{BOT_TOKEN}", methods=["POST"])
 def tg_webhook():
     try:
-        data    = request.get_json(force=True) or {}
+        data = request.get_json(force=True) or {}
         message = data.get("message") or data.get("channel_post") or {}
         handle_tg_command(message)
     except Exception as e:
         logger.exception(f"Telegram webhook failure: {e}")
     return jsonify({"ok": True})
+
 
 # ═══════════════════════════════════════════════════════════════
 # SCHEDULER
@@ -921,7 +915,35 @@ scheduler.add_job(
     misfire_grace_time=300,
 )
 
-# Monthly digest — 1st of every month at 09:00 UTC
+# Saturday joint flight invitation at 06:00 UTC (09:00 MSK / 18:00 Kamchatka)
+scheduler.add_job(
+    lambda: tg_send(
+        "🛫 <b>SATURDAY JOINT FLIGHT OPERATION!</b>\n\n"
+        "⏰ Moscow: 09:00 ☀️  |  Kamchatka: 18:00 🌙\n\n"
+        "✈️ Suggest your route in the comments!\nWho is joining? 👇"
+    ),
+    "cron",
+    day_of_week="sat", hour=6, minute=0,
+    id="saturday_inv",
+    replace_existing=True,
+    misfire_grace_time=300,
+)
+
+# Weekly challenge on Monday at 08:00 UTC (11:00 MSK)
+scheduler.add_job(
+    lambda: tg_send(
+        "🏆 <b>WEEKLY CREW CHALLENGE!</b>\n\n"
+        "🔹 Goal: 3 flights in 7 days\n"
+        "🔹 Bonus: Best landing rate of the week\n\nReady to accept? 💪"
+    ),
+    "cron",
+    day_of_week="mon", hour=8, minute=0,
+    id="monday_challenge",
+    replace_existing=True,
+    misfire_grace_time=300,
+)
+
+# Monthly financial digest on the 1st at 09:00 UTC
 scheduler.add_job(
     lambda: tg_send(fmt_monthly_economy()),
     "cron",
@@ -937,18 +959,19 @@ logger.info("Scheduler started")
 # ═══════════════════════════════════════════════════════════════
 # STARTUP
 # ═══════════════════════════════════════════════════════════════
-#
-#try:
-#    _create_pool()
-#    _init_db()
-#    tg_setup_webhook()
-#    tg_send("🟢 <b>UP! Flight Center - online</b>")
-#except Exception as e:
-#    logger.exception(f"Startup failed: {e}")
-#    sys.exit(1)
-#
-#logger.info(f"Running on port {PORT}")
-#
+
+# Initialize database tables and connection pool
+_create_pool()
+_init_db()
+
+try:
+    tg_setup_webhook()
+    tg_send("🟢 <b>VA UP! PostgreSQL Edition online</b>")
+except Exception as e:
+    logger.exception(f"Startup failed: {e}")
+
+logger.info(f"Running on port {PORT}")
+
 # ═══════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════
