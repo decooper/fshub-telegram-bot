@@ -783,6 +783,11 @@ def handle_tg_command(message: Dict):
     chat_id = message.get("chat", {}).get("id")
     text = (message.get("text") or "").strip()
 
+    # Игнорируем сообщения из основного канала (чтобы бот не отвечал "Unknown command")
+    if str(chat_id) == str(CHAT_ID):
+        logger.info(f"Ignoring message from channel: {text[:50] if text else 'empty'}")
+        return
+
     if not chat_id or not text:
         return
 
@@ -806,6 +811,7 @@ def handle_tg_command(message: Dict):
             tg_send("⚠️ Command error.", chat_id)
         return
 
+    # Если сообщение из личного чата и не является командой — отвечаем
     tg_send("Unknown command. Use /help", chat_id)
 
 
@@ -969,7 +975,8 @@ _init_db()
 
 try:
     tg_setup_webhook()
-    tg_send("🟢 <b>VA UP! PostgreSQL Edition online</b>")
+    # Отправка сообщения о запуске отключена — бот не пишет в канал автоматически
+    # tg_send("🟢 <b>VA UP! Оnline</b>")
 except Exception as e:
     logger.exception(f"Startup failed: {e}")
 
