@@ -937,18 +937,18 @@ logger.info("Scheduler started")
 # ═══════════════════════════════════════════════════════════════
 # STARTUP
 # ═══════════════════════════════════════════════════════════════
-
-try:
-    _create_pool()
-    _init_db()
-    tg_setup_webhook()
-    tg_send("🟢 <b>UP! Flight Center - online</b>")
-except Exception as e:
-    logger.exception(f"Startup failed: {e}")
-    sys.exit(1)
-
-logger.info(f"Running on port {PORT}")
-
+#
+#try:
+#    _create_pool()
+#    _init_db()
+#    tg_setup_webhook()
+#    tg_send("🟢 <b>UP! Flight Center - online</b>")
+#except Exception as e:
+#    logger.exception(f"Startup failed: {e}")
+#    sys.exit(1)
+#
+#logger.info(f"Running on port {PORT}")
+#
 # ═══════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════
