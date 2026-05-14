@@ -959,19 +959,19 @@ logger.info("Scheduler started")
 # ═══════════════════════════════════════════════════════════════
 # STARTUP
 # ═══════════════════════════════════════════════════════════════
-
+#
 # Initialize database tables and connection pool
-_create_pool()
-_init_db()
-
-try:
-    tg_setup_webhook()
-    tg_send("🟢 <b>VA UP! PostgreSQL Edition online</b>")
-except Exception as e:
-    logger.exception(f"Startup failed: {e}")
-
-logger.info(f"Running on port {PORT}")
-
+#_create_pool()
+#_init_db()
+#
+#try:
+#    tg_setup_webhook()
+#    tg_send("🟢 <b>VA UP! PostgreSQL Edition online</b>")
+#except Exception as e:
+#    logger.exception(f"Startup failed: {e}")
+#
+#logger.info(f"Running on port {PORT}")
+#
 # ═══════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════
