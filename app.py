@@ -1,14 +1,16 @@
 import os
 import sys
 import time
-import sqlite3
+import json
 import logging
 import threading
 from logging.handlers import RotatingFileHandler
-from contextlib import closing
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
+import psycopg2
+import psycopg2.extras
+import psycopg2.pool
 import requests
 from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -28,14 +30,21 @@ PORT       = int(os.environ.get("PORT", 10000))
 HOSTNAME   = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "fshub-bot.onrender.com")
 
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-DB_PATH        = os.environ.get("DB_PATH", "va_up.db")
 MAX_DB_FLIGHTS = int(os.environ.get("MAX_DB_FLIGHTS", "5000"))
+
+# PostgreSQL connection string from Neon / Render / any provider
+# Example: postgresql://user:password@host/dbname?sslmode=require
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 FSA_URL = "https://www.fsairlines.net/va_interface2.php"
 TG_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 if not BOT_TOKEN or not CHAT_ID:
     print("❌ TG_BOT_TOKEN or TG_CHAT_ID missing")
+    sys.exit(1)
+
+if not DATABASE_URL:
+    print("❌ DATABASE_URL missing — set it to your PostgreSQL connection string")
     sys.exit(1)
 
 # ═══════════════════════════════════════════════════════════════
@@ -60,84 +69,120 @@ try:
 except Exception:
     logger.warning("Could not create log file, using console only")
 
-logger.info("Starting VA UP! Stable Edition")
+logger.info("Starting VA UP! PostgreSQL Edition")
 
 # ═══════════════════════════════════════════════════════════════
-# REQUEST SESSION
+# HTTP SESSION
 # ═══════════════════════════════════════════════════════════════
 
 session = requests.Session()
-
 retry = Retry(
-    total=3,
-    read=3,
-    connect=3,
-    backoff_factor=1,
+    total=3, read=3, connect=3, backoff_factor=1,
     status_forcelist=[429, 500, 502, 503, 504],
     allowed_methods=["GET", "POST"],
 )
-
 adapter = HTTPAdapter(max_retries=retry)
 session.mount("https://", adapter)
 session.mount("http://", adapter)
 
 # ═══════════════════════════════════════════════════════════════
-# DATABASE
-# Per-thread connections + WAL mode for safe concurrent access
+# DATABASE  —  PostgreSQL with connection pool
+# Pool size 1-3 is enough for Free tier (0.1 CPU, 512 MB RAM)
 # ═══════════════════════════════════════════════════════════════
 
-_db_local = threading.local()
-_db_lock  = threading.Lock()
+_pool: psycopg2.pool.ThreadedConnectionPool = None
 
 
-def get_conn() -> sqlite3.Connection:
-    """Return a per-thread SQLite connection."""
-    if not hasattr(_db_local, "conn") or _db_local.conn is None:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        _db_local.conn = conn
-    return _db_local.conn
+def _create_pool():
+    global _pool
+    _pool = psycopg2.pool.ThreadedConnectionPool(
+        minconn=1,
+        maxconn=3,
+        dsn=DATABASE_URL,
+        cursor_factory=psycopg2.extras.RealDictCursor,
+    )
+    logger.info("PostgreSQL connection pool created")
+
+
+def get_conn():
+    """Borrow a connection from the pool."""
+    return _pool.getconn()
+
+
+def put_conn(conn):
+    """Return a connection to the pool."""
+    _pool.putconn(conn)
+
+
+def db_execute(query: str, params=None, fetch: str = "none"):
+    """
+    Execute a query and optionally fetch results.
+    fetch: "none" | "one" | "all"
+    Returns fetched rows or None.
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(query, params or ())
+            conn.commit()
+            if fetch == "one":
+                return cur.fetchone()
+            if fetch == "all":
+                return cur.fetchall()
+            return None
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        put_conn(conn)
 
 
 def _init_db():
-    conn = get_conn()
-    with closing(conn.cursor()) as cur:
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS flights (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                flight_id    TEXT UNIQUE,
-                pilot        TEXT,
-                flight_no    TEXT,
-                departure    TEXT,
-                arrival      TEXT,
-                aircraft     TEXT,
-                landing_rate INTEGER,
-                profit       INTEGER,
-                created_at   TEXT
-            )
-            """
+    """Create all tables if they don't exist yet."""
+    db_execute(
+        """
+        CREATE TABLE IF NOT EXISTS flights (
+            id           SERIAL PRIMARY KEY,
+            flight_id    TEXT UNIQUE,
+            pilot        TEXT,
+            flight_no    TEXT,
+            departure    TEXT,
+            arrival      TEXT,
+            aircraft     TEXT,
+            landing_rate INTEGER,
+            profit       INTEGER,
+            created_at   TIMESTAMPTZ DEFAULT NOW()
         )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS achievements (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                pilot       TEXT,
-                achievement TEXT,
-                created_at  TEXT
-            )
-            """
+        """
+    )
+    db_execute(
+        """
+        CREATE TABLE IF NOT EXISTS achievements (
+            id          SERIAL PRIMARY KEY,
+            pilot       TEXT,
+            achievement TEXT,
+            created_at  TIMESTAMPTZ DEFAULT NOW()
         )
-        conn.commit()
-
-
-_init_db()
-logger.info("Database initialized")
+        """
+    )
+    # Stores one row per calendar day with aggregated financials.
+    # This is how /monthly works accurately over 30 days.
+    db_execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_economy (
+            id         SERIAL PRIMARY KEY,
+            day        DATE UNIQUE,
+            income     BIGINT DEFAULT 0,
+            expense    BIGINT DEFAULT 0,
+            net        BIGINT DEFAULT 0,
+            detail     JSONB DEFAULT '{}'
+        )
+        """
+    )
+    logger.info("Database tables ready")
 
 # ═══════════════════════════════════════════════════════════════
-# DATABASE HELPERS
+# DB HELPERS — FLIGHTS
 # ═══════════════════════════════════════════════════════════════
 
 def db_add_flight(
@@ -150,69 +195,97 @@ def db_add_flight(
     landing_rate: int,
     profit: Optional[int],
 ):
-    conn = get_conn()
-    with _db_lock:
-        with closing(conn.cursor()) as cur:
-            cur.execute(
-                """
-                INSERT OR IGNORE INTO flights
-                    (flight_id, pilot, flight_no, departure, arrival,
-                     aircraft, landing_rate, profit, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    flight_id, pilot, flight_no, departure, arrival,
-                    aircraft, landing_rate, profit,
-                    datetime.utcnow().isoformat(),
-                ),
-            )
-            conn.commit()
-
-            cur.execute(
-                """
-                DELETE FROM flights
-                WHERE id NOT IN (
-                    SELECT id FROM flights ORDER BY id DESC LIMIT ?
-                )
-                """,
-                (MAX_DB_FLIGHTS,),
-            )
-            conn.commit()
+    db_execute(
+        """
+        INSERT INTO flights
+            (flight_id, pilot, flight_no, departure, arrival,
+             aircraft, landing_rate, profit)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (flight_id) DO NOTHING
+        """,
+        (flight_id, pilot, flight_no, departure, arrival,
+         aircraft, landing_rate, profit),
+    )
+    # Trim old records beyond MAX_DB_FLIGHTS
+    db_execute(
+        """
+        DELETE FROM flights
+        WHERE id NOT IN (
+            SELECT id FROM flights ORDER BY id DESC LIMIT %s
+        )
+        """,
+        (MAX_DB_FLIGHTS,),
+    )
 
 
 def db_last_flights(limit: int = 5) -> List:
-    conn = get_conn()
-    with _db_lock:
-        with closing(conn.cursor()) as cur:
-            cur.execute(
-                "SELECT * FROM flights ORDER BY id DESC LIMIT ?", (limit,)
-            )
-            return cur.fetchall()
+    return db_execute(
+        "SELECT * FROM flights ORDER BY id DESC LIMIT %s",
+        (limit,),
+        fetch="all",
+    ) or []
 
 
 def db_all_flights() -> List:
-    conn = get_conn()
-    with _db_lock:
-        with closing(conn.cursor()) as cur:
-            cur.execute("SELECT * FROM flights")
-            return cur.fetchall()
+    return db_execute(
+        "SELECT * FROM flights ORDER BY id DESC",
+        fetch="all",
+    ) or []
 
 
 def db_top_landings(limit: int = 10) -> List:
-    conn = get_conn()
-    with _db_lock:
-        with closing(conn.cursor()) as cur:
-            cur.execute(
-                "SELECT * FROM flights ORDER BY ABS(landing_rate) ASC LIMIT ?",
-                (limit,),
-            )
-            return cur.fetchall()
+    return db_execute(
+        "SELECT * FROM flights ORDER BY ABS(landing_rate) ASC LIMIT %s",
+        (limit,),
+        fetch="all",
+    ) or []
+
+# ═══════════════════════════════════════════════════════════════
+# DB HELPERS — DAILY ECONOMY
+# ═══════════════════════════════════════════════════════════════
+
+def db_save_daily_economy(day: str, income: int, expense: int, detail: Dict):
+    """
+    Upsert today's economy snapshot.
+    day format: 'YYYY-MM-DD'
+    """
+    db_execute(
+        """
+        INSERT INTO daily_economy (day, income, expense, net, detail)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (day) DO UPDATE SET
+            income  = EXCLUDED.income,
+            expense = EXCLUDED.expense,
+            net     = EXCLUDED.net,
+            detail  = EXCLUDED.detail
+        """,
+        (day, income, expense, income - expense, json.dumps(detail)),
+    )
+
+
+def db_get_monthly_economy(days: int = 30) -> List:
+    """Return economy rows for the last N days."""
+    return db_execute(
+        f"""
+        SELECT * FROM daily_economy
+        WHERE day >= CURRENT_DATE - INTERVAL '{days} days'
+        ORDER BY day ASC
+        """,
+        fetch="all",
+    ) or []
+
+
+def db_get_today_economy() -> Optional[Dict]:
+    return db_execute(
+        "SELECT * FROM daily_economy WHERE day = CURRENT_DATE",
+        fetch="one",
+    )
 
 # ═══════════════════════════════════════════════════════════════
 # TELEGRAM
 # ═══════════════════════════════════════════════════════════════
 
-def tg_send(text: str, chat_id: Optional[str] = None) -> bool:
+def tg_send(text: str, chat_id=None) -> bool:
     target = str(chat_id) if chat_id else CHAT_ID
     try:
         r = session.post(
@@ -251,7 +324,6 @@ def tg_photo(url: str, caption: str) -> bool:
         logger.warning(f"Photo failed: {r.text}")
     except Exception as e:
         logger.exception(f"Photo error: {e}")
-
     return tg_send(f'📸 <b>Screenshot</b>\n<a href="{url}">Open media</a>')
 
 
@@ -274,7 +346,6 @@ def tg_setup_webhook():
 def fsa_call(function: str, extra: Optional[Dict] = None):
     if not FSA_KEY:
         return None
-
     params = {
         "function": function,
         "va_id": FSA_VA_ID,
@@ -283,7 +354,6 @@ def fsa_call(function: str, extra: Optional[Dict] = None):
     }
     if extra:
         params.update(extra)
-
     try:
         r = session.get(FSA_URL, params=params, timeout=20)
         r.raise_for_status()
@@ -297,8 +367,7 @@ def fsa_call(function: str, extra: Optional[Dict] = None):
         return None
 
 
-def _safe_timestamp(ts) -> Optional[datetime]:
-    """Convert a Unix timestamp to datetime safely."""
+def _safe_ts(ts) -> Optional[datetime]:
     try:
         return datetime.fromtimestamp(float(ts))
     except Exception:
@@ -310,25 +379,7 @@ def fsa_daily_transactions() -> List[Dict]:
     if not isinstance(data, list):
         return []
     today = datetime.now().date()
-    result = []
-    for t in data:
-        dt = _safe_timestamp(t.get("ts"))
-        if dt and dt.date() == today:
-            result.append(t)
-    return result
-
-
-def fsa_monthly_transactions() -> List[Dict]:
-    data = fsa_call("getDailyTransactions")
-    if not isinstance(data, list):
-        return []
-    threshold = datetime.now() - timedelta(days=30)
-    result = []
-    for t in data:
-        dt = _safe_timestamp(t.get("ts"))
-        if dt and dt >= threshold:
-            result.append(t)
-    return result
+    return [t for t in data if (dt := _safe_ts(t.get("ts"))) and dt.date() == today]
 
 
 def fsa_active_flights() -> List[Dict]:
@@ -347,34 +398,19 @@ def get_flight_profit(report_id: int) -> Optional[int]:
     data = fsa_call("getReportDetail", {"report_id": report_id})
     if not data:
         return None
-    # FIX: guard against non-numeric profit value (e.g. "N/A", "")
     try:
         return int(float(data.get("profit", 0)))
     except (ValueError, TypeError):
-        logger.warning(f"Non-numeric profit value: {data.get('profit')}")
         return None
 
 # ═══════════════════════════════════════════════════════════════
-# STATISTICS & FORMATTING HELPERS
+# FINANCIAL AGGREGATION
 # ═══════════════════════════════════════════════════════════════
-
-def landing_rating(rate: int) -> Tuple[str, str]:
-    if rate < -600:
-        return "UNSAFE LANDING", "🔴"
-    if rate < -400:
-        return "HARD LANDING", "🟠"
-    if rate < -250:
-        return "FIRM LANDING", "🟡"
-    if rate < -100:
-        return "STABLE LANDING", "🟢"
-    return "SMOOTH LANDING", "✅"
-
 
 def _aggregate(transactions: List[Dict]) -> Dict:
     inc, exp = 0.0, 0.0
     inc_cat: Dict[str, float] = {}
     exp_cat: Dict[str, float] = {}
-
     for t in transactions:
         try:
             v = float(t.get("value", 0))
@@ -387,14 +423,8 @@ def _aggregate(transactions: List[Dict]) -> Dict:
         else:
             exp += abs(v)
             exp_cat[r] = exp_cat.get(r, 0) + abs(v)
-
-    return {
-        "inc": inc,
-        "exp": exp,
-        "net": inc - exp,
-        "inc_cat": inc_cat,
-        "exp_cat": exp_cat,
-    }
+    return {"inc": inc, "exp": exp, "net": inc - exp,
+            "inc_cat": inc_cat, "exp_cat": exp_cat}
 
 
 def _top(d: Dict, n: int = 3) -> List[Tuple]:
@@ -403,6 +433,40 @@ def _top(d: Dict, n: int = 3) -> List[Tuple]:
 
 def _nem(net: float) -> str:
     return "📈" if net > 0 else "📉" if net < 0 else "➡️"
+
+
+def snapshot_daily_economy():
+    """
+    Called every day at 23:50 UTC by scheduler.
+    Pulls today's FSA transactions, aggregates, saves to DB.
+    """
+    if not FSA_KEY:
+        return
+    txs = fsa_daily_transactions()
+    if not txs:
+        logger.info("snapshot_daily_economy: no transactions today")
+        return
+    ag = _aggregate(txs)
+    day = datetime.now().strftime("%Y-%m-%d")
+    detail = {"inc_cat": ag["inc_cat"], "exp_cat": ag["exp_cat"]}
+    db_save_daily_economy(
+        day=day,
+        income=int(ag["inc"]),
+        expense=int(ag["exp"]),
+        detail=detail,
+    )
+    logger.info(f"Economy snapshot saved for {day}: net={ag['net']:,.0f}")
+
+# ═══════════════════════════════════════════════════════════════
+# LANDING RATING
+# ═══════════════════════════════════════════════════════════════
+
+def landing_rating(rate: int) -> Tuple[str, str]:
+    if rate < -600: return "UNSAFE LANDING", "🔴"
+    if rate < -400: return "HARD LANDING", "🟠"
+    if rate < -250: return "FIRM LANDING", "🟡"
+    if rate < -100: return "STABLE LANDING", "🟢"
+    return "SMOOTH LANDING", "✅"
 
 # ═══════════════════════════════════════════════════════════════
 # COMMAND FORMATTERS
@@ -445,9 +509,7 @@ def fmt_top_landings(limit: int = 10) -> str:
     lines = []
     for i, row in enumerate(rows, 1):
         prefix = medals[i - 1] if i <= 3 else f"{i}."
-        lines.append(
-            f"{prefix} <b>{row['pilot']}</b> — {row['landing_rate']} fpm"
-        )
+        lines.append(f"{prefix} <b>{row['pilot']}</b> — {row['landing_rate']} fpm")
     return "🏆 <b>TOP LANDINGS</b>\n\n" + "\n".join(lines)
 
 
@@ -455,96 +517,102 @@ def fmt_top_pilots() -> str:
     flights = db_all_flights()
     if not flights:
         return "🏆 No flight data available."
-
-    week_ago = datetime.now() - timedelta(days=7)
+    week_ago = datetime.utcnow() - timedelta(days=7)
     counts: Dict[str, int] = {}
-
     for f in flights:
         try:
-            # FIX: explicit except Exception instead of bare except
-            date = datetime.fromisoformat(f["created_at"])
-            if date >= week_ago:
+            ca = f["created_at"]
+            if isinstance(ca, str):
+                ca = datetime.fromisoformat(ca)
+            # strip timezone for comparison
+            if ca.replace(tzinfo=None) >= week_ago:
                 counts[f["pilot"]] = counts.get(f["pilot"], 0) + 1
         except Exception:
             pass
-
     if not counts:
         return "🏆 No flights in the last 7 days."
-
     sorted_pilots = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:10]
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    lines = []
-    for i, (pilot, n) in enumerate(sorted_pilots, 1):
-        lines.append(f"{medals.get(i, f'{i}.')} <b>{pilot}</b> — {n} flights")
-
+    lines = [
+        f"{medals.get(i, f'{i}.')} <b>{pilot}</b> — {n} flights"
+        for i, (pilot, n) in enumerate(sorted_pilots, 1)
+    ]
     return "🏆 <b>TOP PILOTS (7 days)</b>\n\n" + "\n".join(lines)
 
 
 def fmt_daily_economy() -> str:
-    txs = fsa_daily_transactions()
-    if not txs:
-        return "📊 No financial data for today."
+    """
+    Shows today's data: first tries DB snapshot,
+    falls back to live FSA call if snapshot not yet saved today.
+    """
+    row = db_get_today_economy()
+    if row:
+        inc  = row["income"]
+        exp  = row["expense"]
+        net  = row["net"]
+        detail = row["detail"] or {}
+        inc_cat = detail.get("inc_cat", {})
+        exp_cat = detail.get("exp_cat", {})
+    else:
+        # Live fallback
+        txs = fsa_daily_transactions()
+        if not txs:
+            return "📊 No financial data for today."
+        ag = _aggregate(txs)
+        inc, exp, net = ag["inc"], ag["exp"], ag["net"]
+        inc_cat, exp_cat = ag["inc_cat"], ag["exp_cat"]
 
-    ag = _aggregate(txs)
-    em = _nem(ag["net"])
-
+    em = _nem(net)
     msg = (
         f"📊 <b>DAILY FINANCIAL REPORT</b>\n\n"
-        f"💰 Revenue: <b>+{ag['inc']:,.0f} v$</b>\n"
-        f"📉 Expenses: <b>-{ag['exp']:,.0f} v$</b>\n"
-        f"{em} <b>Net: {ag['net']:+,.0f} v$</b>\n"
+        f"💰 Revenue: <b>+{inc:,.0f} v$</b>\n"
+        f"📉 Expenses: <b>-{exp:,.0f} v$</b>\n"
+        f"{em} <b>Net: {net:+,.0f} v$</b>\n"
     )
-    if ag["inc_cat"]:
+    if inc_cat:
         msg += "\n🔝 <b>TOP REVENUE:</b>\n"
-        for reason, amount in _top(ag["inc_cat"]):
+        for reason, amount in _top(inc_cat):
             msg += f"   • {reason}: <b>+{amount:,.0f} v$</b>\n"
-    if ag["exp_cat"]:
+    if exp_cat:
         msg += "\n⚠️ <b>TOP EXPENSES:</b>\n"
-        for reason, amount in _top(ag["exp_cat"]):
+        for reason, amount in _top(exp_cat):
             msg += f"   • {reason}: <b>-{amount:,.0f} v$</b>\n"
     return msg
 
 
 def fmt_monthly_economy() -> str:
-    txs = fsa_monthly_transactions()
-    if not txs:
-        return "📊 No financial data for the last 30 days."
+    """
+    Uses our own DB history — accurate up to 30 days.
+    Each day is a snapshot saved at 23:50 UTC.
+    """
+    rows = db_get_monthly_economy(days=30)
+    if not rows:
+        return (
+            "📊 No monthly data yet.\n\n"
+            "ℹ️ History is collected daily at 23:50 UTC. "
+            "Data will appear from tomorrow."
+        )
 
-    total_inc, total_exp = 0.0, 0.0
-    daily_net: Dict[str, float] = {}
-
-    for t in txs:
-        try:
-            value = float(t.get("value", 0))
-        except (ValueError, TypeError):
-            continue
-
-        dt = _safe_timestamp(t.get("ts"))
-        if dt:
-            day = dt.strftime("%Y-%m-%d")
-            daily_net[day] = daily_net.get(day, 0.0) + value
-
-        if value >= 0:
-            total_inc += value
-        else:
-            total_exp += abs(value)
-
+    total_inc = sum(r["income"]  for r in rows)
+    total_exp = sum(r["expense"] for r in rows)
     net = total_inc - total_exp
-    best_day  = max(daily_net.items(), key=lambda x: x[1]) if daily_net else (None, 0)
-    worst_day = min(daily_net.items(), key=lambda x: x[1]) if daily_net else (None, 0)
+
+    # best/worst by net per day
+    best_row  = max(rows, key=lambda r: r["net"])
+    worst_row = min(rows, key=lambda r: r["net"])
 
     msg = (
         f"🏆 <b>MONTHLY FINANCIAL DIGEST</b>\n"
         f"📅 {datetime.now().strftime('%B %Y')}\n\n"
         f"💰 Revenue: <b>+{total_inc:,.0f} v$</b>\n"
         f"📉 Expenses: <b>-{total_exp:,.0f} v$</b>\n"
-        f"{_nem(net)} <b>Net: {net:+,.0f} v$</b>\n"
+        f"{_nem(net)} <b>Net: {net:+,.0f} v$</b>\n\n"
+        f"🌟 Best Day: <b>{best_row['day']}</b> "
+        f"(+{best_row['net']:,.0f} v$)\n"
+        f"⚠️ Worst Day: <b>{worst_row['day']}</b> "
+        f"({worst_row['net']:+,.0f} v$)\n\n"
+        f"📊 Days with data: <b>{len(rows)}</b>"
     )
-    if best_day[0]:
-        msg += f"\n🌟 Best Day: <b>{best_day[0]}</b> (+{best_day[1]:,.0f} v$)\n"
-    if worst_day[0]:
-        msg += f"⚠️ Worst Day: <b>{worst_day[0]}</b> ({worst_day[1]:+,.0f} v$)\n"
-    msg += f"\n📊 Days with activity: <b>{len(daily_net)}</b>"
     return msg
 
 
@@ -575,7 +643,7 @@ def fmt_va_info() -> str:
     )
 
 # ═══════════════════════════════════════════════════════════════
-# FSHUB EVENTS
+# FSHUB EVENT HANDLERS
 # ═══════════════════════════════════════════════════════════════
 
 def handle_departure(data: Dict):
@@ -583,7 +651,6 @@ def handle_departure(data: Dict):
     user     = d.get("user", {})
     plan     = d.get("plan", {})
     aircraft = d.get("aircraft", {})
-
     tg_send(
         f"🛫 <b>DEPARTURE CONFIRMED</b>\n\n"
         f"👨‍✈️ Captain: <b>{user.get('name', 'Unknown')}</b>\n"
@@ -674,7 +741,6 @@ def handle_achievement(data: Dict):
     achievement = d.get("achievement", {})
     flight      = d.get("flight", {})
     user        = flight.get("user", {})
-
     tg_send(
         f"🏆 <b>ACHIEVEMENT UNLOCKED</b>\n\n"
         f"👨‍✈️ {user.get('name', 'Unknown')}\n"
@@ -712,8 +778,8 @@ HELP_TEXT = (
     "/top — top pilots (7 days)\n"
     "/top_landing — best landings\n\n"
     "💰 <b>Financial Operations:</b>\n"
-    "/economy — daily financial report\n"
-    "/monthly — monthly financial digest\n"
+    "/economy — today's financial report\n"
+    "/monthly — 30-day financial digest\n"
     "/live — active flights\n"
     "/va — VA information"
 )
@@ -729,14 +795,13 @@ def handle_tg_command(message: Dict):
     logger.info(f"Command from {chat_id}: {text}")
 
     if text.startswith("/start"):
-        tg_send("✈️ <b>VA UP! Stable Edition</b>\n\nUse /help for commands.", chat_id)
+        tg_send("✈️ <b>VA UP! PostgreSQL Edition</b>\n\nUse /help for commands.", chat_id)
         return
 
     if text.startswith("/help"):
         tg_send(HELP_TEXT, chat_id)
         return
 
-    # Strip bot-username suffix, e.g. /stats@MyBot → /stats
     cmd = text.split("@")[0]
 
     if cmd in COMMANDS:
@@ -760,7 +825,7 @@ app = Flask(__name__)
 def home():
     return jsonify({
         "status": "running",
-        "service": "VA UP! Stable Edition",
+        "service": "VA UP! PostgreSQL Edition",
         "fsa_enabled": bool(FSA_KEY),
     })
 
@@ -774,7 +839,6 @@ def health():
 def fshub_webhook():
     if request.method == "GET":
         return jsonify({"status": "ok"})
-
     try:
         if WEBHOOK_SECRET:
             if request.headers.get("X-Webhook-Secret") != WEBHOOK_SECRET:
@@ -793,7 +857,6 @@ def fshub_webhook():
             handler(data)
 
         return jsonify({"ok": True})
-
     except Exception as e:
         logger.exception(f"Webhook failure: {e}")
         return jsonify({"error": str(e)}), 500
@@ -818,6 +881,17 @@ scheduler = BackgroundScheduler(
     timezone="UTC",
 )
 
+# Save today's economy snapshot every day at 23:50 UTC
+scheduler.add_job(
+    snapshot_daily_economy,
+    "cron",
+    hour=23, minute=50,
+    id="daily_economy_snapshot",
+    replace_existing=True,
+    misfire_grace_time=300,
+)
+
+# Daily stats summary at 21:00 UTC
 scheduler.add_job(
     lambda: tg_send(fmt_stats()),
     "cron",
@@ -827,6 +901,7 @@ scheduler.add_job(
     misfire_grace_time=300,
 )
 
+# Weekly top landings — Sunday 12:00 UTC
 scheduler.add_job(
     lambda: tg_send(fmt_top_landings()),
     "cron",
@@ -836,6 +911,7 @@ scheduler.add_job(
     misfire_grace_time=300,
 )
 
+# Weekly top pilots — Sunday 10:00 UTC
 scheduler.add_job(
     lambda: tg_send(fmt_top_pilots()),
     "cron",
@@ -843,6 +919,16 @@ scheduler.add_job(
     id="weekly_top_pilots",
     replace_existing=True,
     misfire_grace_time=300,
+)
+
+# Monthly digest — 1st of every month at 09:00 UTC
+scheduler.add_job(
+    lambda: tg_send(fmt_monthly_economy()),
+    "cron",
+    day=1, hour=9, minute=0,
+    id="monthly_digest",
+    replace_existing=True,
+    misfire_grace_time=600,
 )
 
 scheduler.start()
@@ -853,10 +939,13 @@ logger.info("Scheduler started")
 # ═══════════════════════════════════════════════════════════════
 
 try:
+    _create_pool()
+    _init_db()
     tg_setup_webhook()
-    tg_send("🟢 <b>VA UP! Stable Edition online</b>")
+    tg_send("🟢 <b>VA UP! PostgreSQL Edition online</b>")
 except Exception as e:
     logger.exception(f"Startup failed: {e}")
+    sys.exit(1)
 
 logger.info(f"Running on port {PORT}")
 
