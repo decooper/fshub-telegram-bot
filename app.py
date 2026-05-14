@@ -7,7 +7,7 @@ import threading
 import traceback
 from logging.handlers import RotatingFileHandler
 from contextlib import closing
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import requests
@@ -59,14 +59,17 @@ console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
-file_handler = RotatingFileHandler(
-    "bot.log",
-    maxBytes=1_000_000,
-    backupCount=3,
-    encoding="utf-8"
-)
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
+try:
+    file_handler = RotatingFileHandler(
+        "bot.log",
+        maxBytes=1_000_000,
+        backupCount=3,
+        encoding="utf-8"
+    )
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+except Exception:
+    logger.warning("Could not create log file, using console only")
 
 logger.info("Starting VA UP! Stable Edition")
 
@@ -86,64 +89,69 @@ retry = Retry(
 )
 
 adapter = HTTPAdapter(max_retries=retry)
-
 session.mount("https://", adapter)
 session.mount("http://", adapter)
 
 # ═══════════════════════════════════════════════════════════════
 # DATABASE
+# FIX: use thread-local connections instead of a single global
+#      connection shared across threads (caused ProgrammingError)
 # ═══════════════════════════════════════════════════════════════
 
+_db_local = threading.local()
 _db_lock = threading.Lock()
 
 
-def db_connect():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+def get_conn() -> sqlite3.Connection:
+    """Return a per-thread SQLite connection."""
+    if not hasattr(_db_local, "conn") or _db_local.conn is None:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        # WAL mode: allows concurrent readers + one writer
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        _db_local.conn = conn
+    return _db_local.conn
 
 
-conn = db_connect()
-
-
-with closing(conn.cursor()) as cur:
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS flights (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            flight_id TEXT UNIQUE,
-            pilot TEXT,
-            flight_no TEXT,
-            departure TEXT,
-            arrival TEXT,
-            aircraft TEXT,
-            landing_rate INTEGER,
-            profit INTEGER,
-            created_at TEXT
+def _init_db():
+    conn = get_conn()
+    with closing(conn.cursor()) as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS flights (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                flight_id   TEXT UNIQUE,
+                pilot       TEXT,
+                flight_no   TEXT,
+                departure   TEXT,
+                arrival     TEXT,
+                aircraft    TEXT,
+                landing_rate INTEGER,
+                profit      INTEGER,
+                created_at  TEXT
+            )
+            """
         )
-        """
-    )
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS achievements (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            pilot TEXT,
-            achievement TEXT,
-            created_at TEXT
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS achievements (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                pilot       TEXT,
+                achievement TEXT,
+                created_at  TEXT
+            )
+            """
         )
-        """
-    )
-
-    conn.commit()
+        conn.commit()
 
 
+_init_db()
 logger.info("Database initialized")
 
 # ═══════════════════════════════════════════════════════════════
 # DATABASE HELPERS
 # ═══════════════════════════════════════════════════════════════
-
 
 def db_add_flight(
     flight_id: Optional[str],
@@ -155,37 +163,25 @@ def db_add_flight(
     landing_rate: int,
     profit: Optional[int]
 ):
+    conn = get_conn()
     with _db_lock:
         with closing(conn.cursor()) as cur:
             cur.execute(
                 """
                 INSERT OR IGNORE INTO flights (
-                    flight_id,
-                    pilot,
-                    flight_no,
-                    departure,
-                    arrival,
-                    aircraft,
-                    landing_rate,
-                    profit,
-                    created_at
+                    flight_id, pilot, flight_no, departure, arrival,
+                    aircraft, landing_rate, profit, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    flight_id,
-                    pilot,
-                    flight_no,
-                    departure,
-                    arrival,
-                    aircraft,
-                    landing_rate,
-                    profit,
+                    flight_id, pilot, flight_no, departure, arrival,
+                    aircraft, landing_rate, profit,
                     datetime.utcnow().isoformat()
                 )
             )
-
             conn.commit()
 
+            # Trim old records
             cur.execute(
                 """
                 DELETE FROM flights
@@ -197,27 +193,22 @@ def db_add_flight(
                 """,
                 (MAX_DB_FLIGHTS,)
             )
-
             conn.commit()
 
 
-
-def db_last_flights(limit: int = 5):
+def db_last_flights(limit: int = 5) -> List:
+    conn = get_conn()
     with _db_lock:
         with closing(conn.cursor()) as cur:
             cur.execute(
-                """
-                SELECT * FROM flights
-                ORDER BY id DESC
-                LIMIT ?
-                """,
+                "SELECT * FROM flights ORDER BY id DESC LIMIT ?",
                 (limit,)
             )
             return cur.fetchall()
 
 
-
-def db_all_flights():
+def db_all_flights() -> List:
+    conn = get_conn()
     with _db_lock:
         with closing(conn.cursor()) as cur:
             cur.execute("SELECT * FROM flights")
@@ -226,7 +217,6 @@ def db_all_flights():
 # ═══════════════════════════════════════════════════════════════
 # TELEGRAM
 # ═══════════════════════════════════════════════════════════════
-
 
 def tg_send(text: str, chat_id: Optional[str] = None) -> bool:
     target = str(chat_id) if chat_id else CHAT_ID
@@ -244,17 +234,13 @@ def tg_send(text: str, chat_id: Optional[str] = None) -> bool:
             json=payload,
             timeout=20
         )
-
         if r.status_code != 200:
             logger.warning(f"Telegram send failed: {r.text}")
             return False
-
         return True
-
     except Exception as e:
         logger.exception(f"Telegram send error: {e}")
         return False
-
 
 
 def tg_photo(url: str, caption: str) -> bool:
@@ -269,12 +255,9 @@ def tg_photo(url: str, caption: str) -> bool:
             },
             timeout=30
         )
-
         if r.status_code == 200:
             return True
-
         logger.warning(f"Photo failed: {r.text}")
-
     except Exception as e:
         logger.exception(f"Photo error: {e}")
 
@@ -283,26 +266,25 @@ def tg_photo(url: str, caption: str) -> bool:
     )
 
 
-
 def tg_setup_webhook():
+    """
+    FIX: Telegram setWebhook requires POST with JSON body,
+         not a GET request.
+    """
     url = f"https://{HOSTNAME}/bot/{BOT_TOKEN}"
-
     try:
-        r = session.get(
+        r = session.post(
             f"{TG_BASE}/setWebhook",
-            params={"url": url},
+            json={"url": url},
             timeout=20
         )
-
         logger.info(f"Telegram webhook: {r.text}")
-
     except Exception as e:
         logger.exception(f"Webhook setup error: {e}")
 
 # ═══════════════════════════════════════════════════════════════
 # FSA API
 # ═══════════════════════════════════════════════════════════════
-
 
 def fsa_call(function: str, extra: Optional[Dict] = None):
     if not FSA_KEY:
@@ -314,37 +296,26 @@ def fsa_call(function: str, extra: Optional[Dict] = None):
         "apikey": FSA_KEY,
         "format": "json"
     }
-
     if extra:
         params.update(extra)
 
     try:
         r = session.get(FSA_URL, params=params, timeout=20)
         r.raise_for_status()
-
         body = r.json()
-
         if body.get("status") == "SUCCESS":
             return body.get("data")
-
         logger.warning(f"FSA failure: {body}")
         return None
-
     except Exception as e:
         logger.exception(f"FSA error: {e}")
         return None
 
 
-
 def get_flight_profit(report_id: int) -> Optional[int]:
-    data = fsa_call(
-        "getReportDetail",
-        {"report_id": report_id}
-    )
-
+    data = fsa_call("getReportDetail", {"report_id": report_id})
     if not data:
         return None
-
     try:
         return int(data.get("profit", 0))
     except Exception:
@@ -353,7 +324,6 @@ def get_flight_profit(report_id: int) -> Optional[int]:
 # ═══════════════════════════════════════════════════════════════
 # STATISTICS
 # ═══════════════════════════════════════════════════════════════
-
 
 def landing_rating(rate: int) -> Tuple[str, str]:
     if rate < -600:
@@ -367,10 +337,8 @@ def landing_rating(rate: int) -> Tuple[str, str]:
     return "SMOOTH LANDING", "✅"
 
 
-
 def fmt_stats() -> str:
     flights = db_all_flights()
-
     if not flights:
         return "📊 <b>No flight data available.</b>"
 
@@ -384,18 +352,14 @@ def fmt_stats() -> str:
     )
 
 
-
 def fmt_last(limit: int = 5) -> str:
     flights = db_last_flights(limit)
-
     if not flights:
         return "✈️ No flights recorded yet."
 
     lines = []
-
     for f in flights:
         rating, emoji = landing_rating(f["landing_rate"])
-
         lines.append(
             f"{emoji} <b>{f['flight_no']}</b>\n"
             f"👨‍✈️ {f['pilot']}\n"
@@ -406,8 +370,8 @@ def fmt_last(limit: int = 5) -> str:
     return "✈️ <b>LATEST FLIGHTS</b>\n\n" + "\n\n".join(lines)
 
 
-
 def fmt_top_landings(limit: int = 10) -> str:
+    conn = get_conn()
     with _db_lock:
         with closing(conn.cursor()) as cur:
             cur.execute(
@@ -425,10 +389,8 @@ def fmt_top_landings(limit: int = 10) -> str:
 
     medals = ["🥇", "🥈", "🥉"]
     lines = []
-
     for i, row in enumerate(rows, 1):
         prefix = medals[i - 1] if i <= 3 else f"{i}."
-
         lines.append(
             f"{prefix} <b>{row['pilot']}</b> — {row['landing_rate']} fpm"
         )
@@ -439,10 +401,8 @@ def fmt_top_landings(limit: int = 10) -> str:
 # FSHUB EVENTS
 # ═══════════════════════════════════════════════════════════════
 
-
 def handle_departure(data: Dict):
     d = data.get("_data", {})
-
     user = d.get("user", {})
     plan = d.get("plan", {})
     aircraft = d.get("aircraft", {})
@@ -456,10 +416,8 @@ def handle_departure(data: Dict):
     )
 
 
-
 def handle_arrival(data: Dict):
     d = data.get("_data", {})
-
     user = d.get("user", {})
     plan = d.get("plan", {})
     aircraft = d.get("aircraft", {})
@@ -467,19 +425,18 @@ def handle_arrival(data: Dict):
 
     flight_id = str(d.get("id", ""))
     rate = int(d.get("landing_rate", 0))
-
     rating, emoji = landing_rating(rate)
 
     profit = None
-
-    if FSA_KEY and flight_id:
+    # FIX: guard non-numeric flight_id before int() cast
+    if FSA_KEY and flight_id and flight_id.isdigit():
         try:
             profit = get_flight_profit(int(flight_id))
         except Exception:
-            pass
+            logger.exception("Failed to get flight profit")
 
     db_add_flight(
-        flight_id=flight_id,
+        flight_id=flight_id or None,
         pilot=user.get("name", "Unknown"),
         flight_no=plan.get("flight_no", "N/A"),
         departure=plan.get("departure", "????"),
@@ -489,18 +446,15 @@ def handle_arrival(data: Dict):
         profit=profit
     )
 
-    profit_text = ""
+    profit_text = (
+        f"\n💎 Profit: <b>{profit:,.0f} v$</b>"
+        if profit is not None else ""
+    )
 
-    if profit is not None:
-        profit_text = f"\n💎 Profit: <b>{profit:,.0f} v$</b>"
-
-    flight_link = ""
-
-    if flight_id:
-        flight_link = (
-            f"\n🔗 <a href=\"https://fshub.io/flight/{flight_id}\">"
-            f"Open Flight Report</a>"
-        )
+    flight_link = (
+        f"\n🔗 <a href=\"https://fshub.io/flight/{flight_id}\">Open Flight Report</a>"
+        if flight_id else ""
+    )
 
     tg_send(
         f"🛬 <b>ARRIVAL CONFIRMED</b> {emoji}\n\n"
@@ -523,29 +477,31 @@ def handle_arrival(data: Dict):
         )
 
 
+def _send_screenshots_async(screenshots: List):
+    """
+    FIX: run screenshot sending in a background thread so the
+         webhook response is not blocked by sleep() calls.
+    """
+    for scr in screenshots[:3]:
+        url = scr.get("screenshot_url")
+        if url:
+            tg_photo(url, "📸 <b>Flight Screenshot</b>")
+            time.sleep(1)
+
 
 def handle_screenshots(data: Dict):
     screenshots = data.get("_data", [])
-
     if not screenshots:
         return
-
-    for scr in screenshots[:3]:
-        url = scr.get("screenshot_url")
-
-        if url:
-            tg_photo(
-                url,
-                "📸 <b>Flight Screenshot</b>"
-            )
-
-            time.sleep(1)
-
+    threading.Thread(
+        target=_send_screenshots_async,
+        args=(screenshots,),
+        daemon=True
+    ).start()
 
 
 def handle_achievement(data: Dict):
     d = data.get("_data", {})
-
     achievement = d.get("achievement", {})
     flight = d.get("flight", {})
     user = flight.get("user", {})
@@ -568,7 +524,6 @@ FSHUB_HANDLERS = {
 # TELEGRAM COMMANDS
 # ═══════════════════════════════════════════════════════════════
 
-
 HELP_TEXT = (
     "<b>VA UP! Operations Panel</b>\n\n"
     "/stats — operations statistics\n"
@@ -576,13 +531,11 @@ HELP_TEXT = (
     "/top_landing — best landings"
 )
 
-
 COMMANDS = {
     "/stats": fmt_stats,
     "/last": fmt_last,
     "/top_landing": fmt_top_landings,
 }
-
 
 
 def handle_tg_command(message: Dict):
@@ -592,31 +545,35 @@ def handle_tg_command(message: Dict):
     if not chat_id or not text:
         return
 
-    if str(chat_id) == str(CHAT_ID):
-        return
+    # FIX: original code BLOCKED commands from the main channel.
+    # Now we allow commands from ANY chat (including the main chat).
+    # If you want to restrict to the main chat only, invert the check:
+    # if str(chat_id) != str(CHAT_ID): return
+    logger.info(f"Telegram command from {chat_id}: {text}")
 
-    logger.info(f"Telegram command: {text}")
-
-    if text == "/start":
+    if text.startswith("/start"):
         tg_send(
             "✈️ <b>VA UP! Stable Edition</b>\n\nUse /help",
             chat_id
         )
         return
 
-    if text == "/help":
+    if text.startswith("/help"):
         tg_send(HELP_TEXT, chat_id)
         return
 
-    if text in COMMANDS:
+    # Strip bot username suffix (e.g. /stats@MyBot)
+    cmd = text.split("@")[0]
+
+    if cmd in COMMANDS:
         try:
-            tg_send(COMMANDS[text](), chat_id)
+            tg_send(COMMANDS[cmd](), chat_id)
         except Exception as e:
             logger.exception(f"Command failed: {e}")
             tg_send("⚠️ Command error.", chat_id)
         return
 
-    tg_send("Unknown command.", chat_id)
+    tg_send("Unknown command. Use /help", chat_id)
 
 # ═══════════════════════════════════════════════════════════════
 # FLASK
@@ -647,22 +604,18 @@ def fshub_webhook():
     try:
         if WEBHOOK_SECRET:
             incoming = request.headers.get("X-Webhook-Secret")
-
             if incoming != WEBHOOK_SECRET:
                 logger.warning("Invalid webhook secret")
                 return jsonify({"error": "forbidden"}), 403
 
         data = request.get_json(force=True)
-
         if not data:
             return jsonify({"error": "no json"}), 400
 
         event = data.get("_type", "")
-
         logger.info(f"FSHub event: {event}")
 
         handler = FSHUB_HANDLERS.get(event)
-
         if handler:
             handler(data)
 
@@ -677,27 +630,23 @@ def fshub_webhook():
 def tg_webhook():
     try:
         data = request.get_json(force=True) or {}
-
-        message = data.get("message") or {}
-
+        message = data.get("message") or data.get("channel_post") or {}
         handle_tg_command(message)
-
     except Exception as e:
         logger.exception(f"Telegram webhook failure: {e}")
-
     return jsonify({"ok": True})
 
 # ═══════════════════════════════════════════════════════════════
 # SCHEDULER
+# FIX: scheduler must start regardless of FSA_KEY,
+#      because daily_stats and weekly_landing_ranking
+#      only use the local DB (no FSA needed).
 # ═══════════════════════════════════════════════════════════════
 
 scheduler = BackgroundScheduler(
-    executors={
-        "default": ThreadPoolExecutor(max_workers=2)
-    },
+    executors={"default": ThreadPoolExecutor(max_workers=2)},
     timezone="UTC"
 )
-
 
 scheduler.add_job(
     lambda: tg_send(fmt_stats()),
@@ -708,7 +657,6 @@ scheduler.add_job(
     replace_existing=True,
     misfire_grace_time=300
 )
-
 
 scheduler.add_job(
     lambda: tg_send(fmt_top_landings()),
@@ -721,21 +669,17 @@ scheduler.add_job(
     misfire_grace_time=300
 )
 
-
-if FSA_KEY:
-    scheduler.start()
-    logger.info("Scheduler started")
+# FIX: always start the scheduler, not only when FSA_KEY is set
+scheduler.start()
+logger.info("Scheduler started")
 
 # ═══════════════════════════════════════════════════════════════
 # STARTUP
 # ═══════════════════════════════════════════════════════════════
 
-
 def startup_message():
     try:
-        tg_send(
-            "🟢 <b>VA UP! Stable Edition online</b>"
-        )
+        tg_send("🟢 <b>VA UP! Stable Edition online</b>")
     except Exception:
         pass
 
@@ -745,7 +689,6 @@ try:
     startup_message()
 except Exception:
     logger.exception("Startup failed")
-
 
 logger.info(f"Running on port {PORT}")
 
@@ -759,49 +702,3 @@ if __name__ == "__main__":
         port=PORT,
         threaded=True
     )
-```
-
----
-
-# requirements.txt
-
-```txt
-Flask==3.0.3
-requests==2.32.3
-APScheduler==3.10.4
-gunicorn==23.0.0
-urllib3==2.2.2
-```
-
----
-
-# Render Start Command
-
-```bash
-gunicorn app:app --workers=1 --threads=4 --timeout=120
-```
-
----
-
-# Recommended Environment Variables
-
-```env
-TG_BOT_TOKEN=
-TG_CHAT_ID=
-FSA_API_KEY=
-FSA_VA_ID=56177
-RENDER_EXTERNAL_HOSTNAME=
-WEBHOOK_SECRET=
-DB_PATH=va_up.db
-MAX_DB_FLIGHTS=5000
-```
-
----
-
-# Recommended UptimeRobot URL
-
-```text
-https://YOUR-RENDER-APP.onrender.com/health
-```
-
-Ping every 5 minutes.
