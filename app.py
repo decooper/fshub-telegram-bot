@@ -250,7 +250,6 @@ def db_save_daily_economy(day: str, income: int, expense: int, detail: Dict):
 
 
 def db_get_monthly_economy(days: int = 30) -> List:
-    # FIX: use parameterized interval to prevent SQL injection
     return db_execute(
         """
         SELECT * FROM daily_economy
@@ -449,7 +448,6 @@ def snapshot_daily_economy():
 
 # ═══════════════════════════════════════════════════════════════
 # LANDING RATING
-# FIX: hard landing alert threshold synced with this scale (-600)
 # ═══════════════════════════════════════════════════════════════
 
 def landing_rating(rate: int) -> Tuple[str, str]:
@@ -541,7 +539,6 @@ def fmt_daily_economy() -> str:
         inc_cat = detail.get("inc_cat", {})
         exp_cat = detail.get("exp_cat", {})
     else:
-        # Live fallback — snapshot not yet saved today
         txs = fsa_daily_transactions()
         if not txs:
             return "📊 No financial data for today."
@@ -619,32 +616,33 @@ def fmt_va_info() -> str:
     )
 
 # ═══════════════════════════════════════════════════════════════
-# FSHUB EVENT HANDLERS
+# FSHUB EVENT HANDLERS (FIXED: added protection against None)
 # ═══════════════════════════════════════════════════════════════
 
 def handle_departure(data: Dict):
-    d        = data.get("_data", {})
-    user     = d.get("user", {})
-    plan     = d.get("plan", {})
-    aircraft = d.get("aircraft", {})
+    d = data.get("_data", {}) or {}
+    user = d.get("user") or {}
+    plan = d.get("plan") or {}
+    aircraft = d.get("aircraft") or {}
+    
     tg_send(
         f"🛫 <b>DEPARTURE CONFIRMED</b>\n\n"
         f"👨‍✈️ Captain: <b>{user.get('name', 'Unknown')}</b>\n"
         f"🆔 Flight: <b>{plan.get('flight_no', 'N/A')}</b>\n"
-        f"🗺 Route: <b>{plan.get('departure')} → {plan.get('arrival')}</b>\n"
+        f"🗺 Route: <b>{plan.get('departure', '???')} → {plan.get('arrival', '???')}</b>\n"
         f"✈️ Aircraft: <b>{aircraft.get('icao_name', 'N/A')}</b>"
     )
 
 
 def handle_arrival(data: Dict):
-    d        = data.get("_data", {})
-    user     = d.get("user", {})
-    plan     = d.get("plan", {})
-    aircraft = d.get("aircraft", {})
-    airport  = d.get("airport", {})
+    d = data.get("_data", {}) or {}
+    user = d.get("user") or {}
+    plan = d.get("plan") or {}
+    aircraft = d.get("aircraft") or {}
+    airport = d.get("airport") or {}
 
-    flight_id     = str(d.get("id", ""))
-    rate          = int(d.get("landing_rate", 0))
+    flight_id = str(d.get("id", ""))
+    rate = int(d.get("landing_rate", 0))
     rating, emoji = landing_rating(rate)
 
     profit = None
@@ -655,29 +653,24 @@ def handle_arrival(data: Dict):
             logger.exception("Failed to get flight profit")
 
     db_add_flight(
-        flight_id    = flight_id or None,
-        pilot        = user.get("name", "Unknown"),
-        flight_no    = plan.get("flight_no", "N/A"),
-        departure    = plan.get("departure", "????"),
-        arrival      = plan.get("arrival", "????"),
-        aircraft     = aircraft.get("icao_name", "Unknown"),
-        landing_rate = rate,
-        profit       = profit,
+        flight_id=flight_id or None,
+        pilot=user.get("name", "Unknown"),
+        flight_no=plan.get("flight_no", "N/A"),
+        departure=plan.get("departure", "????"),
+        arrival=plan.get("arrival", "????"),
+        aircraft=aircraft.get("icao_name", "Unknown"),
+        landing_rate=rate,
+        profit=profit,
     )
 
-    profit_text = (
-        f"\n💎 Profit: <b>{profit:,.0f} v$</b>" if profit is not None else ""
-    )
-    flight_link = (
-        f"\n🔗 <a href='https://fshub.io/flight/{flight_id}'>Open Flight Report</a>"
-        if flight_id else ""
-    )
+    profit_text = f"\n💎 Profit: <b>{profit:,.0f} v$</b>" if profit is not None else ""
+    flight_link = f"\n🔗 <a href='https://fshub.io/flight/{flight_id}'>Flight Report</a>" if flight_id else ""
 
     tg_send(
         f"🛬 <b>ARRIVAL CONFIRMED</b> {emoji}\n\n"
         f"👨‍✈️ Captain: <b>{user.get('name', 'Unknown')}</b>\n"
         f"🆔 Flight: <b>{plan.get('flight_no', 'N/A')}</b>\n"
-        f"🗺 Route: <b>{plan.get('departure')} → {plan.get('arrival')}</b>\n"
+        f"🗺 Route: <b>{plan.get('departure', '???')} → {plan.get('arrival', '???')}</b>\n"
         f"📍 Airport: <b>{airport.get('name', 'Unknown')}</b>\n"
         f"✈️ Aircraft: <b>{aircraft.get('icao_name', 'Unknown')}</b>\n"
         f"📊 Landing Rate: <b>{rate} fpm</b> — {rating}"
@@ -685,7 +678,6 @@ def handle_arrival(data: Dict):
         f"{flight_link}"
     )
 
-    # FIX: alert threshold updated to match landing_rating scale (-600 = HARD)
     if rate < -600:
         tg_send(
             f"⚠️ <b>HARD LANDING ALERT</b>\n\n"
@@ -714,10 +706,10 @@ def handle_screenshots(data: Dict):
 
 
 def handle_achievement(data: Dict):
-    d           = data.get("_data", {})
-    achievement = d.get("achievement", {})
-    flight      = d.get("flight", {})
-    user        = flight.get("user", {})
+    d = data.get("_data", {}) or {}
+    achievement = d.get("achievement") or {}
+    flight = d.get("flight") or {}
+    user = flight.get("user") or {}
     tg_send(
         f"🏆 <b>ACHIEVEMENT UNLOCKED</b>\n\n"
         f"👨‍✈️ {user.get('name', 'Unknown')}\n"
@@ -766,12 +758,9 @@ def handle_tg_command(message: Dict):
     chat_id = message.get("chat", {}).get("id")
     text    = (message.get("text") or "").strip()
 
-    # FIX: check chat_id and text first, then filter channel
     if not chat_id or not text:
         return
 
-    # Ignore messages from the main broadcast channel
-    # (so the bot doesn't reply "Unknown command" to its own posts)
     if str(chat_id) == str(CHAT_ID):
         logger.info(f"Ignoring message from channel: {text[:50]}")
         return
@@ -786,7 +775,7 @@ def handle_tg_command(message: Dict):
         tg_send(HELP_TEXT, chat_id)
         return
 
-    cmd = text.split("@")[0]  # strip @BotName suffix in groups
+    cmd = text.split("@")[0]
 
     if cmd in COMMANDS:
         try:
@@ -824,12 +813,6 @@ def fshub_webhook():
     if request.method == "GET":
         return jsonify({"status": "ok"})
     try:
-        # Webhook secret check disabled — enable when FSHub supports it
-        # if WEBHOOK_SECRET:
-        #     if request.headers.get("X-Webhook-Secret") != WEBHOOK_SECRET:
-        #         logger.warning("Invalid webhook secret")
-        #         return jsonify({"error": "forbidden"}), 403
-
         data = request.get_json(force=True)
         if not data:
             return jsonify({"error": "no json"}), 400
