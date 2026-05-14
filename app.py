@@ -468,15 +468,17 @@ def snapshot_daily_economy():
 # ═══════════════════════════════════════════════════════════════
 
 def landing_rating(rate: int) -> Tuple[str, str]:
-    if rate < -600:
+    if rate < -1000:
         return "UNSAFE LANDING", "🔴"
-    if rate < -400:
+    if rate < -600:
         return "HARD LANDING", "🟠"
-    if rate < -250:
+    if rate < -500:
         return "FIRM LANDING", "🟡"
-    if rate < -100:
+    if rate < -350:
         return "STABLE LANDING", "🟢"
-    return "SMOOTH LANDING", "✅"
+    if rate < -50:
+        return "SMOOTH LANDING", "✅"
+    return "BUTTER LANDING", "⭐⭐⭐"
 
 
 # ═══════════════════════════════════════════════════════════════
