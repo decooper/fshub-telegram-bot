@@ -120,10 +120,6 @@ def put_conn(conn):
 
 
 def db_execute(query: str, params=None, fetch: str = "none"):
-    """
-    Execute a query safely.
-    fetch: "none" | "one" | "all"
-    """
     conn = get_conn()
     try:
         with conn.cursor() as cur:
@@ -183,6 +179,7 @@ def _init_db():
     )
     logger.info("Database tables ready")
 
+
 # ═══════════════════════════════════════════════════════════════
 # DB HELPERS — FLIGHTS
 # ═══════════════════════════════════════════════════════════════
@@ -208,7 +205,6 @@ def db_add_flight(
         (flight_id, pilot, flight_no, departure, arrival,
          aircraft, landing_rate, profit),
     )
-    # Trim oldest records beyond MAX_DB_FLIGHTS
     db_execute(
         """
         DELETE FROM flights
@@ -239,6 +235,7 @@ def db_top_landings(limit: int = 10) -> List:
         "SELECT * FROM flights ORDER BY ABS(landing_rate) ASC LIMIT %s",
         (limit,), fetch="all",
     ) or []
+
 
 # ═══════════════════════════════════════════════════════════════
 # DB HELPERS — DAILY ECONOMY
@@ -275,6 +272,7 @@ def db_get_today_economy() -> Optional[Dict]:
         "SELECT * FROM daily_economy WHERE day = CURRENT_DATE",
         fetch="one",
     )
+
 
 # ═══════════════════════════════════════════════════════════════
 # TELEGRAM
@@ -333,6 +331,7 @@ def tg_setup_webhook():
         logger.info(f"Telegram webhook: {r.text}")
     except Exception as e:
         logger.exception(f"Webhook setup error: {e}")
+
 
 # ═══════════════════════════════════════════════════════════════
 # FSA API
@@ -395,7 +394,8 @@ def fsa_airline_data() -> Optional[Dict]:
 
 
 def get_flight_profit(report_id: int) -> Optional[int]:
-    return None  # временно отключено
+    return None
+
 
 # ═══════════════════════════════════════════════════════════════
 # FINANCIAL AGGREGATION
@@ -432,7 +432,6 @@ def _nem(net: float) -> str:
 
 
 def snapshot_daily_economy():
-    """Called every day at 23:50 UTC by scheduler."""
     if not FSA_KEY:
         return
     txs = fsa_daily_transactions()
@@ -450,6 +449,7 @@ def snapshot_daily_economy():
     )
     logger.info(f"Economy snapshot saved for {day}: net={ag['net']:,.0f}")
 
+
 # ═══════════════════════════════════════════════════════════════
 # LANDING RATING
 # ═══════════════════════════════════════════════════════════════
@@ -461,6 +461,7 @@ def landing_rating(rate: int) -> Tuple[str, str]:
     if rate < -350:  return "STABLE LANDING",  "🟢"
     if rate < -50:   return "SMOOTH LANDING",  "✅"
     return                  "BUTTER LANDING",  "🧈✨"
+
 
 # ═══════════════════════════════════════════════════════════════
 # COMMAND FORMATTERS
@@ -536,10 +537,10 @@ def fmt_top_pilots() -> str:
 def fmt_daily_economy() -> str:
     row = db_get_today_economy()
     if row:
-        inc     = row["income"]
-        exp     = row["expense"]
-        net     = row["net"]
-        detail  = row["detail"] or {}
+        inc = row["income"]
+        exp = row["expense"]
+        net = row["net"]
+        detail = row["detail"] or {}
         inc_cat = detail.get("inc_cat", {})
         exp_cat = detail.get("exp_cat", {})
     else:
@@ -576,10 +577,10 @@ def fmt_monthly_economy() -> str:
             "ℹ️ History is collected daily at 23:50 UTC. "
             "Data will appear from tomorrow."
         )
-    total_inc = sum(r["income"]  for r in rows)
+    total_inc = sum(r["income"] for r in rows)
     total_exp = sum(r["expense"] for r in rows)
-    net       = total_inc - total_exp
-    best_row  = max(rows, key=lambda r: r["net"])
+    net = total_inc - total_exp
+    best_row = max(rows, key=lambda r: r["net"])
     worst_row = min(rows, key=lambda r: r["net"])
     return (
         f"🏆 <b>MONTHLY FINANCIAL DIGEST</b>\n"
@@ -619,6 +620,7 @@ def fmt_va_info() -> str:
         f"✈️ Code: <b>{data.get('code', 'N/A')}</b>"
     )
 
+
 # ═══════════════════════════════════════════════════════════════
 # FSHUB EVENT HANDLERS
 # ═══════════════════════════════════════════════════════════════
@@ -639,15 +641,15 @@ def is_duplicate_event(event_id: str, event_type: str) -> bool:
 
 
 def handle_departure(data: Dict):
-    d        = data.get("_data", {})
+    d = data.get("_data", {})
     flight_id = str(d.get("id", ""))
-    
+
     if flight_id and is_duplicate_event(flight_id, "departure"):
         logger.info(f"Пропуск дублирующего departure для рейса {flight_id}")
         return
-    
-    user     = d.get("user", {})
-    plan     = d.get("plan", {})
+
+    user = d.get("user", {})
+    plan = d.get("plan", {})
     aircraft = d.get("aircraft", {})
     tg_send(
         f"🛫 <b>ВЫЛЕТ ПОДТВЕРЖДЁН — CLEARED FOR TAKEOFF</b>\n\n"
@@ -660,30 +662,30 @@ def handle_departure(data: Dict):
 
 
 def handle_arrival(data: Dict):
-    d        = data.get("_data", {})
+    d = data.get("_data", {})
     flight_id = str(d.get("id", ""))
-    
+
     if flight_id and is_duplicate_event(flight_id, "arrival"):
         logger.info(f"Пропуск дублирующего arrival для рейса {flight_id}")
         return
-    
-    user     = d.get("user", {})
-    plan     = d.get("plan", {})
-    aircraft = d.get("aircraft", {})
-    airport  = d.get("airport", {})
 
-    rate          = int(d.get("landing_rate", 0))
+    user = d.get("user", {})
+    plan = d.get("plan", {})
+    aircraft = d.get("aircraft", {})
+    airport = d.get("airport", {})
+
+    rate = int(d.get("landing_rate", 0))
     rating, emoji = landing_rating(rate)
 
     db_add_flight(
-        flight_id    = flight_id or None,
-        pilot        = user.get("name", "Unknown"),
-        flight_no    = plan.get("flight_no", "N/A"),
-        departure    = plan.get("departure", "????"),
-        arrival      = plan.get("arrival", "????"),
-        aircraft     = aircraft.get("icao_name", "Unknown"),
-        landing_rate = rate,
-        profit       = None,
+        flight_id=flight_id or None,
+        pilot=user.get("name", "Unknown"),
+        flight_no=plan.get("flight_no", "N/A"),
+        departure=plan.get("departure", "????"),
+        arrival=plan.get("arrival", "????"),
+        aircraft=aircraft.get("icao_name", "Unknown"),
+        landing_rate=rate,
+        profit=None,
     )
 
     flight_link = (
@@ -730,10 +732,10 @@ def handle_screenshots(data: Dict):
 
 
 def handle_achievement(data: Dict):
-    d           = data.get("_data", {})
+    d = data.get("_data", {})
     achievement = d.get("achievement", {})
-    flight      = d.get("flight", {})
-    user        = flight.get("user", {})
+    flight = d.get("flight", {})
+    user = flight.get("user", {})
     tg_send(
         f"🏆 <b>ACHIEVEMENT UNLOCKED</b>\n\n"
         f"👨‍✈️ {user.get('name', 'Unknown')}\n"
@@ -742,10 +744,10 @@ def handle_achievement(data: Dict):
 
 
 FSHUB_HANDLERS = {
-    "flight.departed":      handle_departure,
-    "flight.arrived":       handle_arrival,
+    "flight.departed": handle_departure,
+    "flight.arrived": handle_arrival,
     "screenshots.uploaded": handle_screenshots,
-    "airline.achievement":  handle_achievement,
+    "airline.achievement": handle_achievement,
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -753,14 +755,14 @@ FSHUB_HANDLERS = {
 # ═══════════════════════════════════════════════════════════════
 
 COMMANDS = {
-    "/stats":       fmt_stats,
-    "/last":        fmt_last,
+    "/stats": fmt_stats,
+    "/last": fmt_last,
     "/top_landing": fmt_top_landings,
-    "/top":         fmt_top_pilots,
-    "/economy":     fmt_daily_economy,
-    "/monthly":     fmt_monthly_economy,
-    "/live":        fmt_active_flights,
-    "/va":          fmt_va_info,
+    "/top": fmt_top_pilots,
+    "/economy": fmt_daily_economy,
+    "/monthly": fmt_monthly_economy,
+    "/live": fmt_active_flights,
+    "/va": fmt_va_info,
 }
 
 HELP_TEXT = (
@@ -780,7 +782,7 @@ HELP_TEXT = (
 
 def handle_tg_command(message: Dict):
     chat_id = message.get("chat", {}).get("id")
-    text    = (message.get("text") or "").strip()
+    text = (message.get("text") or "").strip()
 
     if not chat_id or not text:
         return
@@ -811,11 +813,134 @@ def handle_tg_command(message: Dict):
 
     tg_send("Unknown command. Use /help", chat_id)
 
+
 # ═══════════════════════════════════════════════════════════════
-# FLASK
+# FLASK APP
 # ═══════════════════════════════════════════════════════════════
 
 app = Flask(__name__)
+
+# Флаг для ленивого запуска планировщика
+_scheduler_started = False
+_scheduler = None
+
+
+def get_scheduler():
+    global _scheduler
+    if _scheduler is None:
+        _scheduler = BackgroundScheduler(
+            daemon=True,
+            executors={
+                "default": ThreadPoolExecutor(max_workers=2)
+            },
+            job_defaults={
+                "coalesce": True,
+                "max_instances": 1,
+                "misfire_grace_time": 3600,
+            },
+            timezone="UTC",
+        )
+    return _scheduler
+
+
+def job_listener(event):
+    if event.exception:
+        logger.error(f"Job {event.job_id} crashed: {event.exception}")
+    else:
+        logger.info(f"Job {event.job_id} executed successfully")
+
+
+def init_scheduler():
+    global _scheduler_started
+    if _scheduler_started:
+        return
+
+    scheduler = get_scheduler()
+
+    scheduler.add_job(
+        snapshot_daily_economy,
+        "cron",
+        hour=23, minute=50,
+        id="daily_economy_snapshot",
+        replace_existing=True,
+    )
+
+    scheduler.add_job(
+        lambda: tg_send(fmt_stats()),
+        "cron",
+        hour=21, minute=0,
+        id="daily_stats",
+        replace_existing=True,
+    )
+
+    scheduler.add_job(
+        lambda: tg_send(fmt_stats()),
+        "cron",
+        hour=1, minute=25,
+        id="night_stats",
+        replace_existing=True,
+    )
+
+    scheduler.add_job(
+        lambda: tg_send(fmt_top_landings()),
+        "cron",
+        day_of_week="sun", hour=12, minute=0,
+        id="weekly_landing_ranking",
+        replace_existing=True,
+    )
+
+    scheduler.add_job(
+        lambda: tg_send(fmt_top_pilots()),
+        "cron",
+        day_of_week="sun", hour=10, minute=0,
+        id="weekly_top_pilots",
+        replace_existing=True,
+    )
+
+    scheduler.add_job(
+        lambda: tg_send(
+            "🛫 <b>СОВМЕСТНАЯ СУББОТНЯЯ ОПЕРАЦИЯ!</b>\n\n"
+            "⏰ Москва: 09:00 ☀️  |  Камчатка: 18:00 🌙\n\n"
+            "✈️ Предлагайте маршрут в комментариях!\nКто присоединяется? 👇"
+        ),
+        "cron",
+        day_of_week="sat", hour=6, minute=0,
+        id="saturday_inv",
+        replace_existing=True,
+    )
+
+    scheduler.add_job(
+        lambda: tg_send(
+            "🏆 <b>ЕЖЕНЕДЕЛЬНЫЙ ВЫЗОВ ЭКИПАЖУ!</b>\n\n"
+            "🔹 Цель: 3 рейса за 7 дней\n"
+            "🔹 Бонус: лучшая посадка недели\n\nГотов принять вызов? 💪"
+        ),
+        "cron",
+        day_of_week="mon", hour=8, minute=0,
+        id="monday_challenge",
+        replace_existing=True,
+    )
+
+    scheduler.add_job(
+        lambda: tg_send(fmt_monthly_economy()),
+        "cron",
+        day=1, hour=9, minute=0,
+        id="monthly_digest",
+        replace_existing=True,
+    )
+
+    scheduler.add_listener(job_listener, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
+
+    scheduler.start()
+    _scheduler_started = True
+
+    logger.info("Планировщик задач запущен")
+    logger.info(f"Активные задачи: {[job.id for job in scheduler.get_jobs()]}")
+
+
+@app.before_request
+def ensure_scheduler():
+    init_scheduler()
 
 
 @app.route("/")
@@ -857,140 +982,12 @@ def fshub_webhook():
 @app.route(f"/bot/{BOT_TOKEN}", methods=["POST"])
 def tg_webhook():
     try:
-        data    = request.get_json(force=True) or {}
+        data = request.get_json(force=True) or {}
         message = data.get("message") or data.get("channel_post") or {}
         handle_tg_command(message)
     except Exception as e:
         logger.exception(f"Telegram webhook failure: {e}")
     return jsonify({"ok": True})
-
-
-# ═══════════════════════════════════════════════════════════════
-# SCHEDULER (запускается только в worker-процессе Flask)
-# ═══════════════════════════════════════════════════════════════
-
-_scheduler_started = False
-_scheduler = None
-
-
-def get_scheduler():
-    global _scheduler, _scheduler_started
-    if _scheduler is None:
-        _scheduler = BackgroundScheduler(
-            daemon=True,
-            executors={
-                "default": ThreadPoolExecutor(max_workers=2)
-            },
-            job_defaults={
-                "coalesce": True,
-                "max_instances": 1,
-                "misfire_grace_time": 3600,
-            },
-            timezone="UTC",
-        )
-    return _scheduler
-
-
-def job_listener(event):
-    if event.exception:
-        logger.error(f"Job {event.job_id} crashed: {event.exception}")
-    else:
-        logger.info(f"Job {event.job_id} executed successfully")
-
-
-def init_scheduler():
-    global _scheduler_started
-    if _scheduler_started:
-        return
-    
-    scheduler = get_scheduler()
-    
-    # Добавляем задачи
-    scheduler.add_job(
-        snapshot_daily_economy,
-        "cron",
-        hour=23, minute=50,
-        id="daily_economy_snapshot",
-        replace_existing=True,
-    )
-    
-    scheduler.add_job(
-        lambda: tg_send(fmt_stats()),
-        "cron",
-        hour=21, minute=0,
-        id="daily_stats",
-        replace_existing=True,
-    )
-    
-    scheduler.add_job(
-        lambda: tg_send(fmt_stats()),
-        "cron",
-        hour=1, minute=15,
-        id="night_stats",
-        replace_existing=True,
-    )
-    
-    scheduler.add_job(
-        lambda: tg_send(fmt_top_landings()),
-        "cron",
-        day_of_week="sun", hour=12, minute=0,
-        id="weekly_landing_ranking",
-        replace_existing=True,
-    )
-    
-    scheduler.add_job(
-        lambda: tg_send(fmt_top_pilots()),
-        "cron",
-        day_of_week="sun", hour=10, minute=0,
-        id="weekly_top_pilots",
-        replace_existing=True,
-    )
-    
-    scheduler.add_job(
-        lambda: tg_send(
-            "🛫 <b>СОВМЕСТНАЯ СУББОТНЯЯ ОПЕРАЦИЯ!</b>\n\n"
-            "⏰ Москва: 09:00 ☀️  |  Камчатка: 18:00 🌙\n\n"
-            "✈️ Предлагайте маршрут в комментариях!\nКто присоединяется? 👇"
-        ),
-        "cron",
-        day_of_week="sat", hour=6, minute=0,
-        id="saturday_inv",
-        replace_existing=True,
-    )
-    
-    scheduler.add_job(
-        lambda: tg_send(
-            "🏆 <b>ЕЖЕНЕДЕЛЬНЫЙ ВЫЗОВ ЭКИПАЖУ!</b>\n\n"
-            "🔹 Цель: 3 рейса за 7 дней\n"
-            "🔹 Бонус: лучшая посадка недели\n\nГотов принять вызов? 💪"
-        ),
-        "cron",
-        day_of_week="mon", hour=8, minute=0,
-        id="monday_challenge",
-        replace_existing=True,
-    )
-    
-    scheduler.add_job(
-        lambda: tg_send(fmt_monthly_economy()),
-        "cron",
-        day=1, hour=9, minute=0,
-        id="monthly_digest",
-        replace_existing=True,
-    )
-    
-    scheduler.add_listener(job_listener, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
-    
-    scheduler.start()
-    _scheduler_started = True
-    
-    logger.info("Планировщик задач запущен")
-    logger.info(f"Активные задачи: {[job.id for job in scheduler.get_jobs()]}")
-
-
-# Запускаем планировщик при первом запросе
-@app.before_request
-def start_scheduler():
-    init_scheduler()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1008,7 +1005,7 @@ except Exception as e:
 logger.info(f"Сервис запущен на порту {PORT} — VA UP! готова к полётам")
 
 # ═══════════════════════════════════════════════════════════════
-# MAIN
+# MAIN (для локального запуска, на Render не используется)
 # ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
