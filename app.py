@@ -15,6 +15,7 @@ import requests
 from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.executors.pool import ThreadPoolExecutor
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -394,10 +395,7 @@ def fsa_airline_data() -> Optional[Dict]:
 
 
 def get_flight_profit(report_id: int) -> Optional[int]:
-    """Запрашивает прибыль рейса из FSAirlines API (временно отключено)"""
-    # Функция оставлена для возможного использования в будущем,
-    # но в сообщениях о посадке прибыль не показывается
-    return None
+    return None  # временно отключено
 
 # ═══════════════════════════════════════════════════════════════
 # FINANCIAL AGGREGATION
@@ -625,13 +623,11 @@ def fmt_va_info() -> str:
 # FSHUB EVENT HANDLERS
 # ═══════════════════════════════════════════════════════════════
 
-# Хранилище обработанных событий для защиты от дублей
 _processed_events = set()
 _processed_lock = threading.Lock()
 
 
 def is_duplicate_event(event_id: str, event_type: str) -> bool:
-    """Проверяет, не было ли уже обработано это событие"""
     key = f"{event_type}:{event_id}"
     with _processed_lock:
         if key in _processed_events:
@@ -687,7 +683,7 @@ def handle_arrival(data: Dict):
         arrival      = plan.get("arrival", "????"),
         aircraft     = aircraft.get("icao_name", "Unknown"),
         landing_rate = rate,
-        profit       = None,  # прибыль временно отключена
+        profit       = None,
     )
 
     flight_link = (
@@ -868,106 +864,134 @@ def tg_webhook():
         logger.exception(f"Telegram webhook failure: {e}")
     return jsonify({"ok": True})
 
+
 # ═══════════════════════════════════════════════════════════════
-# SCHEDULER
+# SCHEDULER (запускается только в worker-процессе Flask)
 # ═══════════════════════════════════════════════════════════════
 
-scheduler = BackgroundScheduler(
-    executors={"default": ThreadPoolExecutor(max_workers=2)},
-    timezone="UTC",
-)
+_scheduler_started = False
+_scheduler = None
 
-# Daily economy snapshot at 23:50 UTC
-scheduler.add_job(
-    snapshot_daily_economy,
-    "cron",
-    hour=23, minute=50,
-    id="daily_economy_snapshot",
-    replace_existing=True,
-    misfire_grace_time=300,
-)
 
-# Daily stats at 21:00 UTC
-scheduler.add_job(
-    lambda: (logger.info("=== DAILY STATS STARTED ==="), tg_send(fmt_stats()), logger.info("=== DAILY STATS FINISHED ===")),
-    "cron",
-    hour=21, minute=0,
-    id="daily_stats",
-    replace_existing=True,
-    misfire_grace_time=300,
-)
+def get_scheduler():
+    global _scheduler, _scheduler_started
+    if _scheduler is None:
+        _scheduler = BackgroundScheduler(
+            daemon=True,
+            executors={
+                "default": ThreadPoolExecutor(max_workers=2)
+            },
+            job_defaults={
+                "coalesce": True,
+                "max_instances": 1,
+                "misfire_grace_time": 3600,
+            },
+            timezone="UTC",
+        )
+    return _scheduler
 
-# Night stats at 01:00 UTC (для проверки планировщика)
-scheduler.add_job(
-    lambda: (logger.info("=== NIGHT STATS STARTED ==="), tg_send(fmt_stats()), logger.info("=== NIGHT STATS FINISHED ===")),
-    "cron",
-    hour=1, minute=0,
-    id="night_stats",
-    replace_existing=True,
-    misfire_grace_time=300,
-)
 
-# Weekly top landings — Sunday 12:00 UTC
-scheduler.add_job(
-    lambda: (logger.info("=== WEEKLY LANDINGS STARTED ==="), tg_send(fmt_top_landings()), logger.info("=== WEEKLY LANDINGS FINISHED ===")),
-    "cron",
-    day_of_week="sun", hour=12, minute=0,
-    id="weekly_landing_ranking",
-    replace_existing=True,
-    misfire_grace_time=300,
-)
+def job_listener(event):
+    if event.exception:
+        logger.error(f"Job {event.job_id} crashed: {event.exception}")
+    else:
+        logger.info(f"Job {event.job_id} executed successfully")
 
-# Weekly top pilots — Sunday 10:00 UTC
-scheduler.add_job(
-    lambda: (logger.info("=== WEEKLY PILOTS STARTED ==="), tg_send(fmt_top_pilots()), logger.info("=== WEEKLY PILOTS FINISHED ===")),
-    "cron",
-    day_of_week="sun", hour=10, minute=0,
-    id="weekly_top_pilots",
-    replace_existing=True,
-    misfire_grace_time=300,
-)
 
-# Saturday joint flight invitation — 06:00 UTC
-scheduler.add_job(
-    lambda: (logger.info("=== SATURDAY INVITATION STARTED ==="), tg_send(
-        "🛫 <b>СОВМЕСТНАЯ СУББОТНЯЯ ОПЕРАЦИЯ!</b>\n\n"
-        "⏰ Москва: 09:00 ☀️  |  Камчатка: 18:00 🌙\n\n"
-        "✈️ Предлагайте маршрут в комментариях!\nКто присоединяется? 👇"
-    ), logger.info("=== SATURDAY INVITATION FINISHED ===")),
-    "cron",
-    day_of_week="sat", hour=6, minute=0,
-    id="saturday_inv",
-    replace_existing=True,
-    misfire_grace_time=300,
-)
+def init_scheduler():
+    global _scheduler_started
+    if _scheduler_started:
+        return
+    
+    scheduler = get_scheduler()
+    
+    # Добавляем задачи
+    scheduler.add_job(
+        snapshot_daily_economy,
+        "cron",
+        hour=23, minute=50,
+        id="daily_economy_snapshot",
+        replace_existing=True,
+    )
+    
+    scheduler.add_job(
+        lambda: tg_send(fmt_stats()),
+        "cron",
+        hour=21, minute=0,
+        id="daily_stats",
+        replace_existing=True,
+    )
+    
+    scheduler.add_job(
+        lambda: tg_send(fmt_stats()),
+        "cron",
+        hour=1, minute=15,
+        id="night_stats",
+        replace_existing=True,
+    )
+    
+    scheduler.add_job(
+        lambda: tg_send(fmt_top_landings()),
+        "cron",
+        day_of_week="sun", hour=12, minute=0,
+        id="weekly_landing_ranking",
+        replace_existing=True,
+    )
+    
+    scheduler.add_job(
+        lambda: tg_send(fmt_top_pilots()),
+        "cron",
+        day_of_week="sun", hour=10, minute=0,
+        id="weekly_top_pilots",
+        replace_existing=True,
+    )
+    
+    scheduler.add_job(
+        lambda: tg_send(
+            "🛫 <b>СОВМЕСТНАЯ СУББОТНЯЯ ОПЕРАЦИЯ!</b>\n\n"
+            "⏰ Москва: 09:00 ☀️  |  Камчатка: 18:00 🌙\n\n"
+            "✈️ Предлагайте маршрут в комментариях!\nКто присоединяется? 👇"
+        ),
+        "cron",
+        day_of_week="sat", hour=6, minute=0,
+        id="saturday_inv",
+        replace_existing=True,
+    )
+    
+    scheduler.add_job(
+        lambda: tg_send(
+            "🏆 <b>ЕЖЕНЕДЕЛЬНЫЙ ВЫЗОВ ЭКИПАЖУ!</b>\n\n"
+            "🔹 Цель: 3 рейса за 7 дней\n"
+            "🔹 Бонус: лучшая посадка недели\n\nГотов принять вызов? 💪"
+        ),
+        "cron",
+        day_of_week="mon", hour=8, minute=0,
+        id="monday_challenge",
+        replace_existing=True,
+    )
+    
+    scheduler.add_job(
+        lambda: tg_send(fmt_monthly_economy()),
+        "cron",
+        day=1, hour=9, minute=0,
+        id="monthly_digest",
+        replace_existing=True,
+    )
+    
+    scheduler.add_listener(job_listener, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
+    
+    scheduler.start()
+    _scheduler_started = True
+    
+    logger.info("Планировщик задач запущен")
+    logger.info(f"Активные задачи: {[job.id for job in scheduler.get_jobs()]}")
 
-# Weekly challenge — Monday 08:00 UTC
-scheduler.add_job(
-    lambda: (logger.info("=== WEEKLY CHALLENGE STARTED ==="), tg_send(
-        "🏆 <b>ЕЖЕНЕДЕЛЬНЫЙ ВЫЗОВ ЭКИПАЖУ!</b>\n\n"
-        "🔹 Цель: 3 рейса за 7 дней\n"
-        "🔹 Бонус: лучшая посадка недели\n\nГотов принять вызов? 💪"
-    ), logger.info("=== WEEKLY CHALLENGE FINISHED ===")),
-    "cron",
-    day_of_week="mon", hour=8, minute=0,
-    id="monday_challenge",
-    replace_existing=True,
-    misfire_grace_time=300,
-)
 
-# Monthly digest — 1st of month at 09:00 UTC
-scheduler.add_job(
-    lambda: (logger.info("=== MONTHLY DIGEST STARTED ==="), tg_send(fmt_monthly_economy()), logger.info("=== MONTHLY DIGEST FINISHED ===")),
-    "cron",
-    day=1, hour=9, minute=0,
-    id="monthly_digest",
-    replace_existing=True,
-    misfire_grace_time=600,
-)
+# Запускаем планировщик при первом запросе
+@app.before_request
+def start_scheduler():
+    init_scheduler()
 
-scheduler.start()
-logger.info("Планировщик задач запущен")
-logger.info(f"Активные задачи: {[job.id for job in scheduler.get_jobs()]}")
 
 # ═══════════════════════════════════════════════════════════════
 # STARTUP
