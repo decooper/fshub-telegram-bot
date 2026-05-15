@@ -349,7 +349,7 @@ def fsa_call(function: str, extra: Optional[Dict] = None):
     if extra:
         params.update(extra)
     try:
-        r = session.get(FSA_URL, params=params, timeout=30)  # увеличен таймаут
+        r = session.get(FSA_URL, params=params, timeout=30)
         r.raise_for_status()
         body = r.json()
         if body.get("status") == "SUCCESS":
@@ -394,30 +394,9 @@ def fsa_airline_data() -> Optional[Dict]:
 
 
 def get_flight_profit(report_id: int) -> Optional[int]:
-    """Запрашивает прибыль рейса из FSAirlines API"""
-    logger.info(f"Запрос прибыли для рейса report_id: {report_id}")
-    
-    for attempt in range(1, 4):  # до 3 попыток
-        try:
-            data = fsa_call("getReportDetail", {"report_id": report_id})
-            if data:
-                profit = data.get("profit")
-                if profit is not None:
-                    try:
-                        profit_int = int(float(profit))
-                        logger.info(f"✅ Прибыль для {report_id}: {profit_int} v$")
-                        return profit_int
-                    except (ValueError, TypeError):
-                        logger.warning(f"Неверное значение прибыли: {profit}")
-            else:
-                logger.warning(f"Нет данных для report_id {report_id}, попытка {attempt}/3")
-        except Exception as e:
-            logger.warning(f"Ошибка при запросе прибыли (попытка {attempt}/3): {e}")
-        
-        if attempt < 3:
-            time.sleep(5)  # ждём 5 секунд перед следующей попыткой
-    
-    logger.warning(f"❌ Прибыль по рейсу {report_id} недоступна после всех попыток")
+    """Запрашивает прибыль рейса из FSAirlines API (временно отключено)"""
+    # Функция оставлена для возможного использования в будущем,
+    # но в сообщениях о посадке прибыль не показывается
     return None
 
 # ═══════════════════════════════════════════════════════════════
@@ -483,7 +462,7 @@ def landing_rating(rate: int) -> Tuple[str, str]:
     if rate < -500:  return "FIRM LANDING",    "🟡"
     if rate < -350:  return "STABLE LANDING",  "🟢"
     if rate < -50:   return "SMOOTH LANDING",  "✅"
-    return                  "BUTTER LANDING",  "⭐⭐⭐"
+    return                  "BUTTER LANDING",  "🧈✨"
 
 # ═══════════════════════════════════════════════════════════════
 # COMMAND FORMATTERS
@@ -658,7 +637,6 @@ def is_duplicate_event(event_id: str, event_type: str) -> bool:
         if key in _processed_events:
             return True
         _processed_events.add(key)
-        # Очищаем старые ключи (оставляем последние 1000)
         if len(_processed_events) > 1000:
             _processed_events.clear()
         return False
@@ -668,7 +646,6 @@ def handle_departure(data: Dict):
     d        = data.get("_data", {})
     flight_id = str(d.get("id", ""))
     
-    # Защита от дублей
     if flight_id and is_duplicate_event(flight_id, "departure"):
         logger.info(f"Пропуск дублирующего departure для рейса {flight_id}")
         return
@@ -681,7 +658,8 @@ def handle_departure(data: Dict):
         f"👨‍✈️ Captain: <b>{user.get('name', 'Unknown')}</b>\n"
         f"🆔 Flight: <b>{plan.get('flight_no', 'N/A')}</b>\n"
         f"🗺 Route: <b>{plan.get('departure')} → {plan.get('arrival')}</b>\n"
-        f"✈️ Aircraft: <b>{aircraft.get('icao_name', 'N/A')}</b>"
+        f"✈️ Aircraft: <b>{aircraft.get('icao_name', 'N/A')}</b>\n\n"
+        f"✈️ <i>Желаем попутного ветра и мягкой посадки!</i>"
     )
 
 
@@ -689,7 +667,6 @@ def handle_arrival(data: Dict):
     d        = data.get("_data", {})
     flight_id = str(d.get("id", ""))
     
-    # Защита от дублей
     if flight_id and is_duplicate_event(flight_id, "arrival"):
         logger.info(f"Пропуск дублирующего arrival для рейса {flight_id}")
         return
@@ -702,13 +679,6 @@ def handle_arrival(data: Dict):
     rate          = int(d.get("landing_rate", 0))
     rating, emoji = landing_rating(rate)
 
-    # Ждём перед запросом прибыли (FSAirlines нужно время)
-    time.sleep(3)
-    
-    profit = None
-    if FSA_KEY and flight_id and flight_id.isdigit():
-        profit = get_flight_profit(int(flight_id))
-
     db_add_flight(
         flight_id    = flight_id or None,
         pilot        = user.get("name", "Unknown"),
@@ -717,12 +687,11 @@ def handle_arrival(data: Dict):
         arrival      = plan.get("arrival", "????"),
         aircraft     = aircraft.get("icao_name", "Unknown"),
         landing_rate = rate,
-        profit       = profit,
+        profit       = None,  # прибыль временно отключена
     )
 
-    profit_text = f"\n💎 Profit: <b>{profit:,.0f} v$</b>" if profit is not None else ""
     flight_link = (
-        f"\n🔗 <a href='https://fshub.io/flight/{flight_id}'>Open Flight Report</a>"
+        f"\n🔗 <a href='https://fshub.io/flight/{flight_id}'>Открыть отчёт о рейсе</a>"
         if flight_id else ""
     )
 
@@ -734,7 +703,6 @@ def handle_arrival(data: Dict):
         f"📍 Airport: <b>{airport.get('name', 'Unknown')}</b>\n"
         f"✈️ Aircraft: <b>{aircraft.get('icao_name', 'Unknown')}</b>\n"
         f"📊 Landing Rate: <b>{rate} fpm</b> — {rating}"
-        f"{profit_text}"
         f"{flight_link}"
     )
 
@@ -921,7 +889,7 @@ scheduler.add_job(
 
 # Daily stats at 21:00 UTC
 scheduler.add_job(
-    lambda: tg_send(fmt_stats()),
+    lambda: (logger.info("=== DAILY STATS STARTED ==="), tg_send(fmt_stats()), logger.info("=== DAILY STATS FINISHED ===")),
     "cron",
     hour=21, minute=0,
     id="daily_stats",
@@ -929,9 +897,19 @@ scheduler.add_job(
     misfire_grace_time=300,
 )
 
+# НОВАЯ ЗАДАЧА: Daily stats at 00:40 UTC (03:40 MSK)
+scheduler.add_job(
+    lambda: (logger.info("=== NIGHT STATS STARTED ==="), tg_send(fmt_stats()), logger.info("=== NIGHT STATS FINISHED ===")),
+    "cron",
+    hour=0, minute=40,
+    id="night_stats",
+    replace_existing=True,
+    misfire_grace_time=300,
+)
+
 # Weekly top landings — Sunday 12:00 UTC
 scheduler.add_job(
-    lambda: tg_send(fmt_top_landings()),
+    lambda: (logger.info("=== WEEKLY LANDINGS STARTED ==="), tg_send(fmt_top_landings()), logger.info("=== WEEKLY LANDINGS FINISHED ===")),
     "cron",
     day_of_week="sun", hour=12, minute=0,
     id="weekly_landing_ranking",
@@ -941,7 +919,7 @@ scheduler.add_job(
 
 # Weekly top pilots — Sunday 10:00 UTC
 scheduler.add_job(
-    lambda: tg_send(fmt_top_pilots()),
+    lambda: (logger.info("=== WEEKLY PILOTS STARTED ==="), tg_send(fmt_top_pilots()), logger.info("=== WEEKLY PILOTS FINISHED ===")),
     "cron",
     day_of_week="sun", hour=10, minute=0,
     id="weekly_top_pilots",
@@ -951,11 +929,11 @@ scheduler.add_job(
 
 # Saturday joint flight invitation — 06:00 UTC (09:00 MSK / 18:00 Kamchatka)
 scheduler.add_job(
-    lambda: tg_send(
-        "🛫 <b>SATURDAY JOINT FLIGHT OPERATION!</b>\n\n"
-        "⏰ Moscow: 09:00 ☀️  |  Kamchatka: 18:00 🌙\n\n"
-        "✈️ Suggest your route in the comments!\nWho is joining? 👇"
-    ),
+    lambda: (logger.info("=== SATURDAY INVITATION STARTED ==="), tg_send(
+        "🛫 <b>СОВМЕСТНАЯ СУББОТНЯЯ ОПЕРАЦИЯ!</b>\n\n"
+        "⏰ Москва: 09:00 ☀️  |  Камчатка: 18:00 🌙\n\n"
+        "✈️ Предлагайте маршрут в комментариях!\nКто присоединяется? 👇"
+    ), logger.info("=== SATURDAY INVITATION FINISHED ===")),
     "cron",
     day_of_week="sat", hour=6, minute=0,
     id="saturday_inv",
@@ -965,11 +943,11 @@ scheduler.add_job(
 
 # Weekly challenge — Monday 08:00 UTC (11:00 MSK)
 scheduler.add_job(
-    lambda: tg_send(
-        "🏆 <b>WEEKLY CREW CHALLENGE!</b>\n\n"
-        "🔹 Goal: 3 flights in 7 days\n"
-        "🔹 Bonus: Best landing rate of the week\n\nReady to accept? 💪"
-    ),
+    lambda: (logger.info("=== WEEKLY CHALLENGE STARTED ==="), tg_send(
+        "🏆 <b>ЕЖЕНЕДЕЛЬНЫЙ ВЫЗОВ ЭКИПАЖУ!</b>\n\n"
+        "🔹 Цель: 3 рейса за 7 дней\n"
+        "🔹 Бонус: лучшая посадка недели\n\nГотов принять вызов? 💪"
+    ), logger.info("=== WEEKLY CHALLENGE FINISHED ===")),
     "cron",
     day_of_week="mon", hour=8, minute=0,
     id="monday_challenge",
@@ -979,7 +957,7 @@ scheduler.add_job(
 
 # Monthly digest — 1st of month at 09:00 UTC
 scheduler.add_job(
-    lambda: tg_send(fmt_monthly_economy()),
+    lambda: (logger.info("=== MONTHLY DIGEST STARTED ==="), tg_send(fmt_monthly_economy()), logger.info("=== MONTHLY DIGEST FINISHED ===")),
     "cron",
     day=1, hour=9, minute=0,
     id="monthly_digest",
