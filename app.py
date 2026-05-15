@@ -897,11 +897,11 @@ scheduler.add_job(
     misfire_grace_time=300,
 )
 
-# НОВАЯ ЗАДАЧА: Daily stats at 00:40 UTC (03:40 MSK)
+# Night stats at 01:00 UTC (для проверки планировщика)
 scheduler.add_job(
     lambda: (logger.info("=== NIGHT STATS STARTED ==="), tg_send(fmt_stats()), logger.info("=== NIGHT STATS FINISHED ===")),
     "cron",
-    hour=0, minute=40,
+    hour=1, minute=0,
     id="night_stats",
     replace_existing=True,
     misfire_grace_time=300,
@@ -927,7 +927,7 @@ scheduler.add_job(
     misfire_grace_time=300,
 )
 
-# Saturday joint flight invitation — 06:00 UTC (09:00 MSK / 18:00 Kamchatka)
+# Saturday joint flight invitation — 06:00 UTC
 scheduler.add_job(
     lambda: (logger.info("=== SATURDAY INVITATION STARTED ==="), tg_send(
         "🛫 <b>СОВМЕСТНАЯ СУББОТНЯЯ ОПЕРАЦИЯ!</b>\n\n"
@@ -941,7 +941,7 @@ scheduler.add_job(
     misfire_grace_time=300,
 )
 
-# Weekly challenge — Monday 08:00 UTC (11:00 MSK)
+# Weekly challenge — Monday 08:00 UTC
 scheduler.add_job(
     lambda: (logger.info("=== WEEKLY CHALLENGE STARTED ==="), tg_send(
         "🏆 <b>ЕЖЕНЕДЕЛЬНЫЙ ВЫЗОВ ЭКИПАЖУ!</b>\n\n"
@@ -967,6 +967,7 @@ scheduler.add_job(
 
 scheduler.start()
 logger.info("Планировщик задач запущен")
+logger.info(f"Активные задачи: {[job.id for job in scheduler.get_jobs()]}")
 
 # ═══════════════════════════════════════════════════════════════
 # STARTUP
