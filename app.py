@@ -13,11 +13,9 @@ import psycopg2.extras
 import psycopg2.pool
 import requests
 from flask import Flask, request, jsonify
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.executors.pool import ThreadPoolExecutor
-from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from urllib.parse import urlparse, urlencode, urlunparse, parse_qs
 
 # ═══════════════════════════════════════════════════════════════
 # CONFIG
@@ -84,58 +82,118 @@ session.mount("https://", adapter)
 session.mount("http://", adapter)
 
 # ═══════════════════════════════════════════════════════════════
-# DATABASE — PostgreSQL connection pool
+# DATABASE — PostgreSQL connection pool with keepalives
 # ═══════════════════════════════════════════════════════════════
 
 _pool: Optional[psycopg2.pool.ThreadedConnectionPool] = None
 
 
+def _build_dsn(base_url: str) -> str:
+    """Добавляет keepalive-параметры к DATABASE_URL для Neon.tech."""
+    parsed = urlparse(base_url)
+    params = {
+        "sslmode": "require",
+        "keepalives": "1",
+        "keepalives_idle": "30",
+        "keepalives_interval": "10",
+        "keepalives_count": "5",
+        "connect_timeout": "10",
+    }
+    existing = parse_qs(parsed.query)
+    existing.update({k: [v] for k, v in params.items()})
+    flat = {k: v[0] for k, v in existing.items()}
+    new_query = urlencode(flat)
+    new_parsed = parsed._replace(query=new_query)
+    return urlunparse(new_parsed)
+
+
 def _create_pool():
     global _pool
+    dsn = _build_dsn(DATABASE_URL)
     _pool = psycopg2.pool.ThreadedConnectionPool(
         minconn=1,
         maxconn=3,
-        dsn=DATABASE_URL,
+        dsn=dsn,
         cursor_factory=psycopg2.extras.RealDictCursor,
     )
-    logger.info("PostgreSQL connection pool created")
+    logger.info("PostgreSQL connection pool created (with keepalives)")
+
+
+def _test_connection(conn) -> bool:
+    try:
+        conn.cursor().execute("SELECT 1")
+        return True
+    except Exception:
+        return False
 
 
 def get_conn():
-    """Borrow a connection from the pool with auto-reconnect."""
     global _pool
-    try:
-        if _pool is None:
-            _create_pool()
-        return _pool.getconn()
-    except Exception as e:
-        logger.warning(f"Connection error: {e}, recreating pool")
-        _pool = None
-        _create_pool()
-        return _pool.getconn()
+    for attempt in range(3):
+        try:
+            if _pool is None:
+                _create_pool()
+            conn = _pool.getconn()
+            if not _test_connection(conn):
+                logger.warning(f"Dead connection detected (attempt {attempt + 1}), recreating pool")
+                try:
+                    _pool.putconn(conn, close=True)
+                except Exception:
+                    pass
+                _pool = None
+                continue
+            return conn
+        except psycopg2.OperationalError as e:
+            logger.warning(f"OperationalError (attempt {attempt + 1}): {e}")
+            _pool = None
+            if attempt == 2:
+                raise
+        except Exception as e:
+            logger.error(f"Unexpected pool error: {e}")
+            _pool = None
+            if attempt == 2:
+                raise
 
 
 def put_conn(conn):
-    _pool.putconn(conn)
+    global _pool
+    if _pool is not None:
+        try:
+            _pool.putconn(conn)
+        except Exception as e:
+            logger.warning(f"Error returning connection to pool: {e}")
 
 
 def db_execute(query: str, params=None, fetch: str = "none"):
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(query, params or ())
-            conn.commit()
-            if fetch == "one":
-                return cur.fetchone()
-            if fetch == "all":
-                return cur.fetchall()
-            return None
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"Database error: {e}")
-        raise
-    finally:
-        put_conn(conn)
+    for attempt in range(2):
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(query, params or ())
+                conn.commit()
+                if fetch == "one":
+                    return cur.fetchone()
+                if fetch == "all":
+                    return cur.fetchall()
+                return None
+        except psycopg2.OperationalError as e:
+            conn.rollback()
+            logger.warning(f"OperationalError in db_execute (attempt {attempt + 1}): {e}")
+            put_conn(conn)
+            global _pool
+            _pool = None
+            if attempt == 1:
+                logger.error(f"Database error after retry: {e}")
+                raise
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Database error: {e}")
+            raise
+        finally:
+            try:
+                put_conn(conn)
+            except Exception:
+                pass
 
 
 def _init_db():
@@ -394,6 +452,7 @@ def fsa_airline_data() -> Optional[Dict]:
 
 
 def get_flight_profit(report_id: int) -> Optional[int]:
+    # Временно отключено — ID не совпадают
     return None
 
 
@@ -820,128 +879,6 @@ def handle_tg_command(message: Dict):
 
 app = Flask(__name__)
 
-# Флаг для ленивого запуска планировщика
-_scheduler_started = False
-_scheduler = None
-
-
-def get_scheduler():
-    global _scheduler
-    if _scheduler is None:
-        _scheduler = BackgroundScheduler(
-            daemon=True,
-            executors={
-                "default": ThreadPoolExecutor(max_workers=2)
-            },
-            job_defaults={
-                "coalesce": True,
-                "max_instances": 1,
-                "misfire_grace_time": 3600,
-            },
-            timezone="UTC",
-        )
-    return _scheduler
-
-
-def job_listener(event):
-    if event.exception:
-        logger.error(f"Job {event.job_id} crashed: {event.exception}")
-    else:
-        logger.info(f"Job {event.job_id} executed successfully")
-
-
-def init_scheduler():
-    global _scheduler_started
-    if _scheduler_started:
-        return
-
-    scheduler = get_scheduler()
-
-    scheduler.add_job(
-        snapshot_daily_economy,
-        "cron",
-        hour=23, minute=50,
-        id="daily_economy_snapshot",
-        replace_existing=True,
-    )
-
-    scheduler.add_job(
-        lambda: tg_send(fmt_stats()),
-        "cron",
-        hour=21, minute=0,
-        id="daily_stats",
-        replace_existing=True,
-    )
-
-    scheduler.add_job(
-        lambda: tg_send(fmt_stats()),
-        "cron",
-        hour=1, minute=25,
-        id="night_stats",
-        replace_existing=True,
-    )
-
-    scheduler.add_job(
-        lambda: tg_send(fmt_top_landings()),
-        "cron",
-        day_of_week="sun", hour=12, minute=0,
-        id="weekly_landing_ranking",
-        replace_existing=True,
-    )
-
-    scheduler.add_job(
-        lambda: tg_send(fmt_top_pilots()),
-        "cron",
-        day_of_week="sun", hour=10, minute=0,
-        id="weekly_top_pilots",
-        replace_existing=True,
-    )
-
-    scheduler.add_job(
-        lambda: tg_send(
-            "🛫 <b>СОВМЕСТНАЯ СУББОТНЯЯ ОПЕРАЦИЯ!</b>\n\n"
-            "⏰ Москва: 09:00 ☀️  |  Камчатка: 18:00 🌙\n\n"
-            "✈️ Предлагайте маршрут в комментариях!\nКто присоединяется? 👇"
-        ),
-        "cron",
-        day_of_week="sat", hour=6, minute=0,
-        id="saturday_inv",
-        replace_existing=True,
-    )
-
-    scheduler.add_job(
-        lambda: tg_send(
-            "🏆 <b>ЕЖЕНЕДЕЛЬНЫЙ ВЫЗОВ ЭКИПАЖУ!</b>\n\n"
-            "🔹 Цель: 3 рейса за 7 дней\n"
-            "🔹 Бонус: лучшая посадка недели\n\nГотов принять вызов? 💪"
-        ),
-        "cron",
-        day_of_week="mon", hour=8, minute=0,
-        id="monday_challenge",
-        replace_existing=True,
-    )
-
-    scheduler.add_job(
-        lambda: tg_send(fmt_monthly_economy()),
-        "cron",
-        day=1, hour=9, minute=0,
-        id="monthly_digest",
-        replace_existing=True,
-    )
-
-    scheduler.add_listener(job_listener, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
-
-    scheduler.start()
-    _scheduler_started = True
-
-    logger.info("Планировщик задач запущен")
-    logger.info(f"Активные задачи: {[job.id for job in scheduler.get_jobs()]}")
-
-
-@app.before_request
-def ensure_scheduler():
-    init_scheduler()
-
 
 @app.route("/")
 def home():
@@ -1005,7 +942,7 @@ except Exception as e:
 logger.info(f"Сервис запущен на порту {PORT} — VA UP! готова к полётам")
 
 # ═══════════════════════════════════════════════════════════════
-# MAIN (для локального запуска, на Render не используется)
+# MAIN (для локального запуска)
 # ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
