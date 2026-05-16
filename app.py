@@ -914,6 +914,7 @@ def init_scheduler():
         timezone="UTC",
     )
 
+    # Ежедневные задачи
     scheduler.add_job(
         snapshot_daily_economy,
         "cron", hour=23, minute=50,
@@ -926,9 +927,17 @@ def init_scheduler():
     )
     scheduler.add_job(
         lambda: tg_send(fmt_stats()),
-        "cron", hour=11, minute=20,
+        "cron", hour=1, minute=25,
         id="night_stats",
     )
+    # Новая задача на 11:40 UTC
+    scheduler.add_job(
+        lambda: tg_send(fmt_stats()),
+        "cron", hour=11, minute=40,
+        id="day_stats_1140",
+    )
+
+    # Еженедельные задачи
     scheduler.add_job(
         lambda: tg_send(fmt_top_landings()),
         "cron", day_of_week="sun", hour=12, minute=0,
@@ -957,6 +966,8 @@ def init_scheduler():
         "cron", day_of_week="mon", hour=8, minute=0,
         id="monday_challenge",
     )
+
+    # Ежемесячные задачи
     scheduler.add_job(
         lambda: tg_send(fmt_monthly_economy()),
         "cron", day=1, hour=9, minute=0,
