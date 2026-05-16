@@ -969,15 +969,18 @@ def handle_tg_command(message: Dict):
     # В канале/чате обрабатываем только команды с явным упоминанием бота:
     # /runway@vaup_bot UHWW — сработает.
     # /runway UHWW или обычный текст — игнорируем, чтобы не мешать общению.
-    bot_username = BOT_TOKEN.split(":")[0]  # числовой ID, но лучше использовать имя
     if str(chat_id) == str(CHAT_ID):
-        # Команда адресована боту, если содержит "@" + часть имени бота,
-        # либо если чат — личка (не канал/группа, там chat_id != CHAT_ID).
-        # Простая проверка: ищем "@" в первом слове команды.
-        first_word = text.split()[0] if text.split() else ""
-        addressed_to_bot = "@" in first_word and first_word.startswith("/")
-        if not addressed_to_bot:
-            return  # тихо игнорируем — не засоряем лог обычным общением
+        # Если пользователь уже в режиме ожидания ICAO — пропускаем фильтр,
+        # чтобы он мог ответить боту прямо в канале.
+        with _awaiting_lock:
+            user_is_awaiting = str(chat_id) in _awaiting_icao
+        if not user_is_awaiting:
+            # В канале реагируем только на команды с явным упоминанием бота:
+            # /runway@up_va_bot — сработает, обычный текст — нет.
+            first_word = text.split()[0] if text.split() else ""
+            addressed_to_bot = "@" in first_word and first_word.startswith("/")
+            if not addressed_to_bot:
+                return  # тихо игнорируем
 
     logger.info(f"Command from chat={chat_id}: {text}")
 
