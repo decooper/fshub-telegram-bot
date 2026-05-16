@@ -933,7 +933,7 @@ def init_scheduler():
     # Новая задача на 11:40 UTC
     scheduler.add_job(
         lambda: tg_send(fmt_stats()),
-        "cron", hour=11, minute=40,
+        "cron", hour=08, minute=43,
         id="day_stats_1140",
     )
 
