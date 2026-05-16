@@ -461,6 +461,54 @@ def tg_edit_message(chat_id, message_id: int, text: str) -> None:
         logger.exception(f"editMessageText error: {e}")
 
 
+def tg_send_menu(chat_id) -> bool:
+    """Отправляет главное меню с inline-кнопками."""
+    try:
+        r = session.post(
+            f"{TG_BASE}/sendMessage",
+            json={
+                "chat_id": str(chat_id),
+                "text": "✈️ <b>VA UP! Operations Panel</b>\n\nВыберите раздел:",
+                "parse_mode": "HTML",
+                "reply_markup": {
+                    "inline_keyboard": [
+                        [
+                            {"text": "📊 Статистика",   "callback_data": "cmd_stats"},
+                            {"text": "✈️ Последние рейсы", "callback_data": "cmd_last"},
+                        ],
+                        [
+                            {"text": "🏆 Топ пилоты",   "callback_data": "cmd_top"},
+                            {"text": "🛬 Топ посадки",  "callback_data": "cmd_top_landing"},
+                        ],
+                        [
+                            {"text": "💰 Финансы",      "callback_data": "cmd_economy"},
+                            {"text": "📅 За месяц",     "callback_data": "cmd_monthly"},
+                        ],
+                        [
+                            {"text": "📡 Онлайн",       "callback_data": "cmd_live"},
+                            {"text": "🏢 О компании",   "callback_data": "cmd_va"},
+                        ],
+                        [
+                            {"text": "🛫 Полосы (Runway)", "callback_data": "cmd_runway"},
+                        ],
+                    ]
+                },
+            },
+            timeout=20,
+        )
+        if r.status_code != 200:
+            logger.warning(f"tg_send_menu failed: {r.text}")
+            return False
+        return True
+    except Exception as e:
+        logger.exception(f"tg_send_menu error: {e}")
+        return False
+
+
+# Маппинг callback_data команд меню → функции-форматтеры
+MENU_CALLBACKS: Dict[str, callable] = {}  # заполняется после определения форматтеров
+
+
 def handle_callback_query(cq: Dict) -> None:
     """Обрабатывает нажатие inline-кнопки."""
     cq_id      = cq.get("id", "")
@@ -475,6 +523,29 @@ def handle_callback_query(cq: Dict) -> None:
         if message_id:
             tg_edit_message(chat_id, message_id, "✅ Запрос полосы отменён.")
         logger.info(f"Runway dialog cancelled by chat={chat_id}")
+        return
+
+    if data == "cmd_runway":
+        tg_answer_callback(cq_id)
+        with _awaiting_lock:
+            _awaiting_icao[chat_id] = True
+        tg_send_with_cancel(
+            "✈️ Введите ICAO-код аэропорта:\n<i>Например: UHWW, UUEE, EGLL</i>",
+            chat_id,
+        )
+        return
+
+    if data in MENU_CALLBACKS:
+        tg_answer_callback(cq_id)
+        try:
+            result = MENU_CALLBACKS[data]()
+            tg_send(result, chat_id)
+        except Exception as e:
+            logger.exception(f"Menu callback {data} failed: {e}")
+            tg_send("⚠️ Ошибка при выполнении команды.", chat_id)
+        return
+
+    tg_answer_callback(cq_id)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -958,6 +1029,18 @@ HELP_TEXT = (
     "/va — VA information"
 )
 
+# Инициализируем маппинг после определения всех форматтеров
+MENU_CALLBACKS.update({
+    "cmd_stats":       fmt_stats,
+    "cmd_last":        fmt_last,
+    "cmd_top":         fmt_top_pilots,
+    "cmd_top_landing": fmt_top_landings,
+    "cmd_economy":     fmt_daily_economy,
+    "cmd_monthly":     fmt_monthly_economy,
+    "cmd_live":        fmt_active_flights,
+    "cmd_va":          fmt_va_info,
+})
+
 
 def handle_tg_command(message: Dict):
     chat_id = message.get("chat", {}).get("id")
@@ -984,12 +1067,8 @@ def handle_tg_command(message: Dict):
 
     logger.info(f"Command from chat={chat_id}: {text}")
 
-    if text.startswith("/start"):
-        tg_send("✈️ <b>VA UP! PostgreSQL Edition</b>\n\nUse /help for commands.", chat_id)
-        return
-
-    if text.startswith("/help"):
-        tg_send(HELP_TEXT, chat_id)
+    if text.startswith("/start") or text.startswith("/help") or text.startswith("/menu"):
+        tg_send_menu(chat_id)
         return
 
     # ─── Обработка /runway ──────────────────────────────────────
