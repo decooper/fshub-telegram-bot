@@ -404,6 +404,79 @@ def tg_setup_webhook():
         logger.exception(f"Webhook setup error: {e}")
 
 
+def tg_send_with_cancel(text: str, chat_id) -> bool:
+    """Отправляет сообщение с inline-кнопкой Отмена."""
+    try:
+        r = session.post(
+            f"{TG_BASE}/sendMessage",
+            json={
+                "chat_id": str(chat_id),
+                "text": text[:4096],
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+                "reply_markup": {
+                    "inline_keyboard": [[
+                        {"text": "❌ Отмена", "callback_data": "runway_cancel"}
+                    ]]
+                },
+            },
+            timeout=20,
+        )
+        if r.status_code != 200:
+            logger.warning(f"tg_send_with_cancel failed: {r.text}")
+            return False
+        return True
+    except Exception as e:
+        logger.exception(f"tg_send_with_cancel error: {e}")
+        return False
+
+
+def tg_answer_callback(callback_query_id: str, text: str = "") -> None:
+    """Закрывает «часики» на кнопке после нажатия."""
+    try:
+        session.post(
+            f"{TG_BASE}/answerCallbackQuery",
+            json={"callback_query_id": callback_query_id, "text": text},
+            timeout=10,
+        )
+    except Exception as e:
+        logger.exception(f"answerCallbackQuery error: {e}")
+
+
+def tg_edit_message(chat_id, message_id: int, text: str) -> None:
+    """Редактирует сообщение бота (убирает кнопку после отмены)."""
+    try:
+        session.post(
+            f"{TG_BASE}/editMessageText",
+            json={
+                "chat_id": str(chat_id),
+                "message_id": message_id,
+                "text": text[:4096],
+                "parse_mode": "HTML",
+                "reply_markup": {"inline_keyboard": []},
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        logger.exception(f"editMessageText error: {e}")
+
+
+def handle_callback_query(cq: Dict) -> None:
+    """Обрабатывает нажатие inline-кнопки."""
+    cq_id      = cq.get("id", "")
+    data       = cq.get("data", "")
+    chat_id    = str(cq.get("message", {}).get("chat", {}).get("id", ""))
+    message_id = cq.get("message", {}).get("message_id")
+
+    if data == "runway_cancel":
+        with _awaiting_lock:
+            _awaiting_icao.pop(chat_id, None)
+        tg_answer_callback(cq_id, "Отменено")
+        if message_id:
+            tg_edit_message(chat_id, message_id, "✅ Запрос полосы отменён.")
+        logger.info(f"Runway dialog cancelled by chat={chat_id}")
+
+
 # ═══════════════════════════════════════════════════════════════
 # FSA API
 # ═══════════════════════════════════════════════════════════════
@@ -716,6 +789,11 @@ def fmt_runway(icao: str) -> str:
 _processed_events = set()
 _processed_lock = threading.Lock()
 
+# Состояние диалога: chat_id -> "awaiting_icao"
+# Используется для /runway без аргумента — бот спрашивает ICAO и ждёт ответа
+_awaiting_icao: Dict[str, bool] = {}
+_awaiting_lock = threading.Lock()
+
 
 def is_duplicate_event(event_id: str, event_type: str) -> bool:
     key = f"{event_type}:{event_id}"
@@ -917,9 +995,11 @@ def handle_tg_command(message: Dict):
 
     if base_cmd == "/runway":
         if len(cmd_parts) < 2:
-            tg_send(
-                "❌ Укажите ICAO-код аэропорта.\n"
-                "Пример: <code>/runway UHWW</code>",
+            # Аргумент не передан — переходим в режим ожидания ICAO
+            with _awaiting_lock:
+                _awaiting_icao[str(chat_id)] = True
+            tg_send_with_cancel(
+                "✈️ Введите ICAO-код аэропорта:\n<i>Например: UHWW, UUEE, EGLL</i>",
                 chat_id,
             )
         else:
@@ -935,6 +1015,24 @@ def handle_tg_command(message: Dict):
                 tg_send(fmt_runway(icao_raw), chat_id)
         return
     # ─── Конец обработки /runway ────────────────────────────────
+
+    # ─── Обработка ответа на запрос ICAO ────────────────────────
+    with _awaiting_lock:
+        is_awaiting = _awaiting_icao.pop(str(chat_id), False)
+
+    if is_awaiting:
+        icao_raw = text.upper().strip()
+        if len(icao_raw) != 4 or not icao_raw.isalnum():
+            tg_send(
+                "❌ Некорректный ICAO-код. Должен содержать 4 символа (буквы и цифры).\n"
+                "Попробуйте снова: <code>/runway UHWW</code>",
+                chat_id,
+            )
+        else:
+            logger.info(f"Runway request (dialog): {icao_raw} from {chat_id}")
+            tg_send(fmt_runway(icao_raw), chat_id)
+        return
+    # ─── Конец обработки ответа ICAO ────────────────────────────
 
     cmd = text.split("@")[0]
 
@@ -1081,8 +1179,12 @@ def fshub_webhook():
 def tg_webhook():
     try:
         data = request.get_json(force=True) or {}
-        message = data.get("message") or data.get("channel_post") or {}
-        handle_tg_command(message)
+        # Inline-кнопки приходят как callback_query, не как message
+        if "callback_query" in data:
+            handle_callback_query(data["callback_query"])
+        else:
+            message = data.get("message") or data.get("channel_post") or {}
+            handle_tg_command(message)
     except Exception as e:
         logger.exception(f"Telegram webhook failure: {e}")
     return jsonify({"ok": True})
