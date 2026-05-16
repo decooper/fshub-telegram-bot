@@ -926,7 +926,7 @@ def init_scheduler():
     )
     scheduler.add_job(
         lambda: tg_send(fmt_stats()),
-        "cron", hour=1, minute=25,
+        "cron", hour=11, minute=20,
         id="night_stats",
     )
     scheduler.add_job(
