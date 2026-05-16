@@ -857,6 +857,22 @@ def handle_tg_command(message: Dict) -> None:
 
     if not chat_id or not text:
         return
+
+    # В канале реагируем только на команды с явным упоминанием бота
+    # Обычный текст и команды без @up_va_bot — игнорируем
+    first_word = text.split()[0] if text.split() else ""
+    is_command = first_word.startswith("/")
+    has_mention = "@" in first_word
+
+    if is_command and not has_mention:
+        # Команда без упоминания в канале — игнорируем
+        return
+
+    if not is_command:
+        # Обычный текст — проверяем, не в канале ли это
+        # Если chat_id отрицательный (группа/канал) — игнорируем
+        if str(chat_id).startswith("-"):
+            return
    
     logger.info(f"Команда от {chat_id}: {text}")
     cmd = text.split("@")[0]
