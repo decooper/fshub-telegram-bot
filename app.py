@@ -430,7 +430,7 @@ def _fetch_profit_and_notify(flight_id: str, pilot: str, flight_no: str) -> None
                         f"👨‍✈️ {pilot}\n"
                         f"🆔 {flight_no}\n"
                         f"💰 Прибыль: <b>{p:+,.0f} v$</b>\n"
-                        f"🔗 <a href='https://fshub.io/flight/{flight_id}/report'>Отчёт о рейсе</a>"
+                        f"🔗 <a href='https://fshub.io/flight/{flight_id}'>Отчёт о рейсе</a>"
                     )
                     try:
                         db_execute(
@@ -762,7 +762,7 @@ def handle_arrival(data: Dict) -> None:
         f"✈️ Aircraft: <b>{aircraft.get('icao_name', 'Unknown')}</b>\n"
         f"📊 Landing Rate: <b>{rate} fpm</b>\n"
         f"🎯 Оценка: <b>{rating}</b>\n"
-        f"🔗 <a href='https://fshub.io/flight/{flight_id}/report'>Отчёт о рейсе</a>"
+        f"🔗 <a href='https://fshub.io/flight/{flight_id}'>Отчёт о рейсе</a>"
     )
 
     if rate < -600:
