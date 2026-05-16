@@ -118,7 +118,7 @@ def _create_pool() -> None:
             dsn=DATABASE_URL,
             cursor_factory=psycopg2.extras.RealDictCursor,
             keepalives=1,
-            keepalives_idle=10,
+            keepalives_idle=10,     # уменьшено с 30 до 10 сек
             keepalives_interval=5,
             keepalives_count=5,
         )
@@ -388,6 +388,7 @@ def fsa_call(function: str, extra: Optional[Dict] = None):
 
 
 def fsa_daily_transactions() -> List[Dict]:
+    """getDailyTransactions — только va_id, API сам отдаёт только сегодня."""
     data = fsa_call("getDailyTransactions")
     if not isinstance(data, list):
         return []
@@ -413,6 +414,8 @@ def _fetch_profit_and_notify(flight_id: str, pilot: str, flight_no: str) -> None
     FSAirlines обрабатывает PIREP 5-15 минут — поэтому delays увеличены.
     Прибыль отправляется отдельным сообщением когда данные появятся.
     """
+    # ИСПРАВЛЕНО: было [5, 10, 20] сек — FSAirlines не успевал обработать.
+    # Теперь ждём 2 мин, затем 5 мин, затем 10 мин.
     delays = [120, 300, 600]
     for i, delay in enumerate(delays):
         time.sleep(delay)
@@ -426,7 +429,8 @@ def _fetch_profit_and_notify(flight_id: str, pilot: str, flight_no: str) -> None
                         f"💎 <b>ФИНАНСОВЫЙ ОТЧЁТ</b>\n\n"
                         f"👨‍✈️ {pilot}\n"
                         f"🆔 {flight_no}\n"
-                        f"💰 Прибыль: <b>{p:+,.0f} v$</b>"
+                        f"💰 Прибыль: <b>{p:+,.0f} v$</b>\n"
+                        f"🔗 <a href='https://fshub.io/flight/{flight_id}/report'>Отчёт о рейсе</a>"
                     )
                     try:
                         db_execute(
@@ -679,10 +683,12 @@ def handle_departure(data: Dict) -> None:
     flight_id = str(d.get("id", ""))
     pilot     = user.get("name", "Unknown")
 
+    # ИСПРАВЛЕНО: если план не загружен — используем FREE-ID вместо N/A
     flight_no = plan.get("flight_no") or f"FREE-{flight_id}"
     dep       = plan.get("departure") or "????"
     arr       = plan.get("arrival")   or "????"
 
+    # Защита 1: по flight_id (FSHub retry)
     if flight_id:
         with departures_lock:
             if flight_id in processed_departures:
@@ -690,6 +696,7 @@ def handle_departure(data: Dict) -> None:
                 return
             processed_departures.append(flight_id)
 
+    # Защита 2: по пилот+маршрут в 10-минутном окне (двойной старт)
     dedup_key = f"{pilot}:{dep}:{arr}"
     now = datetime.utcnow()
     with departures_lock:
@@ -713,6 +720,7 @@ def handle_arrival(data: Dict) -> None:
     d         = data.get("_data", {}) or {}
     flight_id = str(d.get("id", ""))
 
+    # Дедупликация arrivals
     if flight_id:
         with processed_lock:
             if flight_id in processed_flight_ids:
@@ -727,6 +735,7 @@ def handle_arrival(data: Dict) -> None:
     rate      = int(d.get("landing_rate", 0))
     pilot     = user.get("name", "Unknown")
 
+    # ИСПРАВЛЕНО: если план не загружен — arrival берём из airport.icao
     flight_no = plan.get("flight_no") or f"FREE-{flight_id}"
     departure = plan.get("departure") or "????"
     arrival   = plan.get("arrival")   or airport.get("icao") or "????"
@@ -752,7 +761,8 @@ def handle_arrival(data: Dict) -> None:
         f"📍 Airport: <b>{airport.get('name', arrival)}</b>\n"
         f"✈️ Aircraft: <b>{aircraft.get('icao_name', 'Unknown')}</b>\n"
         f"📊 Landing Rate: <b>{rate} fpm</b>\n"
-        f"🎯 Оценка: <b>{rating}</b>"
+        f"🎯 Оценка: <b>{rating}</b>\n"
+        f"🔗 <a href='https://fshub.io/flight/{flight_id}/report'>Отчёт о рейсе</a>"
     )
 
     if rate < -600:
@@ -763,6 +773,7 @@ def handle_arrival(data: Dict) -> None:
             f"✈️ Рекомендуется инспекция ВС."
         )
 
+    # Прибыль запрашиваем в фоне — не блокируем Flask
     if FSA_KEY and flight_id and flight_id.isdigit():
         threading.Thread(
             target=_fetch_profit_and_notify,
@@ -846,18 +857,9 @@ def handle_tg_command(message: Dict) -> None:
 
     if not chat_id or not text:
         return
-
-    # В канале/группе реагируем только на команды с явным упоминанием бота
-    first_word = text.split()[0] if text.split() else ""
-    is_command = first_word.startswith("/")
-    has_mention = "@" in first_word
-    is_channel = str(chat_id).startswith("-")
-
-    if is_channel:
-        if not is_command:
-            return  # обычный текст в канале — игнорируем
-        if not has_mention:
-            return  # команда без @up_va_bot в канале — игнорируем
+    if str(chat_id) == str(CHAT_ID):
+        logger.info(f"Сообщение из канала проигнорировано: {text[:50]}")
+        return
 
     logger.info(f"Команда от {chat_id}: {text}")
     cmd = text.split("@")[0]
@@ -946,47 +948,54 @@ scheduler = BackgroundScheduler(
     timezone="UTC",
 )
 
+# Keepalive БД каждые 5 минут — предотвращает разрыв соединения
 scheduler.add_job(
     lambda: db_execute("SELECT 1", fetch="one"),
     "interval", minutes=5, id="db_keepalive",
     replace_existing=True,
 )
 
+# Снимок экономики в 23:50 UTC
 scheduler.add_job(
     snapshot_daily_economy, "cron",
     hour=23, minute=50, id="daily_economy_snapshot",
     replace_existing=True, misfire_grace_time=300,
 )
 
+# Ежедневная сводка в 00:30 UTC
 scheduler.add_job(
     lambda: tg_send(fmt_stats()), "cron",
     hour=0, minute=30, id="daily_stats",
     replace_existing=True, misfire_grace_time=300,
 )
 
+# Топ посадок — воскресенье 12:00 UTC
 scheduler.add_job(
     lambda: tg_send(fmt_top_landings()), "cron",
     day_of_week="sun", hour=12, minute=0, id="weekly_landing_ranking",
     replace_existing=True, misfire_grace_time=300,
 )
 
+# Топ пилотов — воскресенье 10:00 UTC
 scheduler.add_job(
     lambda: tg_send(fmt_top_pilots()), "cron",
     day_of_week="sun", hour=10, minute=0, id="weekly_top_pilots",
     replace_existing=True, misfire_grace_time=300,
 )
 
+# Приглашение на субботний рейс — суббота 06:00 UTC
 scheduler.add_job(
     lambda: tg_send(
-        "🛫 <b>СУББОТНИЙ СОВМЕСТНЫЙ ПОЛЕТ!</b>\n\n"
+        "🛫 <b>СУББОТНИЙ СОВМЕСТНЫЙ ВЫЛЕТ!</b>\n\n"
         "⏰ Москва: 09:00 ☀️  |  Камчатка: 18:00 🌙\n\n"
         "✈️ Предлагайте маршруты в комментариях!\n"
-        "Кто готов в полёт ? 👇"
+        "Кто в экипаже? 👇"
     ),
     "cron", day_of_week="sat", hour=6, minute=0, id="saturday_inv",
     replace_existing=True, misfire_grace_time=300,
 )
 
+# Еженедельный вызов — понедельник 08:00 UTC
 scheduler.add_job(
     lambda: tg_send(
         "🏆 <b>ЕЖЕНЕДЕЛЬНЫЙ ВЫЗОВ!</b>\n\n"
@@ -998,6 +1007,7 @@ scheduler.add_job(
     replace_existing=True, misfire_grace_time=300,
 )
 
+# Ежемесячный дайджест — 1-е число 09:00 UTC
 scheduler.add_job(
     lambda: tg_send(fmt_monthly_economy()), "cron",
     day=1, hour=9, minute=0, id="monthly_digest",
