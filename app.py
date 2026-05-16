@@ -857,10 +857,7 @@ def handle_tg_command(message: Dict) -> None:
 
     if not chat_id or not text:
         return
-    if str(chat_id) == str(CHAT_ID):
-        logger.info(f"Сообщение из канала проигнорировано: {text[:50]}")
-        return
-
+   
     logger.info(f"Команда от {chat_id}: {text}")
     cmd = text.split("@")[0]
 
