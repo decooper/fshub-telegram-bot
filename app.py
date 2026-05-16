@@ -878,35 +878,33 @@ def is_duplicate_event(event_id: str, event_type: str) -> bool:
 
 
 def handle_departure(data: Dict):
-    d = data.get("_data", {})
+    d = data.get("_data") or {}
     flight_id = str(d.get("id", ""))
 
     if flight_id and is_duplicate_event(flight_id, "departure"):
         logger.info(f"Пропуск дублирующего departure для рейса {flight_id}")
         return
 
-    user = d.get("user", {})
-    plan = d.get("plan", {})
-    aircraft = d.get("aircraft", {})
+    user     = d.get("user") or {}
+    plan     = d.get("plan") or {}
+    aircraft = d.get("aircraft") or {}
     tg_send(
         f"🛫 <b>ВЫЛЕТ ПОДТВЕРЖДЁН — CLEARED FOR TAKEOFF</b>\n\n"
         f"👨‍✈️ Captain: <b>{user.get('name', 'Unknown')}</b>\n"
         f"🆔 Flight: <b>{plan.get('flight_no', 'N/A')}</b>\n"
-        f"🗺 Route: <b>{plan.get('departure')} → {plan.get('arrival')}</b>\n"
+        f"🗺 Route: <b>{plan.get('departure', '????')} → {plan.get('arrival', '????')}</b>\n"
         f"✈️ Aircraft: <b>{aircraft.get('icao_name', 'N/A')}</b>\n\n"
         f"✈️ <i>Желаем попутного ветра и мягкой посадки!</i>"
     )
 
 
 def handle_arrival(data: Dict):
-    d = data.get("_data", {})
+    d = data.get("_data") or {}
     flight_id = str(d.get("id", ""))
 
-    # DEBUG: логируем все ключи payload для поиска правильного ID отчёта
-    logger.info(f"[DEBUG] flight.arrived payload keys (top): {list(data.keys())}")
-    logger.info(f"[DEBUG] flight.arrived _data keys: {list(d.keys())}")
-    logger.info(f"[DEBUG] flight.arrived _data.id={d.get('id')} | _data.report_id={d.get('report_id')} | _data.pirep_id={d.get('pirep_id')}")
-    # Логируем весь _data целиком (будет видно в Render Logs)
+    # DEBUG: логируем полный payload для поиска правильного ID отчёта
+    logger.info(f"[DEBUG] _data keys: {list(d.keys())}")
+    logger.info(f"[DEBUG] id={d.get('id')} | report_id={d.get('report_id')} | pirep_id={d.get('pirep_id')}")
     try:
         logger.info(f"[DEBUG] full _data: {json.dumps(dict(d), default=str)}")
     except Exception:
@@ -916,10 +914,10 @@ def handle_arrival(data: Dict):
         logger.info(f"Пропуск дублирующего arrival для рейса {flight_id}")
         return
 
-    user = d.get("user", {})
-    plan = d.get("plan", {})
-    aircraft = d.get("aircraft", {})
-    airport = d.get("airport", {})
+    user     = d.get("user") or {}
+    plan     = d.get("plan") or {}
+    aircraft = d.get("aircraft") or {}
+    airport  = d.get("airport") or {}
 
     rate = int(d.get("landing_rate", 0))
     rating, emoji = landing_rating(rate)
@@ -935,8 +933,10 @@ def handle_arrival(data: Dict):
         profit=None,
     )
 
+    # Используем flight_id для ссылки; после получения DEBUG-данных
+    # заменим на правильный report_id
     flight_link = (
-        f"\n🔗 <a href='https://fshub.io/flight/{flight_id}'>Открыть отчёт о рейсе</a>"
+        f"\n🔗 <a href='https://fshub.io/flight/{flight_id}/report'>Открыть отчёт о рейсе</a>"
         if flight_id else ""
     )
 
@@ -944,7 +944,7 @@ def handle_arrival(data: Dict):
         f"🛬 <b>ПОСАДКА ВЫПОЛНЕНА — TOUCHDOWN</b> {emoji}\n\n"
         f"👨‍✈️ Captain: <b>{user.get('name', 'Unknown')}</b>\n"
         f"🆔 Flight: <b>{plan.get('flight_no', 'N/A')}</b>\n"
-        f"🗺 Route: <b>{plan.get('departure')} → {plan.get('arrival')}</b>\n"
+        f"🗺 Route: <b>{plan.get('departure', '????')} → {plan.get('arrival', '????')}</b>\n"
         f"📍 Airport: <b>{airport.get('name', 'Unknown')}</b>\n"
         f"✈️ Aircraft: <b>{aircraft.get('icao_name', 'Unknown')}</b>\n"
         f"📊 Landing Rate: <b>{rate} fpm</b> — {rating}"
