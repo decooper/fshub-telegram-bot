@@ -7,15 +7,18 @@ import threading
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse, urlencode, urlunparse, parse_qs
 
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
 import requests
 from flask import Flask, request, jsonify
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.executors.pool import ThreadPoolExecutor
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from urllib.parse import urlparse, urlencode, urlunparse, parse_qs
 
 # ═══════════════════════════════════════════════════════════════
 # CONFIG
@@ -82,14 +85,19 @@ session.mount("https://", adapter)
 session.mount("http://", adapter)
 
 # ═══════════════════════════════════════════════════════════════
-# DATABASE — PostgreSQL connection pool with keepalives
+# DATABASE — PostgreSQL connection pool (с keepalives для Neon.tech)
 # ═══════════════════════════════════════════════════════════════
 
 _pool: Optional[psycopg2.pool.ThreadedConnectionPool] = None
+_pool_lock = threading.Lock()
 
 
 def _build_dsn(base_url: str) -> str:
-    """Добавляет keepalive-параметры к DATABASE_URL для Neon.tech."""
+    """
+    Добавляет keepalive-параметры к DATABASE_URL.
+    Neon.tech закрывает idle-соединения через ~5 минут —
+    TCP keepalives не дают соединению «протухнуть».
+    """
     parsed = urlparse(base_url)
     params = {
         "sslmode": "require",
@@ -103,8 +111,7 @@ def _build_dsn(base_url: str) -> str:
     existing.update({k: [v] for k, v in params.items()})
     flat = {k: v[0] for k, v in existing.items()}
     new_query = urlencode(flat)
-    new_parsed = parsed._replace(query=new_query)
-    return urlunparse(new_parsed)
+    return urlunparse(parsed._replace(query=new_query))
 
 
 def _create_pool():
@@ -112,14 +119,15 @@ def _create_pool():
     dsn = _build_dsn(DATABASE_URL)
     _pool = psycopg2.pool.ThreadedConnectionPool(
         minconn=1,
-        maxconn=3,
+        maxconn=5,
         dsn=dsn,
         cursor_factory=psycopg2.extras.RealDictCursor,
     )
-    logger.info("PostgreSQL connection pool created (with keepalives)")
+    logger.info("PostgreSQL connection pool created (keepalives enabled)")
 
 
-def _test_connection(conn) -> bool:
+def _test_conn(conn) -> bool:
+    """Проверяет, живо ли соединение."""
     try:
         conn.cursor().execute("SELECT 1")
         return True
@@ -128,31 +136,31 @@ def _test_connection(conn) -> bool:
 
 
 def get_conn():
+    """Берёт соединение из пула; при мёртвом соединении пересоздаёт пул."""
     global _pool
     for attempt in range(3):
         try:
-            if _pool is None:
-                _create_pool()
+            with _pool_lock:
+                if _pool is None:
+                    _create_pool()
             conn = _pool.getconn()
-            if not _test_connection(conn):
-                logger.warning(f"Dead connection detected (attempt {attempt + 1}), recreating pool")
+            if not _test_conn(conn):
+                logger.warning(f"Dead connection (attempt {attempt + 1}), recreating pool")
                 try:
                     _pool.putconn(conn, close=True)
                 except Exception:
                     pass
-                _pool = None
+                with _pool_lock:
+                    _pool = None
                 continue
             return conn
         except psycopg2.OperationalError as e:
-            logger.warning(f"OperationalError (attempt {attempt + 1}): {e}")
-            _pool = None
+            logger.warning(f"OperationalError getting conn (attempt {attempt + 1}): {e}")
+            with _pool_lock:
+                _pool = None
             if attempt == 2:
                 raise
-        except Exception as e:
-            logger.error(f"Unexpected pool error: {e}")
-            _pool = None
-            if attempt == 2:
-                raise
+    raise RuntimeError("Could not get a database connection after 3 attempts")
 
 
 def put_conn(conn):
@@ -165,6 +173,7 @@ def put_conn(conn):
 
 
 def db_execute(query: str, params=None, fetch: str = "none"):
+    """Выполняет запрос с автоматическим retry при потере соединения."""
     for attempt in range(2):
         conn = get_conn()
         try:
@@ -180,8 +189,8 @@ def db_execute(query: str, params=None, fetch: str = "none"):
             conn.rollback()
             logger.warning(f"OperationalError in db_execute (attempt {attempt + 1}): {e}")
             put_conn(conn)
-            global _pool
-            _pool = None
+            with _pool_lock:
+                _pool = None
             if attempt == 1:
                 logger.error(f"Database error after retry: {e}")
                 raise
@@ -452,7 +461,7 @@ def fsa_airline_data() -> Optional[Dict]:
 
 
 def get_flight_profit(report_id: int) -> Optional[int]:
-    # Временно отключено — ID не совпадают
+    # TODO: найти маппинг flight_id (FSHub) → report_id (FSAirlines)
     return None
 
 
@@ -880,6 +889,91 @@ def handle_tg_command(message: Dict):
 app = Flask(__name__)
 
 
+def job_listener(event):
+    if event.exception:
+        logger.error(f"Job {event.job_id} crashed: {event.exception}")
+    else:
+        logger.info(f"Job {event.job_id} executed successfully")
+
+
+def init_scheduler():
+    """
+    Инициализирует и запускает планировщик.
+    Вызывается ОДИН РАЗ при старте приложения — НЕ из before_request.
+    Gunicorn запускается с --workers 1 --preload, поэтому планировщик
+    живёт в единственном процессе и не дублируется.
+    """
+    scheduler = BackgroundScheduler(
+        daemon=True,
+        executors={"default": ThreadPoolExecutor(max_workers=2)},
+        job_defaults={
+            "coalesce": True,
+            "max_instances": 1,
+            "misfire_grace_time": 3600,
+        },
+        timezone="UTC",
+    )
+
+    scheduler.add_job(
+        snapshot_daily_economy,
+        "cron", hour=23, minute=50,
+        id="daily_economy_snapshot",
+    )
+    scheduler.add_job(
+        lambda: tg_send(fmt_stats()),
+        "cron", hour=21, minute=0,
+        id="daily_stats",
+    )
+    scheduler.add_job(
+        lambda: tg_send(fmt_stats()),
+        "cron", hour=1, minute=25,
+        id="night_stats",
+    )
+    scheduler.add_job(
+        lambda: tg_send(fmt_top_landings()),
+        "cron", day_of_week="sun", hour=12, minute=0,
+        id="weekly_landing_ranking",
+    )
+    scheduler.add_job(
+        lambda: tg_send(fmt_top_pilots()),
+        "cron", day_of_week="sun", hour=10, minute=0,
+        id="weekly_top_pilots",
+    )
+    scheduler.add_job(
+        lambda: tg_send(
+            "🛫 <b>СОВМЕСТНАЯ СУББОТНЯЯ ОПЕРАЦИЯ!</b>\n\n"
+            "⏰ Москва: 09:00 ☀️  |  Камчатка: 18:00 🌙\n\n"
+            "✈️ Предлагайте маршрут в комментариях!\nКто присоединяется? 👇"
+        ),
+        "cron", day_of_week="sat", hour=6, minute=0,
+        id="saturday_inv",
+    )
+    scheduler.add_job(
+        lambda: tg_send(
+            "🏆 <b>ЕЖЕНЕДЕЛЬНЫЙ ВЫЗОВ ЭКИПАЖУ!</b>\n\n"
+            "🔹 Цель: 3 рейса за 7 дней\n"
+            "🔹 Бонус: лучшая посадка недели\n\nГотов принять вызов? 💪"
+        ),
+        "cron", day_of_week="mon", hour=8, minute=0,
+        id="monday_challenge",
+    )
+    scheduler.add_job(
+        lambda: tg_send(fmt_monthly_economy()),
+        "cron", day=1, hour=9, minute=0,
+        id="monthly_digest",
+    )
+
+    scheduler.add_listener(job_listener, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
+    scheduler.start()
+
+    jobs = scheduler.get_jobs()
+    logger.info(f"Планировщик запущен. Активных задач: {len(jobs)}")
+    for job in jobs:
+        logger.info(f"  • {job.id} → следующий запуск: {job.next_run_time}")
+
+    return scheduler
+
+
 @app.route("/")
 def home():
     return jsonify({
@@ -928,13 +1022,15 @@ def tg_webhook():
 
 
 # ═══════════════════════════════════════════════════════════════
-# STARTUP
+# STARTUP — выполняется один раз при загрузке модуля
+# (с --preload Gunicorn загружает модуль до форка воркеров)
 # ═══════════════════════════════════════════════════════════════
 
 try:
     _create_pool()
     _init_db()
     tg_setup_webhook()
+    init_scheduler()   # ← планировщик стартует здесь, один раз
 except Exception as e:
     logger.exception(f"Startup failed: {e}")
     sys.exit(1)
