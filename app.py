@@ -888,11 +888,20 @@ def handle_tg_command(message: Dict):
     if not chat_id or not text:
         return
 
+    # В канале/чате обрабатываем только команды с явным упоминанием бота:
+    # /runway@vaup_bot UHWW — сработает.
+    # /runway UHWW или обычный текст — игнорируем, чтобы не мешать общению.
+    bot_username = BOT_TOKEN.split(":")[0]  # числовой ID, но лучше использовать имя
     if str(chat_id) == str(CHAT_ID):
-        logger.info(f"Ignoring message from channel: {text[:50]}")
-        return
+        # Команда адресована боту, если содержит "@" + часть имени бота,
+        # либо если чат — личка (не канал/группа, там chat_id != CHAT_ID).
+        # Простая проверка: ищем "@" в первом слове команды.
+        first_word = text.split()[0] if text.split() else ""
+        addressed_to_bot = "@" in first_word and first_word.startswith("/")
+        if not addressed_to_bot:
+            return  # тихо игнорируем — не засоряем лог обычным общением
 
-    logger.info(f"Command from {chat_id}: {text}")
+    logger.info(f"Command from chat={chat_id}: {text}")
 
     if text.startswith("/start"):
         tg_send("✈️ <b>VA UP! PostgreSQL Edition</b>\n\nUse /help for commands.", chat_id)
