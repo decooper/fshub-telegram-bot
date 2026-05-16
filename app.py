@@ -188,7 +188,12 @@ def db_execute(query: str, params=None, fetch: str = "none"):
         except psycopg2.OperationalError as e:
             conn.rollback()
             logger.warning(f"OperationalError in db_execute (attempt {attempt + 1}): {e}")
-            put_conn(conn)
+            # При OperationalError закрываем соединение и пересоздаём пул.
+            # put_conn НЕ вызываем — соединение уже мертво.
+            try:
+                conn.close()
+            except Exception:
+                pass
             with _pool_lock:
                 _pool = None
             if attempt == 1:
@@ -197,12 +202,11 @@ def db_execute(query: str, params=None, fetch: str = "none"):
         except Exception as e:
             conn.rollback()
             logger.error(f"Database error: {e}")
+            put_conn(conn)
             raise
-        finally:
-            try:
-                put_conn(conn)
-            except Exception:
-                pass
+        else:
+            # Успех — возвращаем соединение в пул
+            put_conn(conn)
 
 
 def _init_db():
@@ -899,7 +903,7 @@ def job_listener(event):
 def init_scheduler():
     """
     Инициализирует и запускает планировщик.
-    Вызывается ОДИН РАЗ при старте приложения — НЕ из before_request.
+    Вызывается ОДИН РАЗ в блоке STARTUP при загрузке модуля.
     Gunicorn запускается с --workers 1 --preload, поэтому планировщик
     живёт в единственном процессе и не дублируется.
     """
@@ -914,7 +918,7 @@ def init_scheduler():
         timezone="UTC",
     )
 
-    # Ежедневные задачи
+    # ─── Ежедневные задачи ──────────────────────────────────────
     scheduler.add_job(
         snapshot_daily_economy,
         "cron", hour=23, minute=50,
@@ -925,19 +929,8 @@ def init_scheduler():
         "cron", hour=21, minute=0,
         id="daily_stats",
     )
-    scheduler.add_job(
-        lambda: tg_send(fmt_stats()),
-        "cron", hour=1, minute=25,
-        id="night_stats",
-    )
-    # Новая задача на 11:40 UTC
-    scheduler.add_job(
-        lambda: tg_send(fmt_stats()),
-        "cron", hour=8, minute=48,
-        id="day_stats_1140",
-    )
 
-    # Еженедельные задачи
+    # ─── Еженедельные задачи ────────────────────────────────────
     scheduler.add_job(
         lambda: tg_send(fmt_top_landings()),
         "cron", day_of_week="sun", hour=12, minute=0,
@@ -967,7 +960,7 @@ def init_scheduler():
         id="monday_challenge",
     )
 
-    # Ежемесячные задачи
+    # ─── Ежемесячные задачи ─────────────────────────────────────
     scheduler.add_job(
         lambda: tg_send(fmt_monthly_economy()),
         "cron", day=1, hour=9, minute=0,
@@ -1033,15 +1026,19 @@ def tg_webhook():
 
 
 # ═══════════════════════════════════════════════════════════════
-# STARTUP — выполняется один раз при загрузке модуля
-# (с --preload Gunicorn загружает модуль до форка воркеров)
+# STARTUP — выполняется один раз при загрузке модуля.
+# Gunicorn с флагом --preload загружает модуль ДО форка воркеров,
+# поэтому планировщик стартует ровно один раз.
+#
+# Start Command на Render:
+#   gunicorn app:app --workers 1 --threads 4 --timeout 120 --preload
 # ═══════════════════════════════════════════════════════════════
 
 try:
     _create_pool()
     _init_db()
     tg_setup_webhook()
-    init_scheduler()   # ← планировщик стартует здесь, один раз
+    init_scheduler()
 except Exception as e:
     logger.exception(f"Startup failed: {e}")
     sys.exit(1)
