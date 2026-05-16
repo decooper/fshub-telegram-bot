@@ -693,6 +693,22 @@ def fmt_va_info() -> str:
     )
 
 
+def fmt_runway(icao: str) -> str:
+    """Возвращает сообщение со ссылкой на RunwayApp для указанного ICAO."""
+    icao = icao.upper()
+    url = f"https://runway.airportdb.io/airport/{icao.lower()}"
+    return (
+        f"🛫 <b>РЕКОМЕНДАЦИИ ПО ПОЛОСАМ — {icao}</b>\n\n"
+        f"🔗 <a href='{url}'>Открыть на RunwayApp</a>\n\n"
+        f"💡 <b>Как читать результат:</b>\n"
+        f"• 🟢 Зелёные стрелки — встречный ветер (лучший выбор)\n"
+        f"• 🟡 Жёлтые стрелки — боковой ветер\n"
+        f"• 🔴 Красные — попутный ветер (не рекомендуется)\n"
+        f"• Первая полоса в списке = оптимальный вариант\n\n"
+        f"📡 <i>Данные обновляются по текущему METAR</i>"
+    )
+
+
 # ═══════════════════════════════════════════════════════════════
 # FSHUB EVENT HANDLERS
 # ═══════════════════════════════════════════════════════════════
@@ -736,6 +752,16 @@ def handle_departure(data: Dict):
 def handle_arrival(data: Dict):
     d = data.get("_data", {})
     flight_id = str(d.get("id", ""))
+
+    # DEBUG: логируем все ключи payload для поиска правильного ID отчёта
+    logger.info(f"[DEBUG] flight.arrived payload keys (top): {list(data.keys())}")
+    logger.info(f"[DEBUG] flight.arrived _data keys: {list(d.keys())}")
+    logger.info(f"[DEBUG] flight.arrived _data.id={d.get('id')} | _data.report_id={d.get('report_id')} | _data.pirep_id={d.get('pirep_id')}")
+    # Логируем весь _data целиком (будет видно в Render Logs)
+    try:
+        logger.info(f"[DEBUG] full _data: {json.dumps(dict(d), default=str)}")
+    except Exception:
+        logger.info(f"[DEBUG] full _data (raw): {d}")
 
     if flight_id and is_duplicate_event(flight_id, "arrival"):
         logger.info(f"Пропуск дублирующего arrival для рейса {flight_id}")
@@ -844,6 +870,9 @@ HELP_TEXT = (
     "/last — latest flights\n"
     "/top — top pilots (7 days)\n"
     "/top_landing — best landings\n\n"
+    "🛫 <b>Pre-flight Tools:</b>\n"
+    "/runway ICAO — runway recommendations\n"
+    "   Example: /runway UHWW\n\n"
     "💰 <b>Financial Operations:</b>\n"
     "/economy — daily financial report\n"
     "/monthly — monthly financial digest\n"
@@ -872,6 +901,31 @@ def handle_tg_command(message: Dict):
     if text.startswith("/help"):
         tg_send(HELP_TEXT, chat_id)
         return
+
+    # ─── Обработка /runway ──────────────────────────────────────
+    cmd_parts = text.split()
+    base_cmd = cmd_parts[0].split("@")[0]
+
+    if base_cmd == "/runway":
+        if len(cmd_parts) < 2:
+            tg_send(
+                "❌ Укажите ICAO-код аэропорта.\n"
+                "Пример: <code>/runway UHWW</code>",
+                chat_id,
+            )
+        else:
+            icao_raw = cmd_parts[1].upper()
+            if len(icao_raw) != 4 or not icao_raw.isalnum():
+                tg_send(
+                    "❌ Некорректный ICAO-код. Должен содержать 4 символа (буквы и цифры).\n"
+                    "Пример: <code>/runway UHWW</code>",
+                    chat_id,
+                )
+            else:
+                logger.info(f"Runway request: {icao_raw} from {chat_id}")
+                tg_send(fmt_runway(icao_raw), chat_id)
+        return
+    # ─── Конец обработки /runway ────────────────────────────────
 
     cmd = text.split("@")[0]
 
