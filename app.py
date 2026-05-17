@@ -119,11 +119,11 @@ def _create_pool():
     dsn = _build_dsn(DATABASE_URL)
     _pool = psycopg2.pool.ThreadedConnectionPool(
         minconn=1,
-        maxconn=5,
+        maxconn=10,
         dsn=dsn,
         cursor_factory=psycopg2.extras.RealDictCursor,
     )
-    logger.info("PostgreSQL connection pool created (keepalives enabled)")
+    logger.info("PostgreSQL connection pool created (keepalives enabled, maxconn=10)")
 
 
 def _test_conn(conn) -> bool:
@@ -173,10 +173,15 @@ def put_conn(conn):
 
 
 def db_execute(query: str, params=None, fetch: str = "none"):
-    """Выполняет запрос с автоматическим retry при потере соединения."""
+    """
+    Выполняет запрос с гарантированным возвратом соединения в пул.
+    При OperationalError делает одну повторную попытку с новым соединением.
+    """
+    last_error = None
     for attempt in range(2):
-        conn = get_conn()
+        conn = None
         try:
+            conn = get_conn()
             with conn.cursor() as cur:
                 cur.execute(query, params or ())
                 conn.commit()
@@ -186,27 +191,38 @@ def db_execute(query: str, params=None, fetch: str = "none"):
                     return cur.fetchall()
                 return None
         except psycopg2.OperationalError as e:
-            conn.rollback()
+            last_error = e
             logger.warning(f"OperationalError in db_execute (attempt {attempt + 1}): {e}")
-            # При OperationalError закрываем соединение и пересоздаём пул.
-            # put_conn НЕ вызываем — соединение уже мертво.
-            try:
-                conn.close()
-            except Exception:
-                pass
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = None
             with _pool_lock:
-                _pool = None
-            if attempt == 1:
-                logger.error(f"Database error after retry: {e}")
-                raise
+                _pool = None  # пересоздадим пул на следующей попытке
         except Exception as e:
-            conn.rollback()
+            last_error = e
             logger.error(f"Database error: {e}")
-            put_conn(conn)
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                put_conn(conn)
+                conn = None
             raise
-        else:
-            # Успех — возвращаем соединение в пул
-            put_conn(conn)
+        finally:
+            # Если соединение не было явно закрыто или возвращено — вернуть в пул
+            if conn is not None:
+                put_conn(conn)
+
+    logger.error(f"Database error after {2} attempts: {last_error}")
+    raise last_error
 
 
 def _init_db():
@@ -902,14 +918,6 @@ def handle_arrival(data: Dict):
     d = data.get("_data") or {}
     flight_id = str(d.get("id", ""))
 
-    # DEBUG: логируем полный payload для поиска правильного ID отчёта
-    logger.info(f"[DEBUG] _data keys: {list(d.keys())}")
-    logger.info(f"[DEBUG] id={d.get('id')} | report_id={d.get('report_id')} | pirep_id={d.get('pirep_id')}")
-    try:
-        logger.info(f"[DEBUG] full _data: {json.dumps(dict(d), default=str)}")
-    except Exception:
-        logger.info(f"[DEBUG] full _data (raw): {d}")
-
     if flight_id and is_duplicate_event(flight_id, "arrival"):
         logger.info(f"Пропуск дублирующего arrival для рейса {flight_id}")
         return
@@ -933,8 +941,6 @@ def handle_arrival(data: Dict):
         profit=None,
     )
 
-    # Используем flight_id для ссылки; после получения DEBUG-данных
-    # заменим на правильный report_id
     flight_link = (
         f"\n🔗 <a href='https://fshub.io/flight/{flight_id}/report'>Открыть отчёт о рейсе</a>"
         if flight_id else ""
