@@ -914,46 +914,76 @@ def handle_departure(data: Dict):
     )
 
 
-def handle_arrival(data: Dict):
+def handle_completed(data: Dict):
+    """
+    flight.completed — приходит после обработки рейса FSHub.
+    Структура: _data.id = ID отчёта (правильный для URL),
+               _data.arrival = данные о посадке,
+               _data.departure = данные о вылете,
+               _data.plan = план полёта.
+    """
     d = data.get("_data") or {}
-    flight_id = str(d.get("id", ""))
+    report_id = str(d.get("id", ""))
 
-    if flight_id and is_duplicate_event(flight_id, "arrival"):
-        logger.info(f"Пропуск дублирующего arrival для рейса {flight_id}")
+    if report_id and is_duplicate_event(report_id, "completed"):
+        logger.info(f"Пропуск дублирующего completed для рейса {report_id}")
         return
 
-    user     = d.get("user") or {}
+    # Данные о посадке — в блоке arrival
+    arrival  = d.get("arrival") or {}
     plan     = d.get("plan") or {}
-    aircraft = d.get("aircraft") or {}
-    airport  = d.get("airport") or {}
+    user     = arrival.get("user") or d.get("user") or {}
+    aircraft = arrival.get("aircraft") or d.get("aircraft") or {}
+    airport  = arrival.get("airport") or {}
 
-    rate = int(d.get("landing_rate", 0))
+    # flight_no может быть в plan.callsign (flight.completed) или plan.flight_no
+    flight_no = plan.get("callsign") or plan.get("flight_no", "N/A")
+
+    # Маршрут: в flight.completed plan использует icao_dep/icao_arr
+    dep = plan.get("icao_dep") or plan.get("departure", "????")
+    arr = plan.get("icao_arr") or plan.get("arrival", "????")
+
+    rate = int(arrival.get("landing_rate", 0))
     rating, emoji = landing_rating(rate)
 
+    # Дополнительные данные рейса
+    distance_nm = (d.get("distance") or {}).get("nm")
+    fuel_burnt  = d.get("fuel_burnt")
+    max_alt     = (d.get("max") or {}).get("alt")
+
     db_add_flight(
-        flight_id=flight_id or None,
+        flight_id=report_id or None,
         pilot=user.get("name", "Unknown"),
-        flight_no=plan.get("flight_no", "N/A"),
-        departure=plan.get("departure", "????"),
-        arrival=plan.get("arrival", "????"),
+        flight_no=flight_no,
+        departure=dep,
+        arrival=arr,
         aircraft=aircraft.get("icao_name", "Unknown"),
         landing_rate=rate,
         profit=None,
     )
 
     flight_link = (
-        f"\n🔗 <a href='https://fshub.io/flight/{flight_id}/report'>Открыть отчёт о рейсе</a>"
-        if flight_id else ""
+        f"\n🔗 <a href='https://fshub.io/flight/{report_id}/report'>Открыть отчёт о рейсе</a>"
+        if report_id else ""
     )
+
+    extras = ""
+    if distance_nm:
+        extras += f"\n📏 Distance: <b>{distance_nm} nm</b>"
+    if fuel_burnt:
+        extras += f"\n⛽ Fuel burnt: <b>{fuel_burnt} kg</b>"
+    if max_alt:
+        extras += f"\n🏔 Max altitude: <b>{max_alt:,} ft</b>"
 
     tg_send(
         f"🛬 <b>ПОСАДКА ВЫПОЛНЕНА — TOUCHDOWN</b> {emoji}\n\n"
         f"👨‍✈️ Captain: <b>{user.get('name', 'Unknown')}</b>\n"
-        f"🆔 Flight: <b>{plan.get('flight_no', 'N/A')}</b>\n"
-        f"🗺 Route: <b>{plan.get('departure', '????')} → {plan.get('arrival', '????')}</b>\n"
+        f"🆔 Flight: <b>{flight_no}</b>\n"
+        f"🗺 Route: <b>{dep} → {arr}</b>\n"
         f"📍 Airport: <b>{airport.get('name', 'Unknown')}</b>\n"
         f"✈️ Aircraft: <b>{aircraft.get('icao_name', 'Unknown')}</b>\n"
         f"📊 Landing Rate: <b>{rate} fpm</b> — {rating}"
+        f"{extras}"
         f"{flight_link}"
     )
 
@@ -997,10 +1027,10 @@ def handle_achievement(data: Dict):
 
 
 FSHUB_HANDLERS = {
-    "flight.departed": handle_departure,
-    "flight.arrived": handle_arrival,
+    "flight.departed":   handle_departure,
+    "flight.completed":  handle_completed,
     "screenshots.uploaded": handle_screenshots,
-    "airline.achievement": handle_achievement,
+    "airline.achievement":  handle_achievement,
 }
 
 # ═══════════════════════════════════════════════════════════════
