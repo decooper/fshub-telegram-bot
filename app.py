@@ -264,6 +264,23 @@ def _init_db():
         )
         """
     )
+    db_execute(
+        """
+        CREATE TABLE IF NOT EXISTS contest_entries (
+            id           SERIAL PRIMARY KEY,
+            flight_id    TEXT UNIQUE,
+            pilot        TEXT,
+            flight_no    TEXT,
+            departure    TEXT,
+            arrival      TEXT,
+            aircraft     TEXT,
+            landing_rate INTEGER,
+            report_url   TEXT,
+            contest_month TEXT,
+            created_at   TIMESTAMPTZ DEFAULT NOW()
+        )
+        """
+    )
     logger.info("Database tables ready")
 
 
@@ -359,6 +376,66 @@ def db_get_today_economy() -> Optional[Dict]:
         "SELECT * FROM daily_economy WHERE day = CURRENT_DATE",
         fetch="one",
     )
+
+
+# ═══════════════════════════════════════════════════════════════
+# DB HELPERS — CONTEST
+# ═══════════════════════════════════════════════════════════════
+
+CONTEST_POINTS_PER_LANDING = 100  # баллов за посадку
+CONTEST_MONTHLY_LIMIT      = 1000 # максимум баллов в месяц
+CONTEST_RATE_MIN          = -30   # fpm (не мягче)
+CONTEST_RATE_MAX          = -10   # fpm (не жёстче)
+
+
+def is_contest_landing(rate: int) -> bool:
+    """Проверяет, попадает ли посадка в диапазон конкурса."""
+    return CONTEST_RATE_MAX >= rate >= CONTEST_RATE_MIN
+
+
+def db_contest_add(
+    flight_id: str, pilot: str, flight_no: str,
+    departure: str, arrival: str, aircraft: str,
+    landing_rate: int, report_url: str,
+):
+    month = datetime.now().strftime("%Y-%m")
+    db_execute(
+        """
+        INSERT INTO contest_entries
+            (flight_id, pilot, flight_no, departure, arrival,
+             aircraft, landing_rate, report_url, contest_month)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (flight_id) DO NOTHING
+        """,
+        (flight_id, pilot, flight_no, departure, arrival,
+         aircraft, landing_rate, report_url, month),
+    )
+
+
+def db_contest_month(month: Optional[str] = None) -> List:
+    m = month or datetime.now().strftime("%Y-%m")
+    return db_execute(
+        """
+        SELECT * FROM contest_entries
+        WHERE contest_month = %s
+        ORDER BY created_at ASC
+        """,
+        (m,), fetch="all",
+    ) or []
+
+
+def db_contest_recent_months(n: int = 4) -> List[str]:
+    """Возвращает список месяцев у которых есть записи — текущий + до n-1 предыдущих."""
+    rows = db_execute(
+        """
+        SELECT DISTINCT contest_month
+        FROM contest_entries
+        ORDER BY contest_month DESC
+        LIMIT %s
+        """,
+        (n,), fetch="all",
+    ) or []
+    return [r["contest_month"] for r in rows]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -506,6 +583,7 @@ def tg_send_menu(chat_id) -> bool:
                         ],
                         [
                             {"text": "🛫 Полосы (Runway)", "callback_data": "cmd_runway"},
+                            {"text": "🎯 Мастер Посадки",  "callback_data": "cmd_contest"},
                         ],
                     ]
                 },
@@ -853,6 +931,95 @@ def fmt_va_info() -> str:
     )
 
 
+MONTH_NAMES = {
+    1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
+    5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
+    9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь",
+}
+
+
+def _month_label(m: str) -> str:
+    try:
+        dt = datetime.strptime(m, "%Y-%m")
+        return f"{MONTH_NAMES[dt.month]} {dt.year}"
+    except Exception:
+        return m
+
+
+def _fmt_contest_block(m: str) -> str:
+    """Форматирует блок одного месяца для вывода в /contest."""
+    entries = db_contest_month(m)
+    limit   = CONTEST_MONTHLY_LIMIT
+    earned  = min(len(entries) * CONTEST_POINTS_PER_LANDING, limit)
+    remain  = limit - earned
+    label   = _month_label(m)
+
+    if not entries:
+        return (
+            f"📅 <b>{label}</b>\n"
+            f"Пока нет кандидатов."
+        )
+
+    lines = []
+    for i, e in enumerate(entries, 1):
+        in_limit = i <= limit
+        pts_str  = f"⭐ +{CONTEST_POINTS_PER_LANDING} баллов" if in_limit else "— (лимит исчерпан)"
+        lines.append(
+            f"  {i}. <b>{e['pilot']}</b> "
+            f"{e['flight_no']} {e['departure']}→{e['arrival']} "
+            f"<b>{e['landing_rate']} fpm</b> {pts_str}\n"
+            f"      🔍 Находится на проверке — результат в конце месяца"
+        )
+
+    return (
+        f"📅 <b>{label}</b> — "
+        f"Начислено: <b>{earned} балл.</b> | Остаток фонда: <b>{remain} балл.</b>\n"
+        + "\n".join(lines)
+    )
+
+
+def fmt_contest(month: Optional[str] = None) -> str:
+    """
+    Без аргумента — текущий месяц + до 3 предыдущих с данными.
+    С аргументом (YYYY-MM) — только указанный месяц.
+    """
+    slots = CONTEST_MONTHLY_LIMIT // CONTEST_POINTS_PER_LANDING
+    header = (
+        f"🎯 <b>МАСТЕР ПОСАДКИ</b>\n"
+        f"<i>Диапазон: от {CONTEST_RATE_MAX} до {CONTEST_RATE_MIN} fpm | "
+        f"1 посадка = {CONTEST_POINTS_PER_LANDING} баллов | Фонд: {CONTEST_MONTHLY_LIMIT} баллов/мес</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+    )
+    footer = (
+        f"\n<i>⚠️ Финальная проверка (FSAirlines, штрафы, реал-тайм) — директор</i>"
+    )
+
+    # Конкретный месяц по запросу
+    if month:
+        return header + _fmt_contest_block(month) + footer
+
+    # Текущий + до 3 предыдущих месяцев с данными
+    current = datetime.now().strftime("%Y-%m")
+    recent  = db_contest_recent_months(n=4)
+
+    # Убедимся что текущий месяц всегда первый, даже если данных нет
+    if current not in recent:
+        months_to_show = [current] + recent[:3]
+    else:
+        # Текущий в начале, остальные по убыванию
+        months_to_show = [current] + [m for m in recent if m != current][:3]
+
+    blocks = []
+    for m in months_to_show:
+        entries = db_contest_month(m)
+        # Прошлые месяцы без данных — пропускаем
+        if not entries and m != current:
+            continue
+        blocks.append(_fmt_contest_block(m))
+
+    return header + "\n\n".join(blocks) + footer
+
+
 def fmt_runway(icao: str) -> str:
     """Возвращает сообщение со ссылкой на RunwayApp для указанного ICAO."""
     icao = icao.upper()
@@ -995,6 +1162,39 @@ def handle_completed(data: Dict):
             f"✈️ Aircraft inspection recommended."
         )
 
+    # ─── Проверка конкурса Мастер Посадки ───────────────────────
+    if is_contest_landing(rate):
+        report_url = f"https://fshub.io/flight/{report_id}/report" if report_id else ""
+        db_contest_add(
+            flight_id=report_id,
+            pilot=user.get("name", "Unknown"),
+            flight_no=flight_no,
+            departure=dep,
+            arrival=arr,
+            aircraft=aircraft.get("icao_name", "Unknown"),
+            landing_rate=rate,
+            report_url=report_url,
+        )
+        entries  = db_contest_month()
+        position = len(entries)
+        slots    = CONTEST_MONTHLY_LIMIT // CONTEST_POINTS_PER_LANDING
+        if position <= slots:
+            tg_send(
+                f"🎯 <b>КАНДИДАТ — МАСТЕР ПОСАДКИ!</b>\n\n"
+                f"👨‍✈️ <b>{user.get('name', 'Unknown')}</b>\n"
+                f"📊 Landing Rate: <b>{rate} fpm</b>\n"
+                f"⭐ Позиция в этом месяце: <b>#{position}</b>\n"
+                f"🏅 Начислено: <b>{CONTEST_POINTS_PER_LANDING} баллов</b>\n\n"
+                f"🔍 Находится на проверке — результат в конце месяца"
+            )
+        else:
+            tg_send(
+                f"🎯 <b>СНАЙПЕРСКАЯ ПОСАДКА!</b>\n\n"
+                f"👨‍✈️ <b>{user.get('name', 'Unknown')}</b>\n"
+                f"📊 Landing Rate: <b>{rate} fpm</b>\n"
+                f"📅 Фонд {CONTEST_MONTHLY_LIMIT} баллов на этот месяц исчерпан — ждём следующего!"
+            )
+
 
 def _send_screenshots_async(screenshots: List):
     for scr in screenshots[:3]:
@@ -1075,6 +1275,7 @@ MENU_CALLBACKS.update({
     "cmd_monthly":     fmt_monthly_economy,
     "cmd_live":        fmt_active_flights,
     "cmd_va":          fmt_va_info,
+    "cmd_contest":     fmt_contest,
 })
 
 
@@ -1107,9 +1308,30 @@ def handle_tg_command(message: Dict):
         tg_send_menu(chat_id)
         return
 
-    # ─── Обработка /runway ──────────────────────────────────────
+    # ─── Обработка /contest [YYYY-MM] ───────────────────────────
     cmd_parts = text.split()
     base_cmd = cmd_parts[0].split("@")[0]
+
+    if base_cmd == "/contest":
+        # Опциональный аргумент: /contest 2026-05
+        month_arg = None
+        if len(cmd_parts) >= 2:
+            import re
+            raw = cmd_parts[1].strip()
+            if re.match(r"^\d{4}-\d{2}$", raw):
+                month_arg = raw
+            else:
+                tg_send(
+                    "❌ Неверный формат месяца.\n"
+                    "Пример: <code>/contest 2026-05</code>",
+                    chat_id,
+                )
+                return
+        tg_send(fmt_contest(month_arg), chat_id)
+        return
+    # ─── Конец обработки /contest ───────────────────────────────
+
+    # ─── Обработка /runway ──────────────────────────────────────
 
     if base_cmd == "/runway":
         if len(cmd_parts) < 2:
