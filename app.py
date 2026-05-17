@@ -707,6 +707,117 @@ def get_flight_profit(report_id: int) -> Optional[int]:
     return None
 
 
+# ─── FSAirlines: кэш пилотов и обогащение данных вылета ────────
+
+# Кэш: "Имя Фамилия" → pilot_id в FSAirlines
+# Обновляется при первом обращении и живёт до перезапуска сервиса
+_fsa_pilot_cache: Dict[str, int] = {}
+_fsa_pilot_cache_lock = threading.Lock()
+_fsa_pilot_cache_ts: float = 0  # время последнего обновления
+
+
+def fsa_refresh_pilot_cache() -> None:
+    """Загружает список пилотов FSAirlines в кэш."""
+    global _fsa_pilot_cache_ts
+    data = fsa_call("getPilotList")
+    if not isinstance(data, list):
+        return
+    with _fsa_pilot_cache_lock:
+        _fsa_pilot_cache.clear()
+        for p in data:
+            full_name = f"{p.get('name', '')} {p.get('surname', '')}".strip()
+            if full_name and p.get("id"):
+                _fsa_pilot_cache[full_name] = int(p["id"])
+        _fsa_pilot_cache_ts = time.time()
+    logger.info(f"FSA pilot cache refreshed: {len(_fsa_pilot_cache)} pilots")
+
+
+def fsa_get_pilot_id(name: str) -> Optional[int]:
+    """Возвращает pilot_id FSAirlines по полному имени пилота."""
+    # Обновляем кэш если он пустой или старше 1 часа
+    if not _fsa_pilot_cache or (time.time() - _fsa_pilot_cache_ts) > 3600:
+        fsa_refresh_pilot_cache()
+    with _fsa_pilot_cache_lock:
+        return _fsa_pilot_cache.get(name)
+
+
+def fsa_get_pilot_status(pilot_id: int) -> Optional[Dict]:
+    """Возвращает текущий статус пилота из FSAirlines."""
+    data = fsa_call("getPilotStatus", {"pilot_id": pilot_id})
+    if isinstance(data, list) and data:
+        return data[0]
+    return data if isinstance(data, dict) else None
+
+
+def _is_plan_empty(plan: Dict) -> bool:
+    """Проверяет, пустой ли план полёта из FSHub."""
+    flight_no = plan.get("flight_no", "")
+    departure = plan.get("departure", "")
+    arrival   = plan.get("arrival", "")
+    return (
+        not flight_no or flight_no in ("N/A", "", "None") or
+        not departure or departure in ("????", "", "None") or
+        not arrival   or arrival   in ("????", "", "None")
+    )
+
+
+def _enrich_departure_from_fsa(
+    message_id: int,
+    chat_id_str: str,
+    pilot_name: str,
+    aircraft_name: str,
+    delay: int = 90,
+) -> None:
+    """
+    Запускается в отдельном треде через `delay` секунд после вылета.
+    Запрашивает FSAirlines, получает маршрут и редактирует сообщение бота.
+    """
+    time.sleep(delay)
+    logger.info(f"[Enrich] Запрос FSAirlines для пилота '{pilot_name}' (delay={delay}s)")
+
+    pilot_id = fsa_get_pilot_id(pilot_name)
+    if not pilot_id:
+        logger.warning(f"[Enrich] Пилот '{pilot_name}' не найден в FSAirlines")
+        tg_edit_message(
+            chat_id_str, message_id,
+            f"🛫 <b>ВЫЛЕТ ПОДТВЕРЖДЁН — CLEARED FOR TAKEOFF</b>\n\n"
+            f"👨‍✈️ Captain: <b>{pilot_name}</b>\n"
+            f"✈️ Aircraft: <b>{aircraft_name}</b>\n\n"
+            f"⚠️ <i>Маршрут не найден — пилот не активировал план в RLM Client</i>\n"
+            f"✈️ <i>Желаем попутного ветра и мягкой посадки!</i>"
+        )
+        return
+
+    status = fsa_get_pilot_status(pilot_id)
+    if not status:
+        logger.warning(f"[Enrich] Статус пилота {pilot_id} не получен из FSAirlines")
+        return
+
+    dep       = status.get("departure", "????")
+    arr       = status.get("arrival",   "????")
+    flight_no = status.get("route_id",  "")  # route_id как запасной вариант
+
+    # Попробуем получить номер рейса из активных рейсов FSAirlines
+    active = fsa_active_flights()
+    flt_no = "N/A"
+    for f in active:
+        if str(f.get("user_id")) == str(pilot_id):
+            flt_no = f.get("number", "N/A")
+            break
+
+    logger.info(f"[Enrich] Получены данные FSA: {dep}→{arr} flight={flt_no}")
+
+    tg_edit_message(
+        chat_id_str, message_id,
+        f"🛫 <b>ВЫЛЕТ ПОДТВЕРЖДЁН — CLEARED FOR TAKEOFF</b>\n\n"
+        f"👨‍✈️ Captain: <b>{pilot_name}</b>\n"
+        f"🆔 Flight: <b>{flt_no}</b>\n"
+        f"🗺 Route: <b>{dep} → {arr}</b>\n"
+        f"✈️ Aircraft: <b>{aircraft_name}</b>\n\n"
+        f"✈️ <i>Желаем попутного ветра и мягкой посадки!</i>"
+    )
+
+
 # ═══════════════════════════════════════════════════════════════
 # FINANCIAL AGGREGATION
 # ═══════════════════════════════════════════════════════════════
@@ -1071,14 +1182,52 @@ def handle_departure(data: Dict):
     user     = d.get("user") or {}
     plan     = d.get("plan") or {}
     aircraft = d.get("aircraft") or {}
-    tg_send(
-        f"🛫 <b>ВЫЛЕТ ПОДТВЕРЖДЁН — CLEARED FOR TAKEOFF</b>\n\n"
-        f"👨‍✈️ Captain: <b>{user.get('name', 'Unknown')}</b>\n"
-        f"🆔 Flight: <b>{plan.get('flight_no', 'N/A')}</b>\n"
-        f"🗺 Route: <b>{plan.get('departure', '????')} → {plan.get('arrival', '????')}</b>\n"
-        f"✈️ Aircraft: <b>{aircraft.get('icao_name', 'N/A')}</b>\n\n"
-        f"✈️ <i>Желаем попутного ветра и мягкой посадки!</i>"
-    )
+
+    pilot_name   = user.get("name", "Unknown")
+    aircraft_name = aircraft.get("icao_name", "N/A")
+
+    if not _is_plan_empty(plan):
+        # Данные полные — отправляем сразу
+        logger.info(f"[Departure] Полный план от FSHub для '{pilot_name}'")
+        tg_send(
+            f"🛫 <b>ВЫЛЕТ ПОДТВЕРЖДЁН — CLEARED FOR TAKEOFF</b>\n\n"
+            f"👨‍✈️ Captain: <b>{pilot_name}</b>\n"
+            f"🆔 Flight: <b>{plan.get('flight_no')}</b>\n"
+            f"🗺 Route: <b>{plan.get('departure')} → {plan.get('arrival')}</b>\n"
+            f"✈️ Aircraft: <b>{aircraft_name}</b>\n\n"
+            f"✈️ <i>Желаем попутного ветра и мягкой посадки!</i>"
+        )
+    else:
+        # Пустой план — отправляем краткое сообщение и запускаем обогащение
+        logger.info(f"[Departure] Пустой план от FSHub для '{pilot_name}', запускаю обогащение через 90с")
+
+        # Краткое сообщение — сохраняем message_id для последующего редактирования
+        r = session.post(
+            f"{TG_BASE}/sendMessage",
+            json={
+                "chat_id": CHAT_ID,
+                "text": (
+                    f"🛫 <b>ВЫЛЕТ ПОДТВЕРЖДЁН — CLEARED FOR TAKEOFF</b>\n\n"
+                    f"👨‍✈️ Captain: <b>{pilot_name}</b>\n"
+                    f"✈️ Aircraft: <b>{aircraft_name}</b>\n"
+                    f"🗺 Route: <b>⏳ Загружаю маршрут...</b>\n\n"
+                    f"✈️ <i>Желаем попутного ветра и мягкой посадки!</i>"
+                ),
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=20,
+        )
+        if r.status_code == 200:
+            message_id = r.json().get("result", {}).get("message_id")
+            if message_id:
+                threading.Thread(
+                    target=_enrich_departure_from_fsa,
+                    args=(message_id, CHAT_ID, pilot_name, aircraft_name, 90),
+                    daemon=True,
+                ).start()
+        else:
+            logger.warning(f"[Departure] Не удалось отправить сообщение: {r.text}")
 
 
 def handle_completed(data: Dict):
