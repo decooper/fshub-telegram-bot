@@ -911,25 +911,44 @@ def _enrich_completed_from_fsa(
 # FINANCIAL AGGREGATION
 # ═══════════════════════════════════════════════════════════════
 
+# Транзакции которые являются внутренними переводами между флотами.
+# Они всегда парные (приход = расход) и не влияют на реальный Net,
+# но засоряют отчёт — исключаем из отображения.
+INTERNAL_TRANSFER_REASONS = {
+    "Fleet Money Transfer",
+}
+
+
 def _aggregate(transactions: List[Dict]) -> Dict:
     inc, exp = 0.0, 0.0
     inc_cat: Dict[str, float] = {}
     exp_cat: Dict[str, float] = {}
+    internal_volume = 0.0  # объём внутренних переводов (для справки)
+
     for t in transactions:
         try:
             v = float(t.get("value", 0))
         except (ValueError, TypeError):
             continue
         r = t.get("reason") or "Other"
+
+        # Внутренние переводы: учитываем в net (они нейтральны),
+        # но НЕ показываем в топах доходов/расходов
+        if r in INTERNAL_TRANSFER_REASONS:
+            internal_volume += abs(v)
+            continue
+
         if v >= 0:
             inc += v
             inc_cat[r] = inc_cat.get(r, 0) + v
         else:
             exp += abs(v)
             exp_cat[r] = exp_cat.get(r, 0) + abs(v)
+
     return {
         "inc": inc, "exp": exp, "net": inc - exp,
         "inc_cat": inc_cat, "exp_cat": exp_cat,
+        "internal_volume": internal_volume,
     }
 
 
@@ -950,7 +969,11 @@ def snapshot_daily_economy():
         return
     ag = _aggregate(txs)
     day = datetime.now().strftime("%Y-%m-%d")
-    detail = {"inc_cat": ag["inc_cat"], "exp_cat": ag["exp_cat"]}
+    detail = {
+        "inc_cat": ag["inc_cat"],
+        "exp_cat": ag["exp_cat"],
+        "internal_volume": ag.get("internal_volume", 0),
+    }
     db_save_daily_economy(
         day=day,
         income=int(ag["inc"]),
@@ -1061,6 +1084,10 @@ def fmt_daily_economy() -> str:
         inc, exp, net = ag["inc"], ag["exp"], ag["net"]
         inc_cat, exp_cat = ag["inc_cat"], ag["exp_cat"]
 
+    internal = (row.get("detail") or {}).get("internal_volume", 0) if row else 0
+    if not row:
+        internal = ag.get("internal_volume", 0) if "ag" in dir() else 0
+
     em = _nem(net)
     msg = (
         f"📊 <b>DAILY FINANCIAL REPORT</b>\n\n"
@@ -1068,6 +1095,8 @@ def fmt_daily_economy() -> str:
         f"📉 Expenses: <b>-{exp:,.0f} v$</b>\n"
         f"{em} <b>Net: {net:+,.0f} v$</b>\n"
     )
+    if internal:
+        msg += f"↔️ <i>Внутр. переводы: {internal:,.0f} v$ (не учитываются)</i>\n"
     if inc_cat:
         msg += "\n🔝 <b>TOP REVENUE:</b>\n"
         for reason, amount in _top(inc_cat):
