@@ -38,6 +38,11 @@ DATABASE_URL   = os.environ.get("DATABASE_URL", "")
 FSA_URL = "https://www.fsairlines.net/va_interface2.php"
 TG_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+# Задержки обогащения из FSAirlines (секунды)
+# Увеличьте если FSAirlines не успевает обновить данные
+FSA_ENRICH_DEPARTURE_DELAY = 90   # задержка для вылета
+FSA_ENRICH_ARRIVAL_DELAY   = 180  # задержка для посадки (3 минуты)
+
 if not BOT_TOKEN or not CHAT_ID:
     print("❌ TG_BOT_TOKEN or TG_CHAT_ID missing")
     sys.exit(1)
@@ -818,6 +823,90 @@ def _enrich_departure_from_fsa(
     )
 
 
+def fsa_get_recent_report(pilot_id: int, arrival_time: str) -> Optional[Dict]:
+    """
+    Ищет последний отчёт пилота в FSAirlines близкий по времени к arrival_time.
+    arrival_time — строка ISO формата из _data.arrival_at.
+    """
+    data = fsa_call("getFlightReports", {"pilot_id": pilot_id, "count": 5})
+    if not isinstance(data, list):
+        return None
+    try:
+        arr_dt = datetime.fromisoformat(arrival_time.replace("Z", "+00:00"))
+    except Exception:
+        arr_dt = None
+
+    for report in data:
+        if arr_dt:
+            # Сравниваем по timestamp рейса (поле ts)
+            try:
+                rep_dt = _safe_ts(report.get("ts"))
+                if rep_dt and abs((arr_dt.replace(tzinfo=None) - rep_dt).total_seconds()) < 600:
+                    return report
+            except Exception:
+                pass
+        else:
+            # Без времени — берём первый отчёт
+            return report
+    return None
+
+
+def _enrich_completed_from_fsa(
+    message_id: int,
+    chat_id_str: str,
+    pilot_name: str,
+    aircraft_name: str,
+    airport_name: str,
+    rate: int,
+    rating: str,
+    emoji: str,
+    extras: str,
+    flight_link: str,
+    arrival_time: str,
+    delay: int = 60,
+) -> None:
+    """
+    Запускается в отдельном треде через delay секунд после посадки.
+    Запрашивает FSAirlines, получает маршрут и редактирует сообщение бота.
+    """
+    time.sleep(delay)
+    logger.info(f"[Enrich arrival] Запрос FSAirlines для пилота '{pilot_name}'")
+
+    pilot_id = fsa_get_pilot_id(pilot_name)
+    dep, arr, flight_no = "????", "????", "N/A"
+
+    if pilot_id:
+        report = fsa_get_recent_report(pilot_id, arrival_time)
+        if report:
+            dep       = report.get("dep", "????") or "????"
+            arr       = report.get("arr", "????") or "????"
+            flight_no = report.get("number", "N/A") or "N/A"
+            logger.info(f"[Enrich arrival] Найден маршрут FSA: {dep}→{arr} {flight_no}")
+        else:
+            logger.warning(f"[Enrich arrival] Отчёт FSA не найден для пилота {pilot_id}")
+    else:
+        logger.warning(f"[Enrich arrival] Пилот '{pilot_name}' не найден в FSAirlines")
+
+    route_line = (
+        f"🗺 Route: <b>{dep} → {arr}</b>\n"
+        if dep != "????" else
+        f"🗺 Route: <i>не определён</i>\n"
+    )
+
+    tg_edit_message(
+        chat_id_str, message_id,
+        f"🛬 <b>ПОСАДКА ВЫПОЛНЕНА — TOUCHDOWN</b> {emoji}\n\n"
+        f"👨‍✈️ Captain: <b>{pilot_name}</b>\n"
+        f"🆔 Flight: <b>{flight_no}</b>\n"
+        f"{route_line}"
+        f"📍 Airport: <b>{airport_name}</b>\n"
+        f"✈️ Aircraft: <b>{aircraft_name}</b>\n"
+        f"📊 Landing Rate: <b>{rate} fpm</b> — {rating}"
+        f"{extras}"
+        f"{flight_link}"
+    )
+
+
 # ═══════════════════════════════════════════════════════════════
 # FINANCIAL AGGREGATION
 # ═══════════════════════════════════════════════════════════════
@@ -1223,7 +1312,7 @@ def handle_departure(data: Dict):
             if message_id:
                 threading.Thread(
                     target=_enrich_departure_from_fsa,
-                    args=(message_id, CHAT_ID, pilot_name, aircraft_name, 90),
+                    args=(message_id, CHAT_ID, pilot_name, aircraft_name, FSA_ENRICH_DEPARTURE_DELAY),
                     daemon=True,
                 ).start()
         else:
@@ -1291,17 +1380,53 @@ def handle_completed(data: Dict):
     if max_alt:
         extras += f"\n🏔 Max altitude: <b>{max_alt:,} ft</b>"
 
-    tg_send(
+    pilot_name    = user.get("name", "Unknown")
+    aircraft_name = aircraft.get("icao_name", "Unknown")
+    airport_name  = airport.get("name", "Unknown")
+    arrival_time  = d.get("arrival_at", "") or ""
+    plan_empty    = _is_plan_empty({"flight_no": flight_no, "departure": dep, "arrival": arr})
+
+    msg_text = (
         f"🛬 <b>ПОСАДКА ВЫПОЛНЕНА — TOUCHDOWN</b> {emoji}\n\n"
-        f"👨‍✈️ Captain: <b>{user.get('name', 'Unknown')}</b>\n"
+        f"👨‍✈️ Captain: <b>{pilot_name}</b>\n"
         f"🆔 Flight: <b>{flight_no}</b>\n"
-        f"🗺 Route: <b>{dep} → {arr}</b>\n"
-        f"📍 Airport: <b>{airport.get('name', 'Unknown')}</b>\n"
-        f"✈️ Aircraft: <b>{aircraft.get('icao_name', 'Unknown')}</b>\n"
+        f"🗺 Route: <b>{'⏳ Загружаю маршрут...' if plan_empty else f'{dep} → {arr}'}</b>\n"
+        f"📍 Airport: <b>{airport_name}</b>\n"
+        f"✈️ Aircraft: <b>{aircraft_name}</b>\n"
         f"📊 Landing Rate: <b>{rate} fpm</b> — {rating}"
         f"{extras}"
         f"{flight_link}"
     )
+
+    if plan_empty and FSA_KEY:
+        # Отправляем с placeholder и запускаем обогащение через 60 сек
+        logger.info(f"[Completed] Пустой план, запускаю обогащение для '{pilot_name}'")
+        r = session.post(
+            f"{TG_BASE}/sendMessage",
+            json={
+                "chat_id": CHAT_ID,
+                "text": msg_text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=20,
+        )
+        if r.status_code == 200:
+            message_id = r.json().get("result", {}).get("message_id")
+            if message_id:
+                threading.Thread(
+                    target=_enrich_completed_from_fsa,
+                    args=(
+                        message_id, CHAT_ID, pilot_name, aircraft_name,
+                        airport_name, rate, rating, emoji,
+                        extras, flight_link, arrival_time, FSA_ENRICH_ARRIVAL_DELAY,
+                    ),
+                    daemon=True,
+                ).start()
+        else:
+            logger.warning(f"[Completed] Не удалось отправить: {r.text}")
+    else:
+        tg_send(msg_text)
 
     if rate < -600:
         tg_send(
