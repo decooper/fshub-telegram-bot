@@ -720,6 +720,11 @@ _fsa_pilot_cache: Dict[str, int] = {}
 _fsa_pilot_cache_lock = threading.Lock()
 _fsa_pilot_cache_ts: float = 0  # время последнего обновления
 
+# Кэш данных вылета: pilot_name → {dep, arr, flight_no, ts}
+# Используется при посадке если план FSHub пустой
+_departure_cache: Dict[str, Dict] = {}
+_departure_cache_lock = threading.Lock()
+
 
 def fsa_refresh_pilot_cache() -> None:
     """Загружает список пилотов FSAirlines в кэш."""
@@ -764,6 +769,18 @@ def _is_plan_empty(plan: Dict) -> bool:
         not departure or departure in ("????", "", "None") or
         not arrival   or arrival   in ("????", "", "None")
     )
+
+
+def _is_valid_icao(icao: str) -> bool:
+    """
+    Базовая валидация ICAO: 4 символа, начинается с буквы,
+    только буквы и цифры. Защита от мусорных данных FSAirlines.
+    """
+    if not icao or len(icao) != 4:
+        return False
+    if not icao[0].isalpha():
+        return False
+    return icao.isalnum()
 
 
 def _enrich_departure_from_fsa(
@@ -811,6 +828,17 @@ def _enrich_departure_from_fsa(
             break
 
     logger.info(f"[Enrich] Получены данные FSA: {dep}→{arr} flight={flt_no}")
+
+    # Сохраняем обогащённые данные в кэш для использования при посадке
+    if _is_valid_icao(dep) and _is_valid_icao(arr):
+        with _departure_cache_lock:
+            _departure_cache[pilot_name] = {
+                "dep":       dep,
+                "arr":       arr,
+                "flight_no": flt_no,
+                "ts":        time.time(),
+                "from_fsa":  True,
+            }
 
     tg_edit_message(
         chat_id_str, message_id,
@@ -1250,18 +1278,17 @@ def fmt_contest(month: Optional[str] = None) -> str:
 
 
 def fmt_runway(icao: str) -> str:
-    """Возвращает сообщение со ссылкой на RunwayApp для указанного ICAO."""
+    """Возвращает METAR и рекомендации по полосам через metar-taf.com."""
     icao = icao.upper()
-    url = f"https://runway.airportdb.io/airport/{icao.lower()}"
+    url = f"https://metar-taf.com/metar/{icao.lower()}"
     return (
-        f"🛫 <b>РЕКОМЕНДАЦИИ ПО ПОЛОСАМ — {icao}</b>\n\n"
-        f"🔗 <a href='{url}'>Открыть на RunwayApp</a>\n\n"
-        f"💡 <b>Как читать результат:</b>\n"
-        f"• 🟢 Зелёные стрелки — встречный ветер (лучший выбор)\n"
-        f"• 🟡 Жёлтые стрелки — боковой ветер\n"
-        f"• 🔴 Красные — попутный ветер (не рекомендуется)\n"
-        f"• Первая полоса в списке = оптимальный вариант\n\n"
-        f"📡 <i>Данные обновляются по текущему METAR</i>"
+        f"🛫 <b>METAR И ПОЛОСЫ — {icao}</b>\n\n"
+        f"🔗 <a href='{url}'>Открыть METAR на metar-taf.com</a>\n\n"
+        f"💡 <b>Как выбрать полосу:</b>\n"
+        f"• Смотрим направление и скорость ветра в METAR\n"
+        f"• Выбираем полосу с <b>встречным</b> ветром\n"
+        f"• Курс полосы ≈ направление ветра (±30°)\n\n"
+        f"📡 <i>METAR обновляется каждые 30 минут</i>"
     )
 
 
@@ -1305,8 +1332,15 @@ def handle_departure(data: Dict):
     aircraft_name = aircraft.get("icao_name", "N/A")
 
     if not _is_plan_empty(plan):
-        # Данные полные — отправляем сразу
+        # Данные полные — сохраняем в кэш и отправляем сразу
         logger.info(f"[Departure] Полный план от FSHub для '{pilot_name}'")
+        with _departure_cache_lock:
+            _departure_cache[pilot_name] = {
+                "dep":       plan.get("departure", "????"),
+                "arr":       plan.get("arrival", "????"),
+                "flight_no": plan.get("flight_no", "N/A"),
+                "ts":        time.time(),
+            }
         tg_send(
             f"🛫 <b>ВЫЛЕТ ПОДТВЕРЖДЁН — CLEARED FOR TAKEOFF</b>\n\n"
             f"👨‍✈️ Captain: <b>{pilot_name}</b>\n"
@@ -1428,32 +1462,102 @@ def handle_completed(data: Dict):
     )
 
     if plan_empty and FSA_KEY:
-        # Отправляем с placeholder и запускаем обогащение через 60 сек
-        logger.info(f"[Completed] Пустой план, запускаю обогащение для '{pilot_name}'")
-        r = session.post(
-            f"{TG_BASE}/sendMessage",
-            json={
-                "chat_id": CHAT_ID,
-                "text": msg_text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            },
-            timeout=20,
-        )
-        if r.status_code == 200:
-            message_id = r.json().get("result", {}).get("message_id")
-            if message_id:
-                threading.Thread(
-                    target=_enrich_completed_from_fsa,
-                    args=(
-                        message_id, CHAT_ID, pilot_name, aircraft_name,
-                        airport_name, rate, rating, emoji,
-                        extras, flight_link, arrival_time, FSA_ENRICH_ARRIVAL_DELAY,
-                    ),
-                    daemon=True,
-                ).start()
+        # Проверяем кэш данных вылета
+        airport_icao = airport.get("icao", "").upper()
+        cached = None
+        with _departure_cache_lock:
+            entry = _departure_cache.get(pilot_name)
+            # Кэш актуален если не старше 24 часов
+            if entry and (time.time() - entry.get("ts", 0)) < 86400:
+                cached = entry
+
+        if cached:
+            cached_arr = cached.get("arr", "????").upper()
+            cached_dep = cached.get("dep", "????")
+            cached_fno = cached.get("flight_no", "N/A")
+
+            # Валидируем данные из кэша
+            if not _is_valid_icao(cached_dep) or not _is_valid_icao(cached_arr):
+                logger.warning(f"[Completed] Невалидные ICAO в кэше: {cached_dep}→{cached_arr}, игнорируем")
+                cached = None
+
+        if cached:
+            # Сравниваем аэропорт прилёта из кэша с фактическим из FSHub
+            if airport_icao and cached_arr != airport_icao and _is_valid_icao(airport_icao):
+                # Запасной аэропорт — ждём 15 минут пока пилот завершит рейс в FSAirlines
+                logger.info(
+                    f"[Completed] Запасной аэропорт для '{pilot_name}': "
+                    f"план={cached_arr}, факт={airport_icao} — жду 15 мин"
+                )
+                # Отправляем с placeholder
+                msg_placeholder = msg_text  # уже содержит ⏳
+                r = session.post(
+                    f"{TG_BASE}/sendMessage",
+                    json={
+                        "chat_id": CHAT_ID,
+                        "text": msg_placeholder,
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": True,
+                    },
+                    timeout=20,
+                )
+                if r.status_code == 200:
+                    message_id = r.json().get("result", {}).get("message_id")
+                    if message_id:
+                        threading.Thread(
+                            target=_enrich_completed_from_fsa,
+                            args=(
+                                message_id, CHAT_ID, pilot_name, aircraft_name,
+                                airport_name, rate, rating, emoji,
+                                extras, flight_link, arrival_time, 900,  # 15 минут
+                            ),
+                            daemon=True,
+                        ).start()
+            else:
+                # Аэропорт совпадает — используем данные из кэша сразу
+                logger.info(f"[Completed] Используем кэш вылета для '{pilot_name}': {cached_dep}→{cached_arr}")
+                final_msg = (
+                    f"🛬 <b>ПОСАДКА ВЫПОЛНЕНА — TOUCHDOWN</b> {emoji}\n\n"
+                    f"👨‍✈️ Captain: <b>{pilot_name}</b>\n"
+                    f"🆔 Flight: <b>{cached_fno}</b>\n"
+                    f"🗺 Route: <b>{cached_dep} → {cached_arr}</b>\n"
+                    f"📍 Airport: <b>{airport_name}</b>\n"
+                    f"✈️ Aircraft: <b>{aircraft_name}</b>\n"
+                    f"📊 Landing Rate: <b>{rate} fpm</b> — {rating}"
+                    f"{extras}"
+                    f"{flight_link}"
+                )
+                tg_send(final_msg)
+                # Очищаем кэш после использования
+                with _departure_cache_lock:
+                    _departure_cache.pop(pilot_name, None)
         else:
-            logger.warning(f"[Completed] Не удалось отправить: {r.text}")
+            # Нет кэша — стандартное обогащение через FSAirlines с задержкой 3 мин
+            logger.info(f"[Completed] Нет кэша вылета для '{pilot_name}', запускаю обогащение через {FSA_ENRICH_ARRIVAL_DELAY}с")
+            r = session.post(
+                f"{TG_BASE}/sendMessage",
+                json={
+                    "chat_id": CHAT_ID,
+                    "text": msg_text,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                },
+                timeout=20,
+            )
+            if r.status_code == 200:
+                message_id = r.json().get("result", {}).get("message_id")
+                if message_id:
+                    threading.Thread(
+                        target=_enrich_completed_from_fsa,
+                        args=(
+                            message_id, CHAT_ID, pilot_name, aircraft_name,
+                            airport_name, rate, rating, emoji,
+                            extras, flight_link, arrival_time, FSA_ENRICH_ARRIVAL_DELAY,
+                        ),
+                        daemon=True,
+                    ).start()
+            else:
+                logger.warning(f"[Completed] Не удалось отправить: {r.text}")
     else:
         tg_send(msg_text)
 
@@ -1559,8 +1663,8 @@ HELP_TEXT = (
     "/top — top pilots (7 days)\n"
     "/top_landing — best landings\n\n"
     "🛫 <b>Pre-flight Tools:</b>\n"
-    "/runway ICAO — runway recommendations\n"
-    "   Example: /runway UHWW\n\n"
+    "/runway ICAO — METAR и выбор рабочей полосы\n"
+    "   Пример: /runway UHWW\n\n"
     "💰 <b>Financial Operations:</b>\n"
     "/economy — daily financial report\n"
     "/monthly — monthly financial digest\n"
