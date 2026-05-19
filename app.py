@@ -1031,20 +1031,20 @@ def landing_rating(rate: int) -> Tuple[str, str]:
 def fmt_stats() -> str:
     flights = db_all_flights()
     if not flights:
-        return "📊 <b>No flight data available.</b>"
+        return "📊 <b>Данных о рейсах пока нет.</b>"
     rates = [f["landing_rate"] for f in flights]
     avg = round(sum(rates) / len(rates))
     return (
-        f"📊 <b>VA UP! OPERATIONS</b>\n\n"
-        f"🛬 Flights: <b>{len(flights)}</b>\n"
-        f"📐 Average Landing: <b>{avg} fpm</b>"
+        f"📊 <b>ОПЕРАЦИИ VA UP!</b>\n\n"
+        f"🛬 Рейсов выполнено: <b>{len(flights)}</b>\n"
+        f"📐 Средняя посадка: <b>{avg} fpm</b>"
     )
 
 
 def fmt_last(limit: int = 5) -> str:
     flights = db_last_flights(limit)
     if not flights:
-        return "✈️ No flights recorded yet."
+        return "✈️ Рейсов пока не зафиксировано."
     lines = []
     for f in flights:
         rating, emoji = landing_rating(f["landing_rate"])
@@ -1054,25 +1054,25 @@ def fmt_last(limit: int = 5) -> str:
             f"🗺 {f['departure']} → {f['arrival']}\n"
             f"📊 {f['landing_rate']} fpm"
         )
-    return "✈️ <b>LATEST FLIGHTS</b>\n\n" + "\n\n".join(lines)
+    return "✈️ <b>ПОСЛЕДНИЕ РЕЙСЫ</b>\n\n" + "\n\n".join(lines)
 
 
 def fmt_top_landings(limit: int = 10) -> str:
     rows = db_top_landings(limit)
     if not rows:
-        return "🏆 No landing data available."
+        return "🏆 Данных о посадках пока нет."
     medals = ["🥇", "🥈", "🥉"]
     lines = []
     for i, row in enumerate(rows, 1):
         prefix = medals[i - 1] if i <= 3 else f"{i}."
         lines.append(f"{prefix} <b>{row['pilot']}</b> — {row['landing_rate']} fpm")
-    return "🏆 <b>TOP LANDINGS</b>\n\n" + "\n".join(lines)
+    return "🏆 <b>ЛУЧШИЕ ПОСАДКИ</b>\n\n" + "\n".join(lines)
 
 
 def fmt_top_pilots() -> str:
     flights = db_all_flights()
     if not flights:
-        return "🏆 No flight data available."
+        return "🏆 Данных о рейсах пока нет."
     week_ago = datetime.utcnow() - timedelta(days=7)
     counts: Dict[str, int] = {}
     for f in flights:
@@ -1085,14 +1085,14 @@ def fmt_top_pilots() -> str:
         except Exception:
             pass
     if not counts:
-        return "🏆 No flights in the last 7 days."
+        return "🏆 Рейсов за последние 7 дней нет."
     sorted_pilots = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:10]
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     lines = [
-        f"{medals.get(i, f'{i}.')} <b>{pilot}</b> — {n} flights"
+        f"{medals.get(i, f'{i}.')} <b>{pilot}</b> — {n} рейс(ов)"
         for i, (pilot, n) in enumerate(sorted_pilots, 1)
     ]
-    return "🏆 <b>TOP PILOTS (7 days)</b>\n\n" + "\n".join(lines)
+    return "🏆 <b>ТОП ПИЛОТЫ (7 дней)</b>\n\n" + "\n".join(lines)
 
 
 def fmt_daily_economy() -> str:
@@ -1107,7 +1107,7 @@ def fmt_daily_economy() -> str:
     else:
         txs = fsa_daily_transactions()
         if not txs:
-            return "📊 No financial data for today."
+            return "📊 Финансовых данных за сегодня пока нет."
         ag = _aggregate(txs)
         inc, exp, net = ag["inc"], ag["exp"], ag["net"]
         inc_cat, exp_cat = ag["inc_cat"], ag["exp_cat"]
@@ -1118,19 +1118,19 @@ def fmt_daily_economy() -> str:
 
     em = _nem(net)
     msg = (
-        f"📊 <b>DAILY FINANCIAL REPORT</b>\n\n"
-        f"💰 Revenue: <b>+{inc:,.0f} v$</b>\n"
-        f"📉 Expenses: <b>-{exp:,.0f} v$</b>\n"
-        f"{em} <b>Net: {net:+,.0f} v$</b>\n"
+        f"📊 <b>ФИНАНСОВЫЙ ОТЧЁТ ЗА СЕГОДНЯ</b>\n\n"
+        f"💰 Доходы: <b>+{inc:,.0f} v$</b>\n"
+        f"📉 Расходы: <b>-{exp:,.0f} v$</b>\n"
+        f"{em} <b>Баланс: {net:+,.0f} v$</b>\n"
     )
     if internal:
         msg += f"↔️ <i>Внутр. переводы: {internal:,.0f} v$ (не учитываются)</i>\n"
     if inc_cat:
-        msg += "\n🔝 <b>TOP REVENUE:</b>\n"
+        msg += "\n🔝 <b>ОСНОВНЫЕ ДОХОДЫ:</b>\n"
         for reason, amount in _top(inc_cat):
             msg += f"   • {reason}: <b>+{amount:,.0f} v$</b>\n"
     if exp_cat:
-        msg += "\n⚠️ <b>TOP EXPENSES:</b>\n"
+        msg += "\n⚠️ <b>ОСНОВНЫЕ РАСХОДЫ:</b>\n"
         for reason, amount in _top(exp_cat):
             msg += f"   • {reason}: <b>-{amount:,.0f} v$</b>\n"
     return msg
@@ -1140,9 +1140,9 @@ def fmt_monthly_economy() -> str:
     rows = db_get_monthly_economy(days=30)
     if not rows:
         return (
-            "📊 No monthly data yet.\n\n"
-            "ℹ️ History is collected daily at 23:50 UTC. "
-            "Data will appear from tomorrow."
+            "📊 Данных за месяц пока нет.\n\n"
+            "ℹ️ История собирается ежедневно в 23:50 UTC. "
+            "Данные появятся завтра."
         )
     total_inc = sum(r["income"] for r in rows)
     total_exp = sum(r["expense"] for r in rows)
@@ -1150,41 +1150,41 @@ def fmt_monthly_economy() -> str:
     best_row = max(rows, key=lambda r: r["net"])
     worst_row = min(rows, key=lambda r: r["net"])
     return (
-        f"🏆 <b>MONTHLY FINANCIAL DIGEST</b>\n"
+        f"🏆 <b>ФИНАНСОВЫЙ ДАЙДЖЕСТ ЗА МЕСЯЦ</b>\n"
         f"📅 {datetime.now().strftime('%B %Y')}\n\n"
-        f"💰 Revenue: <b>+{total_inc:,.0f} v$</b>\n"
-        f"📉 Expenses: <b>-{total_exp:,.0f} v$</b>\n"
-        f"{_nem(net)} <b>Net: {net:+,.0f} v$</b>\n\n"
-        f"🌟 Best Day: <b>{best_row['day']}</b> (+{best_row['net']:,.0f} v$)\n"
-        f"⚠️ Worst Day: <b>{worst_row['day']}</b> ({worst_row['net']:+,.0f} v$)\n\n"
-        f"📊 Days with data: <b>{len(rows)}</b>"
+        f"💰 Доходы: <b>+{total_inc:,.0f} v$</b>\n"
+        f"📉 Расходы: <b>-{total_exp:,.0f} v$</b>\n"
+        f"{_nem(net)} <b>Баланс: {net:+,.0f} v$</b>\n\n"
+        f"🌟 Лучший день: <b>{best_row['day']}</b> (+{best_row['net']:,.0f} v$)\n"
+        f"⚠️ Худший день: <b>{worst_row['day']}</b> ({worst_row['net']:+,.0f} v$)\n\n"
+        f"📊 Дней с данными: <b>{len(rows)}</b>"
     )
 
 
 def fmt_active_flights() -> str:
     flights = fsa_active_flights()
     if not flights:
-        return "✈️ No airborne aircraft at this time."
+        return "✈️ В воздухе нет воздушных судов."
     lines = [
         f"✈️ <b>{f.get('number', 'N/A')}</b> "
         f"{f.get('departure', '???')} → {f.get('arrival', '???')} "
-        f"[{f.get('passengers', 0)} pax]"
+        f"[{f.get('passengers', 0)} пасс.]"
         for f in flights[:10]
     ]
-    return f"🛫 <b>AIRBORNE AIRCRAFT ({len(flights)})</b>\n\n" + "\n".join(lines)
+    return f"🛫 <b>В ВОЗДУХЕ СЕЙЧАС ({len(flights)})</b>\n\n" + "\n".join(lines)
 
 
 def fmt_va_info() -> str:
     data = fsa_airline_data()
     if not data:
-        return "📊 VA data unavailable."
+        return "📊 Данные авиакомпании недоступны."
     return (
-        f"🏢 <b>VA UP! INFO</b>\n\n"
-        f"📛 Name: <b>{data.get('name', 'N/A')}</b>\n"
-        f"💰 Budget: <b>{data.get('budget', 0):,.0f} v$</b>\n"
-        f"⭐ Reputation: <b>{data.get('reputation', 0)}</b>\n"
-        f"📍 Base: <b>{data.get('base', 'N/A')}</b>\n"
-        f"✈️ Code: <b>{data.get('code', 'N/A')}</b>"
+        f"🏢 <b>О КОМПАНИИ VA UP!</b>\n\n"
+        f"📛 Название: <b>{data.get('name', 'N/A')}</b>\n"
+        f"💰 Бюджет: <b>{data.get('budget', 0):,.0f} v$</b>\n"
+        f"⭐ Репутация: <b>{data.get('reputation', 0)}</b>\n"
+        f"📍 База: <b>{data.get('base', 'N/A')}</b>\n"
+        f"✈️ Код: <b>{data.get('code', 'N/A')}</b>"
     )
 
 
@@ -1656,20 +1656,20 @@ COMMANDS = {
 }
 
 HELP_TEXT = (
-    "<b>VA UP! Operations Panel</b>\n\n"
-    "📊 <b>Flight Operations:</b>\n"
-    "/stats — operations statistics\n"
-    "/last — latest flights\n"
-    "/top — top pilots (7 days)\n"
-    "/top_landing — best landings\n\n"
-    "🛫 <b>Pre-flight Tools:</b>\n"
-    "/runway ICAO — METAR и выбор рабочей полосы\n"
+    "<b>VA UP! Панель управления</b>\n\n"
+    "📊 <b>Операции:</b>\n"
+    "/stats — статистика операций\n"
+    "/last — последние рейсы\n"
+    "/top — топ пилоты (7 дней)\n"
+    "/top_landing — лучшие посадки\n\n"
+    "🛫 <b>Предполётная подготовка:</b>\n"
+    "/runway ICAO — METAR и рабочая полоса\n"
     "   Пример: /runway UHWW\n\n"
-    "💰 <b>Financial Operations:</b>\n"
-    "/economy — daily financial report\n"
-    "/monthly — monthly financial digest\n"
-    "/live — active flights\n"
-    "/va — VA information"
+    "💰 <b>Финансы:</b>\n"
+    "/economy — финансовый отчёт за день\n"
+    "/monthly — дайджест за месяц\n"
+    "/live — рейсы в воздухе\n"
+    "/va — информация о компании"
 )
 
 # Инициализируем маппинг после определения всех форматтеров
