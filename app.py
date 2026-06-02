@@ -1200,29 +1200,60 @@ def fmt_daily_economy() -> str:
 def fmt_monthly_economy() -> str:
     now = datetime.now()
     month_label = f"{MONTH_NAMES[now.month]} {now.year}"
+
+    # Форматирование знака без дублирования
+    def _fmt_net(v: int) -> str:
+        sign = "+" if v >= 0 else ""
+        return f"{sign}{v:,.0f} v$"
+
+    # Текущий баланс компании из FSAirlines
+    va_data = fsa_airline_data()
+    budget = va_data.get("budget", 0) if va_data else None
+
+    # Месячная динамика из БД (снимки 23:50 каждый день)
     rows = db_get_monthly_economy()
+
+    budget_line = (
+        f"💼 <b>Текущий баланс: {budget:,.0f} v$</b>\n"
+        if budget is not None else
+        f"💼 <b>Текущий баланс: недоступен</b>\n"
+    )
+
     if not rows:
         return (
-            f"📊 <b>ФИНАНСОВЫЙ ДАЙДЖЕСТ ЗА МЕСЯЦ</b>\n"
-            f"📅 {month_label}\n\n"
-            "Данных пока нет.\n"
+            f"🏆 <b>ФИНАНСОВЫЙ ДАЙДЖЕСТ ЗА МЕСЯЦ</b>\n"
+            f"📅 <i>{month_label}</i>\n\n"
+            f"{budget_line}\n"
+            "📊 Данных по транзакциям пока нет.\n"
             "ℹ️ История собирается ежедневно в 23:50 UTC."
         )
+
     total_inc = sum(r["income"] for r in rows)
     total_exp = sum(r["expense"] for r in rows)
-    net = total_inc - total_exp
-    best_row  = max(rows, key=lambda r: r["net"])
-    worst_row = min(rows, key=lambda r: r["net"])
-    return (
+    month_net = total_inc - total_exp
+
+    msg = (
         f"🏆 <b>ФИНАНСОВЫЙ ДАЙДЖЕСТ ЗА МЕСЯЦ</b>\n"
         f"📅 <i>{month_label}</i>\n\n"
+        f"{budget_line}"
+        f"\n"
+        f"📈 <b>Динамика за месяц:</b>\n"
         f"💰 Доходы: <b>+{total_inc:,.0f} v$</b>\n"
         f"📉 Расходы: <b>-{total_exp:,.0f} v$</b>\n"
-        f"{_nem(net)} <b>Баланс: {net:+,.0f} v$</b>\n\n"
-        f"🌟 Лучший день: <b>{best_row['day']}</b> (+{best_row['net']:,.0f} v$)\n"
-        f"⚠️ Худший день: <b>{worst_row['day']}</b> ({worst_row['net']:+,.0f} v$)\n\n"
+        f"{_nem(month_net)} Оборот: <b>{_fmt_net(month_net)}</b>\n\n"
         f"📊 Дней с данными: <b>{len(rows)}</b>"
     )
+
+    # Лучший/худший день только если данных больше одного дня
+    if len(rows) > 1:
+        best_row  = max(rows, key=lambda r: r["net"])
+        worst_row = min(rows, key=lambda r: r["net"])
+        msg += (
+            f"\n🌟 Лучший день: <b>{best_row['day']}</b> ({_fmt_net(best_row['net'])})\n"
+            f"⚠️ Худший день: <b>{worst_row['day']}</b> ({_fmt_net(worst_row['net'])})"
+        )
+
+    return msg
 
 
 def fmt_active_flights() -> str:
