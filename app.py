@@ -1963,6 +1963,13 @@ def init_scheduler():
         "cron", hour=23, minute=50,
         id="daily_economy_snapshot",
     )
+    # Финансовый отчёт за сутки — 23:00 МСК (20:00 UTC)
+    scheduler.add_job(
+        lambda: tg_send(fmt_daily_economy()),
+        "cron", hour=20, minute=0,
+        id="daily_economy_report",
+    )
+    # Статистика операций — 00:00 МСК (21:00 UTC)
     scheduler.add_job(
         lambda: tg_send(fmt_stats()),
         "cron", hour=21, minute=0,
