@@ -28,6 +28,9 @@ BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN", "")
 CHAT_ID    = os.environ.get("TG_CHAT_ID", "")
 FSA_KEY    = os.environ.get("FSA_API_KEY", "")
 FSA_VA_ID  = os.environ.get("FSA_VA_ID", "56177")
+# Второй API — Профсоюз пилотов FSAirlines (добавить ключ когда договоритесь)
+FSA_KEY2   = os.environ.get("FSA_API_KEY2", "")
+FSA_VA_ID2 = os.environ.get("FSA_VA_ID2", "")
 PORT       = int(os.environ.get("PORT", 10000))
 HOSTNAME   = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "fshub-bot.onrender.com")
 
@@ -303,17 +306,21 @@ def _init_db():
     db_execute(
         """
         CREATE TABLE IF NOT EXISTS operation_legs (
-            id          SERIAL PRIMARY KEY,
-            pilot_name  TEXT,
-            leg_num     INTEGER,
-            dep         TEXT,
-            arr         TEXT,
+            id           SERIAL PRIMARY KEY,
+            pilot_name   TEXT,
+            leg_num      INTEGER,
+            dep          TEXT,
+            arr          TEXT,
             landing_rate INTEGER,
-            points      INTEGER,
-            flight_id   TEXT,
-            report_url  TEXT,
-            attempt     INTEGER DEFAULT 1,
-            created_at  TIMESTAMPTZ DEFAULT NOW()
+            base_points  INTEGER DEFAULT 0,
+            coeff        NUMERIC(4,2) DEFAULT 1.0,
+            net_bonus    INTEGER DEFAULT 0,
+            points       INTEGER,
+            on_network   BOOLEAN DEFAULT FALSE,
+            flight_id    TEXT,
+            report_url   TEXT,
+            attempt      INTEGER DEFAULT 1,
+            created_at   TIMESTAMPTZ DEFAULT NOW()
         )
         """
     )
@@ -487,7 +494,59 @@ OPERATION_LEGS = [
     (13, "SGAS", "SBRJ",  810),
 ]
 OPERATION_LEG_MAP = {(dep, arr): (num, pts) for num, dep, arr, pts in OPERATION_LEGS}
+
+# Коэффициенты воздушных судов по ICAO-типу
+OPERATION_AIRCRAFT_COEFF: Dict[str, float] = {
+    "A310":  1.3,
+    "A318":  1.3,
+    "A319":  1.3,
+    "A320":  1.1,
+    "A321":  1.0,
+    "A330":  1.0,
+    "ATR72": 2.5,  # ATR-72
+    "AT72":  2.5,  # альтернативный ICAO код ATR-72
+    "B727":  2.0,
+    "B736":  1.1,
+    "B737":  1.1,
+    "B738":  1.0,
+    "B38M":  1.3,  # B738M
+    "B773":  1.0,
+    "CRJ7":  1.5,
+    "MD11":  1.1,
+}
+OPERATION_VATSIM_BONUS = 50   # очков за полёт в VATSIM или IVAO
+
+# Максимум очков без коэффициентов
 OPERATION_MAX_POINTS = sum(pts for _, _, _, pts in OPERATION_LEGS)  # 13360
+
+
+def op_get_aircraft_coeff(aircraft_icao: str) -> float:
+    """Возвращает коэффициент ВС по ICAO-типу. По умолчанию 1.0."""
+    if not aircraft_icao:
+        return 1.0
+    # Нормализуем: убираем пробелы, приводим к верхнему регистру
+    key = aircraft_icao.upper().strip()
+    # Прямое совпадение
+    if key in OPERATION_AIRCRAFT_COEFF:
+        return OPERATION_AIRCRAFT_COEFF[key]
+    # Частичное совпадение (например "Boeing 737-800" → B738)
+    for icao_key, coeff in OPERATION_AIRCRAFT_COEFF.items():
+        if icao_key in key:
+            return coeff
+    return 1.0
+
+
+def op_calc_points(base_pts: int, aircraft_icao: str, on_network: bool) -> tuple:
+    """
+    Рассчитывает итоговые очки за лег.
+    Формула: round(base_pts × коэффициент_ВС) + бонус_сети
+    Возвращает (итого, коэффициент, бонус_сети)
+    """
+    coeff       = op_get_aircraft_coeff(aircraft_icao)
+    base_calc   = round(base_pts * coeff)
+    net_bonus   = OPERATION_VATSIM_BONUS if on_network else 0
+    total       = base_calc + net_bonus
+    return total, coeff, net_bonus
 
 
 def operation_is_active() -> bool:
@@ -530,9 +589,10 @@ def db_op_register_pilot(pilot_name: str, aircraft: str = "") -> bool:
 def db_op_add_leg(
     pilot_name: str, leg_num: int, dep: str, arr: str,
     landing_rate: int, points: int, flight_id: str, report_url: str,
+    base_points: int = 0, coeff: float = 1.0,
+    net_bonus: int = 0, on_network: bool = False,
 ) -> None:
     """Записывает выполненный этап."""
-    # Считаем номер попытки для этого лега
     attempt_row = db_execute(
         "SELECT COUNT(*) as cnt FROM operation_legs WHERE pilot_name=%s AND leg_num=%s",
         (pilot_name, leg_num), fetch="one",
@@ -541,10 +601,14 @@ def db_op_add_leg(
     db_execute(
         """
         INSERT INTO operation_legs
-            (pilot_name, leg_num, dep, arr, landing_rate, points, flight_id, report_url, attempt)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            (pilot_name, leg_num, dep, arr, landing_rate,
+             base_points, coeff, net_bonus, points, on_network,
+             flight_id, report_url, attempt)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
-        (pilot_name, leg_num, dep, arr, landing_rate, points, flight_id, report_url, attempt),
+        (pilot_name, leg_num, dep, arr, landing_rate,
+         base_points, coeff, net_bonus, points, on_network,
+         flight_id, report_url, attempt),
     )
 
 
@@ -583,6 +647,47 @@ def db_op_reset_pilot(pilot_name: str) -> None:
         """,
         (pilot_name,),
     )
+
+
+def db_op_check_daily_limit(pilot_name: str) -> tuple:
+    """
+    Проверяет лимит 2 лега в 24 часа.
+    Правило: если у пилота уже есть 2+ успешных лега (points > 0),
+    смотрим время второго последнего — если прошло < 24ч, запрещаем.
+
+    Возвращает (allowed: bool, wait_seconds: int, legs_today: int)
+    """
+    # Берём последние успешные леги (points > 0) за последние 24 часа
+    rows = db_execute(
+        """
+        SELECT created_at FROM operation_legs
+        WHERE pilot_name = %s
+          AND points > 0
+          AND created_at >= NOW() - INTERVAL '24 hours'
+        ORDER BY created_at ASC
+        """,
+        (pilot_name,), fetch="all",
+    ) or []
+
+    count = len(rows)
+
+    if count < 2:
+        # Меньше двух легов за последние 24ч — разрешаем
+        return True, 0, count
+
+    # Есть 2+ лега за последние 24ч — смотрим время второго
+    second_leg_time = rows[1]["created_at"]
+    if isinstance(second_leg_time, str):
+        second_leg_time = datetime.fromisoformat(second_leg_time)
+
+    # Когда истечёт блокировка
+    unlock_time = second_leg_time.replace(tzinfo=None) + timedelta(hours=24)
+    now_utc     = datetime.utcnow()
+    wait_sec    = int((unlock_time - now_utc).total_seconds())
+
+    if wait_sec > 0:
+        return False, wait_sec, count
+    return True, 0, count
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -856,14 +961,17 @@ def handle_callback_query(cq: Dict) -> None:
 # FSA API
 # ═══════════════════════════════════════════════════════════════
 
-def fsa_call(function: str, extra: Optional[Dict] = None):
-    if not FSA_KEY:
+def fsa_call(function: str, extra: Optional[Dict] = None, key: str = "", va_id: str = ""):
+    """Вызов FSAirlines API. Использует UP! по умолчанию."""
+    api_key   = key   or FSA_KEY
+    api_va_id = va_id or FSA_VA_ID
+    if not api_key:
         return None
     params = {
         "function": function,
-        "va_id": FSA_VA_ID,
-        "apikey": FSA_KEY,
-        "format": "json",
+        "va_id":    api_va_id,
+        "apikey":   api_key,
+        "format":   "json",
     }
     if extra:
         params.update(extra)
@@ -878,6 +986,13 @@ def fsa_call(function: str, extra: Optional[Dict] = None):
     except Exception as e:
         logger.exception(f"FSA error: {e}")
         return None
+
+
+def fsa_call2(function: str, extra: Optional[Dict] = None):
+    """Вызов FSAirlines API Профсоюза (второй ключ)."""
+    if not FSA_KEY2 or not FSA_VA_ID2:
+        return None
+    return fsa_call(function, extra, key=FSA_KEY2, va_id=FSA_VA_ID2)
 
 
 def _safe_ts(ts) -> Optional[datetime]:
@@ -947,11 +1062,30 @@ def fsa_refresh_pilot_cache() -> None:
     logger.info(f"FSA pilot cache refreshed: {len(_fsa_pilot_cache)} pilots")
 
 
+def fsa_refresh_pilot_cache2() -> None:
+    """Загружает список пилотов Профсоюза FSAirlines в кэш."""
+    if not FSA_KEY2 or not FSA_VA_ID2:
+        return
+    data = fsa_call2("getPilotList")
+    if not isinstance(data, list):
+        return
+    with _fsa_pilot_cache_lock:
+        for p in data:
+            full_name = f"{p.get('name', '')} {p.get('surname', '')}".strip()
+            if full_name and p.get("id") and full_name not in _fsa_pilot_cache:
+                _fsa_pilot_cache[full_name] = int(p["id"])
+    logger.info(f"FSA2 pilot cache merged: total {len(_fsa_pilot_cache)} pilots")
+
+
 def fsa_get_pilot_id(name: str) -> Optional[int]:
-    """Возвращает pilot_id FSAirlines по полному имени пилота."""
-    # Обновляем кэш если он пустой или старше 1 часа
+    """
+    Возвращает pilot_id FSAirlines по полному имени.
+    Сначала ищет в UP!, затем в Профсоюзе.
+    """
     if not _fsa_pilot_cache or (time.time() - _fsa_pilot_cache_ts) > 3600:
         fsa_refresh_pilot_cache()
+        if FSA_KEY2 and FSA_VA_ID2:
+            fsa_refresh_pilot_cache2()
     with _fsa_pilot_cache_lock:
         return _fsa_pilot_cache.get(name)
 
@@ -1977,59 +2111,112 @@ def handle_completed(data: Dict):
             if pilot and pilot["status"] == "active":
                 report_url_op = f"https://fshub.io/flight/{report_id}/report" if report_id else ""
 
-                if rate <= -OPERATION_HARD_CRASH:
-                    # Крушение — полный сброс
-                    db_op_add_leg(pilot_name, leg_num, dep, arr, rate, 0, report_id or "", report_url_op)
-                    db_op_reset_pilot(pilot_name)
+                # ── Проверка лимита 2 лега в 24 часа ────────────────
+                allowed, wait_sec, legs_recent = db_op_check_daily_limit(pilot_name)
+                if not allowed:
+                    hours_left = wait_sec // 3600
+                    mins_left  = (wait_sec % 3600) // 60
                     tg_send(
-                        f"💥 <b>КРУШЕНИЕ — ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
+                        f"⏳ <b>ЛИМИТ ЛЕГОВ — ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
                         f"👨‍✈️ <b>{pilot_name}</b>\n"
-                        f"✈️ Leg {leg_num}: {dep} → {arr}\n"
-                        f"📊 Посадка: <b>{rate} fpm</b>\n\n"
-                        f"⚠️ Борт утерян. Весь прогресс сброшен.\n"
-                        f"Пилот начинает с Leg 1."
+                        f"✈️ Leg {leg_num}: {dep} → {arr}\n\n"
+                        f"❌ За последние 24 часа уже выполнено <b>{legs_recent} лега</b>.\n"
+                        f"⏱ Следующий лег доступен через: "
+                        f"<b>{hours_left}ч {mins_left}мин</b>"
                     )
-                elif rate <= -OPERATION_FAIL_RATE:
-                    # Жёсткая посадка — этап провален, 0 очков
-                    db_op_add_leg(pilot_name, leg_num, dep, arr, rate, 0, report_id or "", report_url_op)
-                    tg_send(
-                        f"🔴 <b>ЭТАП ПРОВАЛЕН — ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
-                        f"👨‍✈️ <b>{pilot_name}</b>\n"
-                        f"✈️ Leg {leg_num}: {dep} → {arr}\n"
-                        f"📊 Посадка: <b>{rate} fpm</b> — слишком жёстко!\n\n"
-                        f"❌ Очки не начислены. Повторите Leg {leg_num}."
+                    logger.info(
+                        f"[Operation] {pilot_name} leg={leg_num} — лимит превышен, "
+                        f"ждать {hours_left}ч {mins_left}мин"
                     )
+                    # Лег не засчитывается — выходим из блока
                 else:
-                    # Успешная посадка
-                    next_leg = leg_num + 1
-                    is_finished = next_leg > len(OPERATION_LEGS)
-                    new_status  = "finished" if is_finished else "active"
-                    new_points  = pilot["total_points"] + leg_pts
-                    db_op_add_leg(pilot_name, leg_num, dep, arr, rate, leg_pts, report_id or "", report_url_op)
-                    db_op_update_pilot(pilot_name, next_leg if not is_finished else leg_num, new_points, new_status)
+                    # Определяем тип ВС для коэффициента
+                    aircraft_icao_type = (
+                        d.get("aircraft") or {}
+                    ).get("icao") or aircraft.get("icao_name", "")
 
-                    if is_finished:
+                    # Проверяем полёт в сети VATSIM/IVAO
+                    user_handles = user.get("handles") or {}
+                    on_network   = bool(user_handles.get("vatsim") or user_handles.get("ivao"))
+
+                    if rate <= -OPERATION_HARD_CRASH:
+                        # Крушение — полный сброс
+                        db_op_add_leg(
+                            pilot_name, leg_num, dep, arr, rate,
+                            0, report_id or "", report_url_op,
+                        )
+                        db_op_reset_pilot(pilot_name)
                         tg_send(
-                            f"🏁 <b>ФИНИШ! ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
-                            f"👨‍✈️ <b>{pilot_name}</b> завершил маршрут!\n"
-                            f"✈️ Последний этап: {dep} → {arr}\n"
-                            f"📊 Посадка: <b>{rate} fpm</b>\n"
-                            f"⭐ Итого очков: <b>{new_points:,}</b>\n\n"
-                            f"🎉 Борт успешно перегнан в SBRJ!"
+                            f"💥 <b>КРУШЕНИЕ — ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
+                            f"👨‍✈️ <b>{pilot_name}</b>\n"
+                            f"✈️ Leg {leg_num}: {dep} → {arr}\n"
+                            f"📊 Посадка: <b>{rate} fpm</b>\n\n"
+                            f"⚠️ Борт утерян. Весь прогресс сброшен.\n"
+                            f"Пилот начинает с Leg 1."
+                        )
+                    elif rate <= -OPERATION_FAIL_RATE:
+                        # Жёсткая посадка — этап провален, 0 очков
+                        db_op_add_leg(
+                            pilot_name, leg_num, dep, arr, rate,
+                            0, report_id or "", report_url_op,
+                        )
+                        tg_send(
+                            f"🔴 <b>ЭТАП ПРОВАЛЕН — ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
+                            f"👨‍✈️ <b>{pilot_name}</b>\n"
+                            f"✈️ Leg {leg_num}: {dep} → {arr}\n"
+                            f"📊 Посадка: <b>{rate} fpm</b> — слишком жёстко!\n\n"
+                            f"❌ Очки не начислены. Повторите Leg {leg_num}."
                         )
                     else:
-                        next_info = next(
-                            (f"{d}→{a}" for n, d, a, _ in OPERATION_LEGS if n == next_leg), ""
+                        # Успешная посадка — рассчитываем очки
+                        earned, coeff, net_bonus = op_calc_points(leg_pts, aircraft_icao_type, on_network)
+                        next_leg    = leg_num + 1
+                        is_finished = next_leg > len(OPERATION_LEGS)
+                        new_status  = "finished" if is_finished else "active"
+                        new_points  = pilot["total_points"] + earned
+    
+                        db_op_add_leg(
+                            pilot_name, leg_num, dep, arr, rate,
+                            earned, report_id or "", report_url_op,
+                            base_points=leg_pts, coeff=coeff,
+                            net_bonus=net_bonus, on_network=on_network,
                         )
-                        tg_send(
-                            f"✅ <b>LEG {leg_num} ВЫПОЛНЕН — «{OPERATION_NAME}»</b>\n\n"
-                            f"👨‍✈️ <b>{pilot_name}</b>\n"
-                            f"✈️ {dep} → {arr}\n"
-                            f"📊 Посадка: <b>{rate} fpm</b>\n"
-                            f"⭐ +{leg_pts} очков | Итого: <b>{new_points:,}</b>\n\n"
-                            f"➡️ Следующий: Leg {next_leg} {next_info}"
+                        db_op_update_pilot(
+                            pilot_name,
+                            next_leg if not is_finished else leg_num,
+                            new_points, new_status,
                         )
-                logger.info(f"[Operation] {pilot_name} leg={leg_num} rate={rate} pts={leg_pts}")
+    
+                        # Строка с деталями начисления
+                        coeff_str  = f"×{coeff}" if coeff != 1.0 else ""
+                        bonus_str  = f" +{net_bonus} (VATSIM/IVAO)" if net_bonus else ""
+                        detail_str = f"{leg_pts}{coeff_str}{bonus_str} = <b>{earned}</b>"
+    
+                        if is_finished:
+                            tg_send(
+                                f"🏁 <b>ФИНИШ! ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
+                                f"👨‍✈️ <b>{pilot_name}</b> завершил маршрут!\n"
+                                f"✈️ Последний этап: {dep} → {arr}\n"
+                                f"📊 Посадка: <b>{rate} fpm</b>\n"
+                                f"⭐ Очки: {detail_str} | Итого: <b>{new_points:,}</b>\n\n"
+                                f"🎉 Борт успешно перегнан в SBRJ!"
+                            )
+                        else:
+                            next_info = next(
+                                (f"{d2}→{a2}" for n2, d2, a2, _ in OPERATION_LEGS if n2 == next_leg), ""
+                            )
+                            tg_send(
+                                f"✅ <b>LEG {leg_num} ВЫПОЛНЕН — «{OPERATION_NAME}»</b>\n\n"
+                                f"👨‍✈️ <b>{pilot_name}</b>\n"
+                                f"✈️ {dep} → {arr}\n"
+                                f"📊 Посадка: <b>{rate} fpm</b>\n"
+                                f"⭐ Очки: {detail_str} | Итого: <b>{new_points:,}</b>\n\n"
+                                f"➡️ Следующий: Leg {next_leg} {next_info}"
+                            )
+                    logger.info(
+                        f"[Operation] {pilot_name} leg={leg_num} rate={rate} "
+                        f"aircraft={aircraft_icao_type} network={on_network} pts={earned if rate > -OPERATION_FAIL_RATE else 0}"
+                    )
 
     # ─── Проверка конкурса Мастер Посадки ───────────────────────
     if is_contest_landing(rate):
