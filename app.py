@@ -325,6 +325,34 @@ def db_add_flight(
     )
 
 
+def db_update_flight_route(flight_id: str, flight_no: str, departure: str, arrival: str) -> None:
+    """Обновляет маршрут рейса в БД после обогащения из FSAirlines."""
+    if not flight_id:
+        return
+    db_execute(
+        """
+        UPDATE flights
+        SET flight_no  = %s,
+            departure  = %s,
+            arrival    = %s
+        WHERE flight_id = %s
+          AND (flight_no = 'N/A' OR departure = '????' OR arrival = '????')
+        """,
+        (flight_no, departure, arrival, flight_id),
+    )
+    db_execute(
+        """
+        UPDATE contest_entries
+        SET flight_no  = %s,
+            departure  = %s,
+            arrival    = %s
+        WHERE flight_id = %s
+          AND (flight_no = 'N/A' OR departure = '????' OR arrival = '????')
+        """,
+        (flight_no, departure, arrival, flight_id),
+    )
+
+
 def db_last_flights(limit: int = 5) -> List:
     return db_execute(
         "SELECT * FROM flights ORDER BY id DESC LIMIT %s",
@@ -339,9 +367,26 @@ def db_all_flights() -> List:
     ) or []
 
 
-def db_top_landings(limit: int = 10) -> List:
+def db_flights_this_month() -> List:
+    """Рейсы за текущий календарный месяц."""
     return db_execute(
-        "SELECT * FROM flights ORDER BY ABS(landing_rate) ASC LIMIT %s",
+        """
+        SELECT * FROM flights
+        WHERE DATE_TRUNC('month', created_at) = DATE_TRUNC('month', NOW())
+        ORDER BY id DESC
+        """,
+        fetch="all",
+    ) or []
+
+
+def db_top_landings(limit: int = 10) -> List:
+    """Топ посадок за текущий календарный месяц."""
+    return db_execute(
+        """
+        SELECT * FROM flights
+        WHERE DATE_TRUNC('month', created_at) = DATE_TRUNC('month', NOW())
+        ORDER BY ABS(landing_rate) ASC LIMIT %s
+        """,
         (limit,), fetch="all",
     ) or []
 
@@ -366,13 +411,14 @@ def db_save_daily_economy(day: str, income: int, expense: int, detail: Dict):
 
 
 def db_get_monthly_economy(days: int = 30) -> List:
+    """Финансовые данные за текущий календарный месяц."""
     return db_execute(
         """
         SELECT * FROM daily_economy
-        WHERE day >= CURRENT_DATE - (%s * INTERVAL '1 day')
+        WHERE DATE_TRUNC('month', day) = DATE_TRUNC('month', CURRENT_DATE)
         ORDER BY day ASC
         """,
-        (days,), fetch="all",
+        fetch="all",
     ) or []
 
 
@@ -892,6 +938,7 @@ def _enrich_completed_from_fsa(
     flight_link: str,
     arrival_time: str,
     delay: int = 60,
+    flight_id_for_db: Optional[str] = None,
 ) -> None:
     """
     Запускается в отдельном треде через delay секунд после посадки.
@@ -910,6 +957,11 @@ def _enrich_completed_from_fsa(
             arr       = report.get("arr", "????") or "????"
             flight_no = report.get("number", "N/A") or "N/A"
             logger.info(f"[Enrich arrival] Найден маршрут FSA: {dep}→{arr} {flight_no}")
+
+            # Обновляем БД если получили валидные данные
+            if _is_valid_icao(dep) and _is_valid_icao(arr) and flight_id_for_db:
+                db_update_flight_route(flight_id_for_db, flight_no, dep, arr)
+                logger.info(f"[Enrich arrival] БД обновлена для flight_id={flight_id_for_db}")
         else:
             logger.warning(f"[Enrich arrival] Отчёт FSA не найден для пилота {pilot_id}")
     else:
@@ -1029,13 +1081,16 @@ def landing_rating(rate: int) -> Tuple[str, str]:
 # ═══════════════════════════════════════════════════════════════
 
 def fmt_stats() -> str:
-    flights = db_all_flights()
+    now = datetime.now()
+    month_label = f"{MONTH_NAMES[now.month]} {now.year}"
+    flights = db_flights_this_month()
     if not flights:
-        return "📊 <b>Данных о рейсах пока нет.</b>"
+        return f"📊 <b>ОПЕРАЦИИ VA UP!</b>\n📅 {month_label}\n\nРейсов пока нет."
     rates = [f["landing_rate"] for f in flights]
     avg = round(sum(rates) / len(rates))
     return (
-        f"📊 <b>ОПЕРАЦИИ VA UP!</b>\n\n"
+        f"📊 <b>ОПЕРАЦИИ VA UP!</b>\n"
+        f"📅 <i>{month_label}</i>\n\n"
         f"🛬 Рейсов выполнено: <b>{len(flights)}</b>\n"
         f"📐 Средняя посадка: <b>{avg} fpm</b>"
     )
@@ -1058,15 +1113,21 @@ def fmt_last(limit: int = 5) -> str:
 
 
 def fmt_top_landings(limit: int = 10) -> str:
+    now = datetime.now()
+    month_label = f"{MONTH_NAMES[now.month]} {now.year}"
     rows = db_top_landings(limit)
     if not rows:
-        return "🏆 Данных о посадках пока нет."
+        return f"🏆 <b>ЛУЧШИЕ ПОСАДКИ</b>\n📅 {month_label}\n\nПосадок пока нет."
     medals = ["🥇", "🥈", "🥉"]
     lines = []
     for i, row in enumerate(rows, 1):
         prefix = medals[i - 1] if i <= 3 else f"{i}."
         lines.append(f"{prefix} <b>{row['pilot']}</b> — {row['landing_rate']} fpm")
-    return "🏆 <b>ЛУЧШИЕ ПОСАДКИ</b>\n\n" + "\n".join(lines)
+    return (
+        f"🏆 <b>ЛУЧШИЕ ПОСАДКИ</b>\n"
+        f"📅 <i>{month_label}</i>\n\n"
+        + "\n".join(lines)
+    )
 
 
 def fmt_top_pilots() -> str:
@@ -1137,21 +1198,24 @@ def fmt_daily_economy() -> str:
 
 
 def fmt_monthly_economy() -> str:
-    rows = db_get_monthly_economy(days=30)
+    now = datetime.now()
+    month_label = f"{MONTH_NAMES[now.month]} {now.year}"
+    rows = db_get_monthly_economy()
     if not rows:
         return (
-            "📊 Данных за месяц пока нет.\n\n"
-            "ℹ️ История собирается ежедневно в 23:50 UTC. "
-            "Данные появятся завтра."
+            f"📊 <b>ФИНАНСОВЫЙ ДАЙДЖЕСТ ЗА МЕСЯЦ</b>\n"
+            f"📅 {month_label}\n\n"
+            "Данных пока нет.\n"
+            "ℹ️ История собирается ежедневно в 23:50 UTC."
         )
     total_inc = sum(r["income"] for r in rows)
     total_exp = sum(r["expense"] for r in rows)
     net = total_inc - total_exp
-    best_row = max(rows, key=lambda r: r["net"])
+    best_row  = max(rows, key=lambda r: r["net"])
     worst_row = min(rows, key=lambda r: r["net"])
     return (
         f"🏆 <b>ФИНАНСОВЫЙ ДАЙДЖЕСТ ЗА МЕСЯЦ</b>\n"
-        f"📅 {datetime.now().strftime('%B %Y')}\n\n"
+        f"📅 <i>{month_label}</i>\n\n"
         f"💰 Доходы: <b>+{total_inc:,.0f} v$</b>\n"
         f"📉 Расходы: <b>-{total_exp:,.0f} v$</b>\n"
         f"{_nem(net)} <b>Баланс: {net:+,.0f} v$</b>\n\n"
@@ -1511,6 +1575,7 @@ def handle_completed(data: Dict):
                                 airport_name, rate, rating, emoji,
                                 extras, flight_link, arrival_time, 900,  # 15 минут
                             ),
+                            kwargs={"flight_id_for_db": report_id or None},
                             daemon=True,
                         ).start()
             else:
@@ -1528,6 +1593,10 @@ def handle_completed(data: Dict):
                     f"{flight_link}"
                 )
                 tg_send(final_msg)
+                # Обновляем БД если данные из кэша валидные
+                if _is_valid_icao(cached_dep) and _is_valid_icao(cached_arr) and report_id:
+                    db_update_flight_route(report_id, cached_fno, cached_dep, cached_arr)
+                    logger.info(f"[Completed] БД обновлена из кэша для flight_id={report_id}")
                 # Очищаем кэш после использования
                 with _departure_cache_lock:
                     _departure_cache.pop(pilot_name, None)
@@ -1554,6 +1623,7 @@ def handle_completed(data: Dict):
                             airport_name, rate, rating, emoji,
                             extras, flight_link, arrival_time, FSA_ENRICH_ARRIVAL_DELAY,
                         ),
+                        kwargs={"flight_id_for_db": report_id or None},
                         daemon=True,
                     ).start()
             else:
