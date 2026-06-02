@@ -1103,12 +1103,30 @@ def fmt_last(limit: int = 5) -> str:
     lines = []
     for f in flights:
         rating, emoji = landing_rating(f["landing_rate"])
-        lines.append(
-            f"{emoji} <b>{f['flight_no']}</b>\n"
-            f"👨‍✈️ {f['pilot']}\n"
-            f"🗺 {f['departure']} → {f['arrival']}\n"
-            f"📊 {f['landing_rate']} fpm"
+        dep = f["departure"] or "????"
+        arr = f["arrival"]   or "????"
+        fno = f["flight_no"] or "N/A"
+
+        no_plan = (
+            fno in ("N/A", "", "None") or
+            dep in ("????", "", "None") or
+            arr in ("????", "", "None")
         )
+
+        if no_plan:
+            # Маршрут неизвестен — не показываем ???? мусор
+            lines.append(
+                f"{emoji} <b>{f['pilot']}</b>\n"
+                f"✈️ {f['aircraft'] or 'N/A'}\n"
+                f"📊 {f['landing_rate']} fpm — <i>план не подан в RLM</i>"
+            )
+        else:
+            lines.append(
+                f"{emoji} <b>{fno}</b>\n"
+                f"👨‍✈️ {f['pilot']}\n"
+                f"🗺 {dep} → {arr}\n"
+                f"📊 {f['landing_rate']} fpm"
+            )
     return "✈️ <b>ПОСЛЕДНИЕ РЕЙСЫ</b>\n\n" + "\n\n".join(lines)
 
 
@@ -1165,6 +1183,7 @@ def fmt_daily_economy() -> str:
         detail = row["detail"] or {}
         inc_cat = detail.get("inc_cat", {})
         exp_cat = detail.get("exp_cat", {})
+        internal = detail.get("internal_volume", 0)
     else:
         txs = fsa_daily_transactions()
         if not txs:
@@ -1172,17 +1191,28 @@ def fmt_daily_economy() -> str:
         ag = _aggregate(txs)
         inc, exp, net = ag["inc"], ag["exp"], ag["net"]
         inc_cat, exp_cat = ag["inc_cat"], ag["exp_cat"]
+        internal = ag.get("internal_volume", 0)
 
-    internal = (row.get("detail") or {}).get("internal_volume", 0) if row else 0
-    if not row:
-        internal = ag.get("internal_volume", 0) if "ag" in dir() else 0
+    # Текущий баланс компании из FSAirlines
+    va_data = fsa_airline_data()
+    budget = va_data.get("budget") if va_data else None
 
     em = _nem(net)
+    sign = "+" if net >= 0 else ""
+
+    budget_line = (
+        f"💼 <b>Баланс компании: {budget:,.0f} v$</b>\n"
+        if budget is not None else ""
+    )
+
     msg = (
         f"📊 <b>ФИНАНСОВЫЙ ОТЧЁТ ЗА СЕГОДНЯ</b>\n\n"
+        f"{budget_line}"
+        f"\n"
+        f"📈 <b>Оборот за сутки:</b>\n"
         f"💰 Доходы: <b>+{inc:,.0f} v$</b>\n"
         f"📉 Расходы: <b>-{exp:,.0f} v$</b>\n"
-        f"{em} <b>Баланс: {net:+,.0f} v$</b>\n"
+        f"{em} Итог: <b>{sign}{net:,.0f} v$</b>\n"
     )
     if internal:
         msg += f"↔️ <i>Внутр. переводы: {internal:,.0f} v$ (не учитываются)</i>\n"
