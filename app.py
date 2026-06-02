@@ -34,6 +34,7 @@ HOSTNAME   = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "fshub-bot.onrender.com"
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 MAX_DB_FLIGHTS = int(os.environ.get("MAX_DB_FLIGHTS", "5000"))
 DATABASE_URL   = os.environ.get("DATABASE_URL", "")
+ADMIN_ID       = os.environ.get("ADMIN_TG_ID", "44859840")  # Telegram ID администратора
 
 FSA_URL = "https://www.fsairlines.net/va_interface2.php"
 TG_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -286,6 +287,36 @@ def _init_db():
         )
         """
     )
+    db_execute(
+        """
+        CREATE TABLE IF NOT EXISTS operation_pilots (
+            id            SERIAL PRIMARY KEY,
+            pilot_name    TEXT UNIQUE,
+            aircraft      TEXT DEFAULT '',
+            current_leg   INTEGER DEFAULT 1,
+            total_points  INTEGER DEFAULT 0,
+            status        TEXT DEFAULT 'active',
+            registered_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """
+    )
+    db_execute(
+        """
+        CREATE TABLE IF NOT EXISTS operation_legs (
+            id          SERIAL PRIMARY KEY,
+            pilot_name  TEXT,
+            leg_num     INTEGER,
+            dep         TEXT,
+            arr         TEXT,
+            landing_rate INTEGER,
+            points      INTEGER,
+            flight_id   TEXT,
+            report_url  TEXT,
+            attempt     INTEGER DEFAULT 1,
+            created_at  TIMESTAMPTZ DEFAULT NOW()
+        )
+        """
+    )
     logger.info("Database tables ready")
 
 
@@ -426,6 +457,131 @@ def db_get_today_economy() -> Optional[Dict]:
     return db_execute(
         "SELECT * FROM daily_economy WHERE day = CURRENT_DATE",
         fetch="one",
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# OPERATION "ТИХИЙ ВЖУХ" — ДАННЫЕ
+# ═══════════════════════════════════════════════════════════════
+
+OPERATION_NAME       = "Тихий Вжух"
+OPERATION_START      = "2026-06-10"
+OPERATION_END        = "2026-08-31"
+OPERATION_HARD_CRASH = 1200   # fpm — борт утерян, полный сброс
+OPERATION_FAIL_RATE  = 600    # fpm — этап провален, 0 очков
+
+# 13 этапов: (dep, arr, очки за успешную посадку)
+OPERATION_LEGS = [
+    (1,  "VTBS", "VVPQ",  290),
+    (2,  "VVPQ", "RPVP",  880),
+    (3,  "RPVP", "WAMM",  620),
+    (4,  "WAMM", "WAJJ",  970),
+    (5,  "WAJJ", "NWWW", 1900),
+    (6,  "NWWW", "NFFN",  690),
+    (7,  "NFFN", "NSFA",  670),
+    (8,  "NSFA", "NTAA", 1350),
+    (9,  "NTAA", "NTGJ",  970),
+    (10, "NTGJ", "SCIP", 1430),
+    (11, "SCIP", "SCFA", 2160),
+    (12, "SCFA", "SGAS",  780),
+    (13, "SGAS", "SBRJ",  810),
+]
+OPERATION_LEG_MAP = {(dep, arr): (num, pts) for num, dep, arr, pts in OPERATION_LEGS}
+OPERATION_MAX_POINTS = sum(pts for _, _, _, pts in OPERATION_LEGS)  # 13360
+
+
+def operation_is_active() -> bool:
+    """Проверяет, активен ли ивент сейчас."""
+    today = datetime.now().date()
+    try:
+        start = datetime.strptime(OPERATION_START, "%Y-%m-%d").date()
+        end   = datetime.strptime(OPERATION_END,   "%Y-%m-%d").date()
+        return start <= today <= end
+    except Exception:
+        return False
+
+
+def db_op_get_pilot(pilot_name: str) -> Optional[Dict]:
+    return db_execute(
+        "SELECT * FROM operation_pilots WHERE pilot_name = %s",
+        (pilot_name,), fetch="one",
+    )
+
+
+def db_op_all_pilots() -> List:
+    return db_execute(
+        "SELECT * FROM operation_pilots ORDER BY total_points DESC",
+        fetch="all",
+    ) or []
+
+
+def db_op_register_pilot(pilot_name: str, aircraft: str = "") -> bool:
+    """Регистрирует пилота. Возвращает True если новый."""
+    existing = db_op_get_pilot(pilot_name)
+    if existing:
+        return False
+    db_execute(
+        "INSERT INTO operation_pilots (pilot_name, aircraft) VALUES (%s, %s)",
+        (pilot_name, aircraft),
+    )
+    return True
+
+
+def db_op_add_leg(
+    pilot_name: str, leg_num: int, dep: str, arr: str,
+    landing_rate: int, points: int, flight_id: str, report_url: str,
+) -> None:
+    """Записывает выполненный этап."""
+    # Считаем номер попытки для этого лега
+    attempt_row = db_execute(
+        "SELECT COUNT(*) as cnt FROM operation_legs WHERE pilot_name=%s AND leg_num=%s",
+        (pilot_name, leg_num), fetch="one",
+    )
+    attempt = (attempt_row["cnt"] + 1) if attempt_row else 1
+    db_execute(
+        """
+        INSERT INTO operation_legs
+            (pilot_name, leg_num, dep, arr, landing_rate, points, flight_id, report_url, attempt)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (pilot_name, leg_num, dep, arr, landing_rate, points, flight_id, report_url, attempt),
+    )
+
+
+def db_op_update_pilot(
+    pilot_name: str, current_leg: int, total_points: int, status: str = "active"
+) -> None:
+    db_execute(
+        """
+        UPDATE operation_pilots
+        SET current_leg = %s, total_points = %s, status = %s
+        WHERE pilot_name = %s
+        """,
+        (current_leg, total_points, status, pilot_name),
+    )
+
+
+def db_op_admin_set(pilot_name: str, leg_num: int, points_delta: int) -> None:
+    """Ручная корректировка очков администратором."""
+    pilot = db_op_get_pilot(pilot_name)
+    if not pilot:
+        return
+    new_points = max(0, pilot["total_points"] + points_delta)
+    db_execute(
+        "UPDATE operation_pilots SET total_points = %s WHERE pilot_name = %s",
+        (new_points, pilot_name),
+    )
+
+
+def db_op_reset_pilot(pilot_name: str) -> None:
+    """Полный сброс прогресса пилота (потеря борта)."""
+    db_execute(
+        """
+        UPDATE operation_pilots
+        SET current_leg = 1, total_points = 0, status = 'active'
+        WHERE pilot_name = %s
+        """,
+        (pilot_name,),
     )
 
 
@@ -635,6 +791,9 @@ def tg_send_menu(chat_id) -> bool:
                         [
                             {"text": "🛫 Полосы (Runway)", "callback_data": "cmd_runway"},
                             {"text": "🎯 Мастер Посадки",  "callback_data": "cmd_contest"},
+                        ],
+                        [
+                            {"text": "✈️ Операция «Тихий Вжух»", "callback_data": "cmd_operation"},
                         ],
                     ]
                 },
@@ -1402,6 +1561,107 @@ def fmt_contest(month: Optional[str] = None) -> str:
     return header + "\n\n".join(blocks) + footer
 
 
+def fmt_operation() -> str:
+    """Таблица лидеров и прогресс участников ивента."""
+    pilots = db_op_all_pilots()
+    total_legs = len(OPERATION_LEGS)
+    max_pts    = OPERATION_MAX_POINTS
+
+    header = (
+        f"✈️ <b>ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n"
+        f"<i>VTBS → SBRJ • 13 этапов • {OPERATION_START} – {OPERATION_END}</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+    )
+
+    if not pilots:
+        return header + "Участников пока нет."
+
+    lines = []
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    for i, p in enumerate(pilots, 1):
+        prefix  = medals.get(i, f"{i}.")
+        status  = "✅" if p["status"] == "finished" else ("💀" if p["status"] == "lost" else "🛫")
+        leg_str = f"Leg {p['current_leg']}/{total_legs}"
+        pts_str = f"{p['total_points']:,} очк."
+        bar_len = 10
+        filled  = round(p["total_points"] / max_pts * bar_len) if max_pts else 0
+        bar     = "█" * filled + "░" * (bar_len - filled)
+        aircraft = f" ({p['aircraft']})" if p.get("aircraft") else ""
+        lines.append(
+            f"{prefix} {status} <b>{p['pilot_name']}</b>{aircraft}\n"
+            f"   {bar} {pts_str} | {leg_str}"
+        )
+
+    footer = (
+        f"\n<i>Макс. очков: {max_pts:,} | "
+        f"Активен до {OPERATION_END}</i>"
+    )
+    return header + "\n\n".join(lines) + footer
+
+
+def fmt_operation_digest() -> str:
+    """Еженедельный дайджест по ивенту."""
+    pilots = db_op_all_pilots()
+    active = [p for p in pilots if p["status"] == "active"]
+    finished = [p for p in pilots if p["status"] == "finished"]
+
+    now = datetime.now()
+    week_label = f"{now.strftime('%d.%m')} — еженедельный отчёт"
+
+    msg = (
+        f"✈️ <b>ОПЕРАЦИЯ «{OPERATION_NAME}» — ДАЙДЖЕСТ</b>\n"
+        f"<i>{week_label}</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    )
+
+    if finished:
+        msg += f"🏁 <b>Завершили маршрут ({len(finished)}):</b>\n"
+        for p in finished:
+            msg += f"  ✅ {p['pilot_name']} — {p['total_points']:,} очк.\n"
+        msg += "\n"
+
+    if active:
+        msg += f"🛫 <b>В пути ({len(active)}):</b>\n"
+        for p in active:
+            leg_info = next((f"{dep}→{arr}" for n, dep, arr, _ in OPERATION_LEGS if n == p["current_leg"]), "—")
+            msg += f"  • {p['pilot_name']} — Leg {p['current_leg']}: {leg_info} | {p['total_points']:,} очк.\n"
+
+    if not pilots:
+        msg += "Участников пока нет."
+
+    return msg
+
+
+def fmt_operation_digest() -> str:
+    """Еженедельный дайджест по ивенту."""
+    pilots = db_op_all_pilots()
+    active   = [p for p in pilots if p["status"] == "active"]
+    finished = [p for p in pilots if p["status"] == "finished"]
+    now = datetime.now()
+
+    msg = (
+        f"✈️ <b>ОПЕРАЦИЯ «{OPERATION_NAME}» — ДАЙДЖЕСТ</b>\n"
+        f"<i>{now.strftime('%d.%m.%Y')}</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    )
+    if finished:
+        msg += f"🏁 <b>Финишировали ({len(finished)}):</b>\n"
+        for p in finished:
+            msg += f"  ✅ {p['pilot_name']} — {p['total_points']:,} очк.\n"
+        msg += "\n"
+    if active:
+        msg += f"🛫 <b>В пути ({len(active)}):</b>\n"
+        for p in active:
+            next_leg = next(
+                (f"Leg {n}: {dep}→{arr}" for n, dep, arr, _ in OPERATION_LEGS if n == p["current_leg"]),
+                "завершён"
+            )
+            msg += f"  • {p['pilot_name']} | {next_leg} | {p['total_points']:,} очк.\n"
+    if not pilots:
+        msg += "Участников пока нет."
+    return msg
+
+
 def fmt_runway(icao: str) -> str:
     """Возвращает METAR и рекомендации по полосам через metar-taf.com."""
     icao = icao.upper()
@@ -1700,6 +1960,77 @@ def handle_completed(data: Dict):
             f"✈️ Aircraft inspection recommended."
         )
 
+    # ─── Проверка ивента «Тихий Вжух» ──────────────────────────
+    if operation_is_active() and _is_valid_icao(dep) and _is_valid_icao(arr):
+        leg_key = (dep.upper(), arr.upper())
+        if leg_key in OPERATION_LEG_MAP:
+            leg_num, leg_pts = OPERATION_LEG_MAP[leg_key]
+            pilot = db_op_get_pilot(pilot_name)
+
+            # Авторегистрация при первом совпавшем рейсе
+            if not pilot:
+                aircraft_name_op = aircraft.get("icao_name", "")
+                db_op_register_pilot(pilot_name, aircraft_name_op)
+                pilot = db_op_get_pilot(pilot_name)
+                logger.info(f"[Operation] Авторегистрация пилота '{pilot_name}'")
+
+            if pilot and pilot["status"] == "active":
+                report_url_op = f"https://fshub.io/flight/{report_id}/report" if report_id else ""
+
+                if rate <= -OPERATION_HARD_CRASH:
+                    # Крушение — полный сброс
+                    db_op_add_leg(pilot_name, leg_num, dep, arr, rate, 0, report_id or "", report_url_op)
+                    db_op_reset_pilot(pilot_name)
+                    tg_send(
+                        f"💥 <b>КРУШЕНИЕ — ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
+                        f"👨‍✈️ <b>{pilot_name}</b>\n"
+                        f"✈️ Leg {leg_num}: {dep} → {arr}\n"
+                        f"📊 Посадка: <b>{rate} fpm</b>\n\n"
+                        f"⚠️ Борт утерян. Весь прогресс сброшен.\n"
+                        f"Пилот начинает с Leg 1."
+                    )
+                elif rate <= -OPERATION_FAIL_RATE:
+                    # Жёсткая посадка — этап провален, 0 очков
+                    db_op_add_leg(pilot_name, leg_num, dep, arr, rate, 0, report_id or "", report_url_op)
+                    tg_send(
+                        f"🔴 <b>ЭТАП ПРОВАЛЕН — ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
+                        f"👨‍✈️ <b>{pilot_name}</b>\n"
+                        f"✈️ Leg {leg_num}: {dep} → {arr}\n"
+                        f"📊 Посадка: <b>{rate} fpm</b> — слишком жёстко!\n\n"
+                        f"❌ Очки не начислены. Повторите Leg {leg_num}."
+                    )
+                else:
+                    # Успешная посадка
+                    next_leg = leg_num + 1
+                    is_finished = next_leg > len(OPERATION_LEGS)
+                    new_status  = "finished" if is_finished else "active"
+                    new_points  = pilot["total_points"] + leg_pts
+                    db_op_add_leg(pilot_name, leg_num, dep, arr, rate, leg_pts, report_id or "", report_url_op)
+                    db_op_update_pilot(pilot_name, next_leg if not is_finished else leg_num, new_points, new_status)
+
+                    if is_finished:
+                        tg_send(
+                            f"🏁 <b>ФИНИШ! ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
+                            f"👨‍✈️ <b>{pilot_name}</b> завершил маршрут!\n"
+                            f"✈️ Последний этап: {dep} → {arr}\n"
+                            f"📊 Посадка: <b>{rate} fpm</b>\n"
+                            f"⭐ Итого очков: <b>{new_points:,}</b>\n\n"
+                            f"🎉 Борт успешно перегнан в SBRJ!"
+                        )
+                    else:
+                        next_info = next(
+                            (f"{d}→{a}" for n, d, a, _ in OPERATION_LEGS if n == next_leg), ""
+                        )
+                        tg_send(
+                            f"✅ <b>LEG {leg_num} ВЫПОЛНЕН — «{OPERATION_NAME}»</b>\n\n"
+                            f"👨‍✈️ <b>{pilot_name}</b>\n"
+                            f"✈️ {dep} → {arr}\n"
+                            f"📊 Посадка: <b>{rate} fpm</b>\n"
+                            f"⭐ +{leg_pts} очков | Итого: <b>{new_points:,}</b>\n\n"
+                            f"➡️ Следующий: Leg {next_leg} {next_info}"
+                        )
+                logger.info(f"[Operation] {pilot_name} leg={leg_num} rate={rate} pts={leg_pts}")
+
     # ─── Проверка конкурса Мастер Посадки ───────────────────────
     if is_contest_landing(rate):
         report_url = f"https://fshub.io/flight/{report_id}/report" if report_id else ""
@@ -1776,14 +2107,15 @@ FSHUB_HANDLERS = {
 # ═══════════════════════════════════════════════════════════════
 
 COMMANDS = {
-    "/stats": fmt_stats,
-    "/last": fmt_last,
+    "/stats":     fmt_stats,
+    "/last":      fmt_last,
     "/top_landing": fmt_top_landings,
-    "/top": fmt_top_pilots,
-    "/economy": fmt_daily_economy,
-    "/monthly": fmt_monthly_economy,
-    "/live": fmt_active_flights,
-    "/va": fmt_va_info,
+    "/top":       fmt_top_pilots,
+    "/economy":   fmt_daily_economy,
+    "/monthly":   fmt_monthly_economy,
+    "/live":      fmt_active_flights,
+    "/va":        fmt_va_info,
+    "/operation": fmt_operation,
 }
 
 HELP_TEXT = (
@@ -1814,6 +2146,7 @@ MENU_CALLBACKS.update({
     "cmd_live":        fmt_active_flights,
     "cmd_va":          fmt_va_info,
     "cmd_contest":     fmt_contest,
+    "cmd_operation":   fmt_operation,
 })
 
 
@@ -1845,6 +2178,112 @@ def handle_tg_command(message: Dict):
     if text.startswith("/start") or text.startswith("/help") or text.startswith("/menu"):
         tg_send_menu(chat_id)
         return
+
+    # ─── Обработка /operation_admin ────────────────────────────
+    if base_cmd == "/operation_admin":
+        if str(chat_id) != str(ADMIN_ID):
+            tg_send("⛔ Нет доступа.", chat_id)
+            return
+        # /operation_admin add <имя> [самолёт]
+        # /operation_admin set <имя> <очки_дельта>
+        # /operation_admin reset <имя>
+        # /operation_admin list
+        parts = text.split(None, 3)
+        sub = parts[1] if len(parts) > 1 else ""
+
+        if sub == "add":
+            pilot = parts[2] if len(parts) > 2 else ""
+            aircraft = parts[3] if len(parts) > 3 else ""
+            if not pilot:
+                tg_send("Использование: /operation_admin add <имя> [самолёт]", chat_id)
+                return
+            ok = db_op_register_pilot(pilot, aircraft)
+            tg_send(
+                f"✅ Пилот <b>{pilot}</b> зарегистрирован{' на ' + aircraft if aircraft else ''}."
+                if ok else f"⚠️ Пилот <b>{pilot}</b> уже зарегистрирован.",
+                chat_id
+            )
+
+        elif sub == "set":
+            # /operation_admin set <имя> <дельта_очков>
+            if len(parts) < 4:
+                tg_send("Использование: /operation_admin set <имя> <дельта>\nПример: /operation_admin set Grigory +500 или -200", chat_id)
+                return
+            pilot = parts[2]
+            try:
+                delta = int(parts[3])
+            except ValueError:
+                tg_send("Дельта должна быть числом (например +500 или -200)", chat_id)
+                return
+            p = db_op_get_pilot(pilot)
+            if not p:
+                tg_send(f"Пилот <b>{pilot}</b> не найден.", chat_id)
+                return
+            db_op_admin_set(pilot, 0, delta)
+            p2 = db_op_get_pilot(pilot)
+            tg_send(f"✅ <b>{pilot}</b>: {p['total_points']:,} → <b>{p2['total_points']:,}</b> очков.", chat_id)
+
+        elif sub == "leg":
+            # /operation_admin leg <имя> <номер_лега>
+            if len(parts) < 4:
+                tg_send("Использование: /operation_admin leg <имя> <номер>", chat_id)
+                return
+            pilot = parts[2]
+            try:
+                leg = int(parts[3])
+            except ValueError:
+                tg_send("Номер лега должен быть числом.", chat_id)
+                return
+            if not 1 <= leg <= len(OPERATION_LEGS) + 1:
+                tg_send(f"Номер лега: 1–{len(OPERATION_LEGS)}.", chat_id)
+                return
+            p = db_op_get_pilot(pilot)
+            if not p:
+                tg_send(f"Пилот <b>{pilot}</b> не найден.", chat_id)
+                return
+            db_execute(
+                "UPDATE operation_pilots SET current_leg = %s WHERE pilot_name = %s",
+                (leg, pilot),
+            )
+            tg_send(f"✅ <b>{pilot}</b>: текущий лег установлен на <b>{leg}</b>.", chat_id)
+
+        elif sub == "reset":
+            pilot = parts[2] if len(parts) > 2 else ""
+            if not pilot:
+                tg_send("Использование: /operation_admin reset <имя>", chat_id)
+                return
+            p = db_op_get_pilot(pilot)
+            if not p:
+                tg_send(f"Пилот <b>{pilot}</b> не найден.", chat_id)
+                return
+            db_op_reset_pilot(pilot)
+            tg_send(f"✅ Прогресс <b>{pilot}</b> сброшен.", chat_id)
+
+        elif sub == "list":
+            pilots = db_op_all_pilots()
+            if not pilots:
+                tg_send("Участников нет.", chat_id)
+                return
+            lines = []
+            for p in pilots:
+                lines.append(
+                    f"• <b>{p['pilot_name']}</b> ({p['aircraft'] or '—'}) "
+                    f"Leg {p['current_leg']} | {p['total_points']:,} очк. [{p['status']}]"
+                )
+            tg_send("📋 <b>Участники операции:</b>\n\n" + "\n".join(lines), chat_id)
+
+        else:
+            tg_send(
+                "📋 <b>Команды администратора:</b>\n"
+                "/operation_admin add &lt;имя&gt; [самолёт]\n"
+                "/operation_admin set &lt;имя&gt; &lt;дельта&gt;\n"
+                "/operation_admin leg &lt;имя&gt; &lt;номер&gt;\n"
+                "/operation_admin reset &lt;имя&gt;\n"
+                "/operation_admin list",
+                chat_id,
+            )
+        return
+    # ─── Конец /operation_admin ──────────────────────────────────
 
     # ─── Обработка /contest [YYYY-MM] ───────────────────────────
     cmd_parts = text.split()
@@ -1981,6 +2420,11 @@ def init_scheduler():
         lambda: tg_send(fmt_top_landings()),
         "cron", day_of_week="sun", hour=12, minute=0,
         id="weekly_landing_ranking",
+    )
+    scheduler.add_job(
+        lambda: tg_send(fmt_operation_digest()) if operation_is_active() else None,
+        "cron", day_of_week="sun", hour=11, minute=0,
+        id="weekly_operation_digest",
     )
     scheduler.add_job(
         lambda: tg_send(fmt_top_pilots()),
