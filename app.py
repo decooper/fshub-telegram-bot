@@ -651,43 +651,25 @@ def db_op_reset_pilot(pilot_name: str) -> None:
 
 def db_op_check_daily_limit(pilot_name: str) -> tuple:
     """
-    Проверяет лимит 2 лега в 24 часа.
-    Правило: если у пилота уже есть 2+ успешных лега (points > 0),
-    смотрим время второго последнего — если прошло < 24ч, запрещаем.
+    Проверяет лимит 2 лега в календарные сутки UTC.
+    Счётчик сбрасывается в 00:00 UTC каждый день.
 
-    Возвращает (allowed: bool, wait_seconds: int, legs_today: int)
+    Возвращает (allowed: bool, legs_today: int)
     """
-    # Берём последние успешные леги (points > 0) за последние 24 часа
     rows = db_execute(
         """
         SELECT created_at FROM operation_legs
         WHERE pilot_name = %s
           AND points > 0
-          AND created_at >= NOW() - INTERVAL '24 hours'
+          AND DATE(created_at AT TIME ZONE 'UTC') = CURRENT_DATE
         ORDER BY created_at ASC
         """,
         (pilot_name,), fetch="all",
     ) or []
 
     count = len(rows)
-
-    if count < 2:
-        # Меньше двух легов за последние 24ч — разрешаем
-        return True, 0, count
-
-    # Есть 2+ лега за последние 24ч — смотрим время второго
-    second_leg_time = rows[1]["created_at"]
-    if isinstance(second_leg_time, str):
-        second_leg_time = datetime.fromisoformat(second_leg_time)
-
-    # Когда истечёт блокировка
-    unlock_time = second_leg_time.replace(tzinfo=None) + timedelta(hours=24)
-    now_utc     = datetime.utcnow()
-    wait_sec    = int((unlock_time - now_utc).total_seconds())
-
-    if wait_sec > 0:
-        return False, wait_sec, count
-    return True, 0, count
+    allowed = count < 2
+    return allowed, count
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2111,22 +2093,18 @@ def handle_completed(data: Dict):
             if pilot and pilot["status"] == "active":
                 report_url_op = f"https://fshub.io/flight/{report_id}/report" if report_id else ""
 
-                # ── Проверка лимита 2 лега в 24 часа ────────────────
-                allowed, wait_sec, legs_recent = db_op_check_daily_limit(pilot_name)
+                # ── Проверка лимита 2 лега в сутки UTC ──────────────
+                allowed, legs_today = db_op_check_daily_limit(pilot_name)
                 if not allowed:
-                    hours_left = wait_sec // 3600
-                    mins_left  = (wait_sec % 3600) // 60
                     tg_send(
                         f"⏳ <b>ЛИМИТ ЛЕГОВ — ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
                         f"👨‍✈️ <b>{pilot_name}</b>\n"
                         f"✈️ Leg {leg_num}: {dep} → {arr}\n\n"
-                        f"❌ За последние 24 часа уже выполнено <b>{legs_recent} лега</b>.\n"
-                        f"⏱ Следующий лег доступен через: "
-                        f"<b>{hours_left}ч {mins_left}мин</b>"
+                        f"❌ Сегодня уже выполнено <b>2 лега</b>.\n"
+                        f"🕛 Счётчик сбросится в <b>00:00 UTC (03:00 МСК)</b>"
                     )
                     logger.info(
-                        f"[Operation] {pilot_name} leg={leg_num} — лимит превышен, "
-                        f"ждать {hours_left}ч {mins_left}мин"
+                        f"[Operation] {pilot_name} leg={leg_num} — лимит сутки превышен"
                     )
                     # Лег не засчитывается — выходим из блока
                 else:
@@ -2205,13 +2183,24 @@ def handle_completed(data: Dict):
                             next_info = next(
                                 (f"{d2}→{a2}" for n2, d2, a2, _ in OPERATION_LEGS if n2 == next_leg), ""
                             )
+                            # Инфо о лимите суток (включая текущий лег)
+                            legs_after = legs_today + 1
+                            if legs_after >= 2:
+                                limit_str = (
+                                    f"\n🕛 На сегодня лимит исчерпан. "
+                                    f"Следующий лег — после <b>00:00 UTC (03:00 МСК)</b>"
+                                )
+                            else:
+                                limit_str = f"\n✅ Сегодня можно выполнить ещё <b>1 лег</b>"
+
                             tg_send(
                                 f"✅ <b>LEG {leg_num} ВЫПОЛНЕН — «{OPERATION_NAME}»</b>\n\n"
                                 f"👨‍✈️ <b>{pilot_name}</b>\n"
                                 f"✈️ {dep} → {arr}\n"
                                 f"📊 Посадка: <b>{rate} fpm</b>\n"
-                                f"⭐ Очки: {detail_str} | Итого: <b>{new_points:,}</b>\n\n"
+                                f"⭐ Очки: {detail_str} | Итого: <b>{new_points:,}</b>\n"
                                 f"➡️ Следующий: Leg {next_leg} {next_info}"
+                                f"{limit_str}"
                             )
                     logger.info(
                         f"[Operation] {pilot_name} leg={leg_num} rate={rate} "
@@ -2612,6 +2601,11 @@ def init_scheduler():
         lambda: tg_send(fmt_operation_digest()) if operation_is_active() else None,
         "cron", day_of_week="sun", hour=11, minute=0,
         id="weekly_operation_digest",
+    )
+    scheduler.add_job(
+        lambda: tg_send(fmt_operation()) if operation_is_active() else None,
+        "cron", day_of_week="fri", hour=0, minute=0,
+        id="weekly_operation_standings",
     )
     scheduler.add_job(
         lambda: tg_send(fmt_top_pilots()),
