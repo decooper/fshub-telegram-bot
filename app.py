@@ -1699,9 +1699,11 @@ def fmt_operation() -> str:
         status  = "✅" if p["status"] == "finished" else ("💀" if p["status"] == "lost" else "🛫")
         leg_str = f"Leg {p['current_leg']}/{total_legs}"
         pts_str = f"{p['total_points']:,} очк."
-        bar_len = 10
-        filled  = round(p["total_points"] / max_pts * bar_len) if max_pts else 0
-        bar     = "█" * filled + "░" * (bar_len - filled)
+        bar_len     = 13  # каждый символ = 1 лег
+        legs_done   = max(0, p["current_leg"] - 1)  # текущий лег ещё не выполнен
+        if p["status"] == "finished":
+            legs_done = total_legs
+        bar         = "█" * legs_done + "░" * (total_legs - legs_done)
         aircraft = f" ({p['aircraft']})" if p.get("aircraft") else ""
         lines.append(
             f"{prefix} {status} <b>{p['pilot_name']}</b>{aircraft}\n"
