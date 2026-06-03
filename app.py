@@ -2351,6 +2351,10 @@ def handle_tg_command(message: Dict):
 
     logger.info(f"Command from chat={chat_id}: {text}")
 
+    # Парсим команду один раз — используется во всех блоках ниже
+    cmd_parts = text.split()
+    base_cmd  = cmd_parts[0].split("@")[0] if cmd_parts else ""
+
     if text.startswith("/start") or text.startswith("/help") or text.startswith("/menu"):
         tg_send_menu(chat_id)
         return
@@ -2462,9 +2466,6 @@ def handle_tg_command(message: Dict):
     # ─── Конец /operation_admin ──────────────────────────────────
 
     # ─── Обработка /contest [YYYY-MM] ───────────────────────────
-    cmd_parts = text.split()
-    base_cmd = cmd_parts[0].split("@")[0]
-
     if base_cmd == "/contest":
         # Опциональный аргумент: /contest 2026-05
         month_arg = None
