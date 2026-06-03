@@ -2372,10 +2372,18 @@ def handle_tg_command(message: Dict):
         sub = parts[1] if len(parts) > 1 else ""
 
         if sub == "add":
-            pilot = parts[2] if len(parts) > 2 else ""
-            aircraft = parts[3] if len(parts) > 3 else ""
+            # Формат: /operation_admin add Имя Фамилия | B738
+            # Разделитель | отделяет имя от самолёта
+            rest = text.split(None, 2)[2] if len(text.split(None, 2)) > 2 else ""
+            if "|" in rest:
+                pilot_part, aircraft_part = rest.split("|", 1)
+                pilot   = pilot_part.strip()
+                aircraft = aircraft_part.strip()
+            else:
+                pilot    = rest.strip()
+                aircraft = ""
             if not pilot:
-                tg_send("Использование: /operation_admin add <имя> [самолёт]", chat_id)
+                tg_send("Использование: /operation_admin add Имя Фамилия | B738", chat_id)
                 return
             ok = db_op_register_pilot(pilot, aircraft)
             tg_send(
@@ -2385,13 +2393,15 @@ def handle_tg_command(message: Dict):
             )
 
         elif sub == "set":
-            # /operation_admin set <имя> <дельта_очков>
-            if len(parts) < 4:
-                tg_send("Использование: /operation_admin set <имя> <дельта>\nПример: /operation_admin set Grigory +500 или -200", chat_id)
+            # Формат: /operation_admin set Имя Фамилия | +500
+            rest = text.split(None, 2)[2] if len(text.split(None, 2)) > 2 else ""
+            if "|" not in rest:
+                tg_send("Использование: /operation_admin set Имя Фамилия | +500", chat_id)
                 return
-            pilot = parts[2]
+            pilot_part, delta_part = rest.split("|", 1)
+            pilot = pilot_part.strip()
             try:
-                delta = int(parts[3])
+                delta = int(delta_part.strip().replace("+", ""))
             except ValueError:
                 tg_send("Дельта должна быть числом (например +500 или -200)", chat_id)
                 return
@@ -2404,13 +2414,15 @@ def handle_tg_command(message: Dict):
             tg_send(f"✅ <b>{pilot}</b>: {p['total_points']:,} → <b>{p2['total_points']:,}</b> очков.", chat_id)
 
         elif sub == "leg":
-            # /operation_admin leg <имя> <номер_лега>
-            if len(parts) < 4:
-                tg_send("Использование: /operation_admin leg <имя> <номер>", chat_id)
+            # Формат: /operation_admin leg Имя Фамилия | 3
+            rest = text.split(None, 2)[2] if len(text.split(None, 2)) > 2 else ""
+            if "|" not in rest:
+                tg_send("Использование: /operation_admin leg Имя Фамилия | 3", chat_id)
                 return
-            pilot = parts[2]
+            pilot_part, leg_part = rest.split("|", 1)
+            pilot = pilot_part.strip()
             try:
-                leg = int(parts[3])
+                leg = int(leg_part.strip())
             except ValueError:
                 tg_send("Номер лега должен быть числом.", chat_id)
                 return
@@ -2428,9 +2440,11 @@ def handle_tg_command(message: Dict):
             tg_send(f"✅ <b>{pilot}</b>: текущий лег установлен на <b>{leg}</b>.", chat_id)
 
         elif sub == "reset":
-            pilot = parts[2] if len(parts) > 2 else ""
+            # Формат: /operation_admin reset Имя Фамилия
+            rest = text.split(None, 2)[2] if len(text.split(None, 2)) > 2 else ""
+            pilot = rest.strip()
             if not pilot:
-                tg_send("Использование: /operation_admin reset <имя>", chat_id)
+                tg_send("Использование: /operation_admin reset Имя Фамилия", chat_id)
                 return
             p = db_op_get_pilot(pilot)
             if not p:
@@ -2454,11 +2468,11 @@ def handle_tg_command(message: Dict):
 
         else:
             tg_send(
-                "📋 <b>Команды администратора:</b>\n"
-                "/operation_admin add &lt;имя&gt; [самолёт]\n"
-                "/operation_admin set &lt;имя&gt; &lt;дельта&gt;\n"
-                "/operation_admin leg &lt;имя&gt; &lt;номер&gt;\n"
-                "/operation_admin reset &lt;имя&gt;\n"
+                "📋 <b>Команды администратора:</b>\n\n"
+                "/operation_admin add Имя Фамилия | B738\n"
+                "/operation_admin set Имя Фамилия | +500\n"
+                "/operation_admin leg Имя Фамилия | 3\n"
+                "/operation_admin reset Имя Фамилия\n"
                 "/operation_admin list",
                 chat_id,
             )
