@@ -28,7 +28,7 @@ BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN", "")
 CHAT_ID    = os.environ.get("TG_CHAT_ID", "")
 FSA_KEY    = os.environ.get("FSA_API_KEY", "")
 FSA_VA_ID  = os.environ.get("FSA_VA_ID", "56177")
-# Второй API — Профсоюз пилотов FSAirlines (добавить ключ когда договоритесь)
+# Второй API - Профсоюз пилотов FSAirlines (добавить ключ когда договоритесь)
 FSA_KEY2   = os.environ.get("FSA_API_KEY2", "")
 FSA_VA_ID2 = os.environ.get("FSA_VA_ID2", "")
 PORT       = int(os.environ.get("PORT", 10000))
@@ -94,7 +94,7 @@ session.mount("https://", adapter)
 session.mount("http://", adapter)
 
 # ═══════════════════════════════════════════════════════════════
-# DATABASE — PostgreSQL connection pool (с keepalives для Neon.tech)
+# DATABASE - PostgreSQL connection pool (с keepalives для Neon.tech)
 # ═══════════════════════════════════════════════════════════════
 
 _pool: Optional[psycopg2.pool.ThreadedConnectionPool] = None
@@ -226,7 +226,7 @@ def db_execute(query: str, params=None, fetch: str = "none"):
                 conn = None
             raise
         finally:
-            # Если соединение не было явно закрыто или возвращено — вернуть в пул
+            # Если соединение не было явно закрыто или возвращено - вернуть в пул
             if conn is not None:
                 put_conn(conn)
 
@@ -298,11 +298,20 @@ def _init_db():
             aircraft      TEXT DEFAULT '',
             current_leg   INTEGER DEFAULT 1,
             total_points  INTEGER DEFAULT 0,
+            ferry_num     INTEGER DEFAULT 1,
             status        TEXT DEFAULT 'active',
             registered_at TIMESTAMPTZ DEFAULT NOW()
         )
         """
     )
+    # Добавить колонки если их нет (миграция для существующей БД)
+    for col, definition in [
+        ("ferry_num", "INTEGER DEFAULT 1"),
+    ]:
+        try:
+            db_execute(f"ALTER TABLE operation_pilots ADD COLUMN IF NOT EXISTS {col} {definition}")
+        except Exception:
+            pass
     db_execute(
         """
         CREATE TABLE IF NOT EXISTS operation_legs (
@@ -328,7 +337,7 @@ def _init_db():
 
 
 # ═══════════════════════════════════════════════════════════════
-# DB HELPERS — FLIGHTS
+# DB HELPERS - FLIGHTS
 # ═══════════════════════════════════════════════════════════════
 
 def db_add_flight(
@@ -430,7 +439,7 @@ def db_top_landings(limit: int = 10) -> List:
 
 
 # ═══════════════════════════════════════════════════════════════
-# DB HELPERS — DAILY ECONOMY
+# DB HELPERS - DAILY ECONOMY
 # ═══════════════════════════════════════════════════════════════
 
 def db_save_daily_economy(day: str, income: int, expense: int, detail: Dict):
@@ -468,7 +477,7 @@ def db_get_today_economy() -> Optional[Dict]:
 
 
 # ═══════════════════════════════════════════════════════════════
-# OPERATION "ТИХИЙ ВЖУХ" — ДАННЫЕ
+# OPERATION "ТИХИЙ ВЖУХ" - ДАННЫЕ
 # ═══════════════════════════════════════════════════════════════
 
 OPERATION_NAME       = "Тихий Вжух"
@@ -539,7 +548,7 @@ def op_get_aircraft_coeff(aircraft_icao: str) -> float:
 def op_calc_points(base_pts: int, aircraft_icao: str, on_network: bool) -> tuple:
     """
     Рассчитывает итоговые очки за лег.
-    Формула: round(base_pts × коэффициент_ВС) + бонус_сети
+    Формула: round(base_pts * коэффициент_ВС) + бонус_сети
     Возвращает (итого, коэффициент, бонус_сети)
     """
     coeff       = op_get_aircraft_coeff(aircraft_icao)
@@ -575,12 +584,29 @@ def db_op_all_pilots() -> List:
 
 
 def db_op_register_pilot(pilot_name: str, aircraft: str = "") -> bool:
-    """Регистрирует пилота. Возвращает True если новый."""
+    """
+    Регистрирует пилота.
+    Если пилот уже есть и статус finished — начинает новый перегон.
+    Возвращает True если новый или начат новый перегон, False если уже активен.
+    """
     existing = db_op_get_pilot(pilot_name)
     if existing:
-        return False
+        if existing["status"] == "finished":
+            # Начать новый перегон
+            new_ferry = existing["ferry_num"] + 1
+            db_execute(
+                """
+                UPDATE operation_pilots
+                SET current_leg = 1, status = 'active',
+                    aircraft = %s, ferry_num = %s
+                WHERE pilot_name = %s
+                """,
+                (aircraft, new_ferry, pilot_name),
+            )
+            return True  # новый перегон начат
+        return False  # уже активный перегон
     db_execute(
-        "INSERT INTO operation_pilots (pilot_name, aircraft) VALUES (%s, %s)",
+        "INSERT INTO operation_pilots (pilot_name, aircraft, ferry_num) VALUES (%s, %s, 1)",
         (pilot_name, aircraft),
     )
     return True
@@ -623,6 +649,29 @@ def db_op_update_pilot(
         """,
         (current_leg, total_points, status, pilot_name),
     )
+
+
+def db_op_start_new_ferry(pilot_name: str, aircraft: str) -> Optional[int]:
+    """
+    Начинает новый перегон для пилота после завершения предыдущего.
+    Возвращает номер нового перегона или None если пилот не найден / перегон активен.
+    """
+    pilot = db_op_get_pilot(pilot_name)
+    if not pilot:
+        return None
+    if pilot["status"] != "finished":
+        return None
+    new_ferry = pilot["ferry_num"] + 1
+    db_execute(
+        """
+        UPDATE operation_pilots
+        SET current_leg = 1, status = 'active',
+            aircraft = %s, ferry_num = %s
+        WHERE pilot_name = %s
+        """,
+        (aircraft, new_ferry, pilot_name),
+    )
+    return new_ferry
 
 
 def db_op_admin_set(pilot_name: str, leg_num: int, points_delta: int) -> None:
@@ -673,7 +722,7 @@ def db_op_check_daily_limit(pilot_name: str) -> tuple:
 
 
 # ═══════════════════════════════════════════════════════════════
-# DB HELPERS — CONTEST
+# DB HELPERS - CONTEST
 # ═══════════════════════════════════════════════════════════════
 
 CONTEST_POINTS_PER_LANDING = 100  # баллов за посадку
@@ -719,7 +768,7 @@ def db_contest_month(month: Optional[str] = None) -> List:
 
 
 def db_contest_recent_months(n: int = 4) -> List[str]:
-    """Возвращает список месяцев у которых есть записи — текущий + до n-1 предыдущих."""
+    """Возвращает список месяцев у которых есть записи - текущий + до n-1 предыдущих."""
     rows = db_execute(
         """
         SELECT DISTINCT contest_month
@@ -1195,7 +1244,7 @@ def fsa_get_recent_report(pilot_id: int, arrival_time: str) -> Optional[Dict]:
             except Exception:
                 pass
         else:
-            # Без времени — берём первый отчёт
+            # Без времени - берём первый отчёт
             return report
     return None
 
@@ -1268,7 +1317,7 @@ def _enrich_completed_from_fsa(
 
 # Транзакции которые являются внутренними переводами между флотами.
 # Они всегда парные (приход = расход) и не влияют на реальный Net,
-# но засоряют отчёт — исключаем из отображения.
+# но засоряют отчёт - исключаем из отображения.
 INTERNAL_TRANSFER_REASONS = {
     "Fleet Money Transfer",
 }
@@ -1389,7 +1438,7 @@ def fmt_last(limit: int = 5) -> str:
         )
 
         if no_plan:
-            # Маршрут неизвестен — не показываем ???? мусор
+            # Маршрут неизвестен - не показываем ???? мусор
             lines.append(
                 f"{emoji} <b>{f['pilot']}</b>\n"
                 f"✈️ {f['aircraft'] or 'N/A'}\n"
@@ -1669,7 +1718,7 @@ def fmt_contest(month: Optional[str] = None) -> str:
     blocks = []
     for m in months_to_show:
         entries = db_contest_month(m)
-        # Прошлые месяцы без данных — пропускаем
+        # Прошлые месяцы без данных - пропускаем
         if not entries and m != current:
             continue
         blocks.append(_fmt_contest_block(m))
@@ -1704,9 +1753,10 @@ def fmt_operation() -> str:
         if p["status"] == "finished":
             legs_done = total_legs
         bar         = "█" * legs_done + "░" * (total_legs - legs_done)
-        aircraft = f" ({p['aircraft']})" if p.get("aircraft") else ""
+        aircraft   = f" ({p['aircraft']})" if p.get("aircraft") else ""
+        ferry_str  = f" • Перегон #{p['ferry_num']}" if p.get("ferry_num", 1) > 1 else ""
         lines.append(
-            f"{prefix} {status} <b>{p['pilot_name']}</b>{aircraft}\n"
+            f"{prefix} {status} <b>{p['pilot_name']}</b>{aircraft}{ferry_str}\n"
             f"   {bar} {pts_str} | {leg_str}"
         )
 
@@ -1803,7 +1853,7 @@ _processed_events = set()
 _processed_lock = threading.Lock()
 
 # Состояние диалога: chat_id -> "awaiting_icao"
-# Используется для /runway без аргумента — бот спрашивает ICAO и ждёт ответа
+# Используется для /runway без аргумента - бот спрашивает ICAO и ждёт ответа
 _awaiting_icao: Dict[str, bool] = {}
 _awaiting_lock = threading.Lock()
 
@@ -1835,7 +1885,7 @@ def handle_departure(data: Dict):
     aircraft_name = aircraft.get("icao_name", "N/A")
 
     if not _is_plan_empty(plan):
-        # Данные полные — сохраняем в кэш и отправляем сразу
+        # Данные полные - сохраняем в кэш и отправляем сразу
         logger.info(f"[Departure] Полный план от FSHub для '{pilot_name}'")
         with _departure_cache_lock:
             _departure_cache[pilot_name] = {
@@ -1853,10 +1903,10 @@ def handle_departure(data: Dict):
             f"✈️ <i>Желаем попутного ветра и мягкой посадки!</i>"
         )
     else:
-        # Пустой план — отправляем краткое сообщение и запускаем обогащение
+        # Пустой план - отправляем краткое сообщение и запускаем обогащение
         logger.info(f"[Departure] Пустой план от FSHub для '{pilot_name}', запускаю обогащение через 90с")
 
-        # Краткое сообщение — сохраняем message_id для последующего редактирования
+        # Краткое сообщение - сохраняем message_id для последующего редактирования
         r = session.post(
             f"{TG_BASE}/sendMessage",
             json={
@@ -1900,7 +1950,7 @@ def handle_completed(data: Dict):
         logger.info(f"Пропуск дублирующего completed для рейса {report_id}")
         return
 
-    # Данные о посадке — в блоке arrival
+    # Данные о посадке - в блоке arrival
     arrival  = d.get("arrival") or {}
     plan     = d.get("plan") or {}
     user     = arrival.get("user") or d.get("user") or {}
@@ -1987,7 +2037,7 @@ def handle_completed(data: Dict):
         if cached:
             # Сравниваем аэропорт прилёта из кэша с фактическим из FSHub
             if airport_icao and cached_arr != airport_icao and _is_valid_icao(airport_icao):
-                # Запасной аэропорт — ждём 15 минут пока пилот завершит рейс в FSAirlines
+                # Запасной аэропорт - ждём 15 минут пока пилот завершит рейс в FSAirlines
                 logger.info(
                     f"[Completed] Запасной аэропорт для '{pilot_name}': "
                     f"план={cached_arr}, факт={airport_icao} — жду 15 мин"
@@ -2018,7 +2068,7 @@ def handle_completed(data: Dict):
                             daemon=True,
                         ).start()
             else:
-                # Аэропорт совпадает — используем данные из кэша сразу
+                # Аэропорт совпадает - используем данные из кэша сразу
                 logger.info(f"[Completed] Используем кэш вылета для '{pilot_name}': {cached_dep}→{cached_arr}")
                 final_msg = (
                     f"🛬 <b>ПОСАДКА ВЫПОЛНЕНА — TOUCHDOWN</b> {emoji}\n\n"
@@ -2040,7 +2090,7 @@ def handle_completed(data: Dict):
                 with _departure_cache_lock:
                     _departure_cache.pop(pilot_name, None)
         else:
-            # Нет кэша — стандартное обогащение через FSAirlines с задержкой 3 мин
+            # Нет кэша - стандартное обогащение через FSAirlines с задержкой 3 мин
             logger.info(f"[Completed] Нет кэша вылета для '{pilot_name}', запускаю обогащение через {FSA_ENRICH_ARRIVAL_DELAY}с")
             r = session.post(
                 f"{TG_BASE}/sendMessage",
@@ -2092,122 +2142,140 @@ def handle_completed(data: Dict):
                 pilot = db_op_get_pilot(pilot_name)
                 logger.info(f"[Operation] Авторегистрация пилота '{pilot_name}'")
 
+            # Автостарт нового перегона если предыдущий завершён и это Leg 1
+            if pilot and pilot["status"] == "finished" and leg_num == 1:
+                aircraft_name_op = aircraft.get("icao_name", "")
+                new_ferry = db_op_start_new_ferry(pilot_name, aircraft_name_op)
+                if new_ferry:
+                    pilot = db_op_get_pilot(pilot_name)
+                    logger.info(f"[Operation] Автостарт перегона #{new_ferry} для '{pilot_name}'")
+                    tg_send(
+                        f"✈️ <b>НОВЫЙ ПЕРЕГОН #{new_ferry} — «{OPERATION_NAME}»</b>\n\n"
+                        f"👨‍✈️ <b>{pilot_name}</b> начинает новый перегон!\n"
+                        f"✈️ Самолёт: <b>{aircraft_name_op}</b>\n"
+                        f"🗺 Маршрут: VTBS → SBRJ"
+                    )
+
             if pilot and pilot["status"] == "active":
                 report_url_op = f"https://fshub.io/flight/{report_id}/report" if report_id else ""
 
-                # ── Проверка лимита 2 лега в сутки UTC ──────────────
-                allowed, legs_today = db_op_check_daily_limit(pilot_name)
-                if not allowed:
-                    tg_send(
-                        f"⏳ <b>ЛИМИТ ЛЕГОВ — ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
-                        f"👨‍✈️ <b>{pilot_name}</b>\n"
-                        f"✈️ Leg {leg_num}: {dep} → {arr}\n\n"
-                        f"❌ Сегодня уже выполнено <b>2 лега</b>.\n"
-                        f"🕛 Счётчик сбросится в <b>00:00 UTC (03:00 МСК)</b>"
-                    )
+                # Засчитываем только ожидаемый следующий лег
+                if leg_num != pilot["current_leg"]:
                     logger.info(
-                        f"[Operation] {pilot_name} leg={leg_num} — лимит сутки превышен"
+                        f"[Operation] {pilot_name} Leg {leg_num} ignored, "
+                        f"expected Leg {pilot['current_leg']}"
                     )
-                    # Лег не засчитывается — выходим из блока
                 else:
-                    # Определяем тип ВС для коэффициента
-                    aircraft_icao_type = (
-                        d.get("aircraft") or {}
-                    ).get("icao") or aircraft.get("icao_name", "")
-
-                    # Проверяем полёт в сети VATSIM/IVAO
-                    user_handles = user.get("handles") or {}
-                    on_network   = bool(user_handles.get("vatsim") or user_handles.get("ivao"))
-
-                    if rate <= -OPERATION_HARD_CRASH:
-                        # Крушение — полный сброс
-                        db_op_add_leg(
-                            pilot_name, leg_num, dep, arr, rate,
-                            0, report_id or "", report_url_op,
-                        )
-                        db_op_reset_pilot(pilot_name)
+                    # Проверка лимита 2 лега в сутки UTC
+                    allowed, legs_today = db_op_check_daily_limit(pilot_name)
+                    if not allowed:
                         tg_send(
-                            f"💥 <b>КРУШЕНИЕ — ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
+                            f"⏳ <b>ЛИМИТ ЛЕГОВ — ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
                             f"👨‍✈️ <b>{pilot_name}</b>\n"
-                            f"✈️ Leg {leg_num}: {dep} → {arr}\n"
-                            f"📊 Посадка: <b>{rate} fpm</b>\n\n"
-                            f"⚠️ Борт утерян. Весь прогресс сброшен.\n"
-                            f"Пилот начинает с Leg 1."
+                            f"✈️ Leg {leg_num}: {dep} → {arr}\n\n"
+                            f"❌ Сегодня уже выполнено <b>2 лега</b>.\n"
+                            f"🕛 Счётчик сбросится в <b>00:00 UTC (03:00 МСК)</b>"
                         )
-                    elif rate <= -OPERATION_FAIL_RATE:
-                        # Жёсткая посадка — этап провален, 0 очков
-                        db_op_add_leg(
-                            pilot_name, leg_num, dep, arr, rate,
-                            0, report_id or "", report_url_op,
-                        )
-                        tg_send(
-                            f"🔴 <b>ЭТАП ПРОВАЛЕН — ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
-                            f"👨‍✈️ <b>{pilot_name}</b>\n"
-                            f"✈️ Leg {leg_num}: {dep} → {arr}\n"
-                            f"📊 Посадка: <b>{rate} fpm</b> — слишком жёстко!\n\n"
-                            f"❌ Очки не начислены. Повторите Leg {leg_num}."
-                        )
+                        logger.info(f"[Operation] {pilot_name} leg={leg_num} — дневной лимит")
                     else:
-                        # Успешная посадка — рассчитываем очки
-                        earned, coeff, net_bonus = op_calc_points(leg_pts, aircraft_icao_type, on_network)
-                        next_leg    = leg_num + 1
-                        is_finished = next_leg > len(OPERATION_LEGS)
-                        new_status  = "finished" if is_finished else "active"
-                        new_points  = pilot["total_points"] + earned
-    
-                        db_op_add_leg(
-                            pilot_name, leg_num, dep, arr, rate,
-                            earned, report_id or "", report_url_op,
-                            base_points=leg_pts, coeff=coeff,
-                            net_bonus=net_bonus, on_network=on_network,
-                        )
-                        db_op_update_pilot(
-                            pilot_name,
-                            next_leg if not is_finished else leg_num,
-                            new_points, new_status,
-                        )
-    
-                        # Строка с деталями начисления
-                        coeff_str  = f"×{coeff}" if coeff != 1.0 else ""
-                        bonus_str  = f" +{net_bonus} (VATSIM/IVAO)" if net_bonus else ""
-                        detail_str = f"{leg_pts}{coeff_str}{bonus_str} = <b>{earned}</b>"
-    
-                        if is_finished:
+                        # Определяем тип ВС и сеть
+                        aircraft_icao_type = (
+                            d.get("aircraft") or {}
+                        ).get("icao") or aircraft.get("icao_name", "")
+                        user_handles = user.get("handles") or {}
+                        on_network   = bool(user_handles.get("vatsim") or user_handles.get("ivao"))
+
+                        if rate <= -OPERATION_HARD_CRASH:
+                            # Крушение — полный сброс
+                            db_op_add_leg(
+                                pilot_name, leg_num, dep, arr, rate,
+                                0, report_id or "", report_url_op,
+                            )
+                            db_op_reset_pilot(pilot_name)
                             tg_send(
-                                f"🏁 <b>ФИНИШ! ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
-                                f"👨‍✈️ <b>{pilot_name}</b> завершил маршрут!\n"
-                                f"✈️ Последний этап: {dep} → {arr}\n"
-                                f"📊 Посадка: <b>{rate} fpm</b>\n"
-                                f"⭐ Очки: {detail_str} | Итого: <b>{new_points:,}</b>\n\n"
-                                f"🎉 Борт успешно перегнан в SBRJ!"
+                                f"💥 <b>КРУШЕНИЕ — ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
+                                f"👨‍✈️ <b>{pilot_name}</b>\n"
+                                f"✈️ Leg {leg_num}: {dep} → {arr}\n"
+                                f"📊 Посадка: <b>{rate} fpm</b>\n\n"
+                                f"⚠️ Борт утерян. Весь прогресс сброшен.\n"
+                                f"Пилот начинает с Leg 1."
+                            )
+                        elif rate <= -OPERATION_FAIL_RATE:
+                            # Жёсткая посадка — этап провален, 0 очков
+                            db_op_add_leg(
+                                pilot_name, leg_num, dep, arr, rate,
+                                0, report_id or "", report_url_op,
+                            )
+                            tg_send(
+                                f"🔴 <b>ЭТАП ПРОВАЛЕН — ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
+                                f"👨‍✈️ <b>{pilot_name}</b>\n"
+                                f"✈️ Leg {leg_num}: {dep} → {arr}\n"
+                                f"📊 Посадка: <b>{rate} fpm</b> — слишком жёстко!\n\n"
+                                f"❌ Очки не начислены. Повторите Leg {leg_num}."
                             )
                         else:
-                            next_info = next(
-                                (f"{d2}→{a2}" for n2, d2, a2, _ in OPERATION_LEGS if n2 == next_leg), ""
+                            # Успешная посадка — рассчитываем очки
+                            earned, coeff, net_bonus = op_calc_points(
+                                leg_pts, aircraft_icao_type, on_network
                             )
-                            # Инфо о лимите суток (включая текущий лег)
-                            legs_after = legs_today + 1
-                            if legs_after >= 2:
-                                limit_str = (
-                                    f"\n🕛 На сегодня лимит исчерпан. "
-                                    f"Следующий лег — после <b>00:00 UTC (03:00 МСК)</b>"
+                            next_leg    = leg_num + 1
+                            is_finished = next_leg > len(OPERATION_LEGS)
+                            new_status  = "finished" if is_finished else "active"
+                            new_points  = pilot["total_points"] + earned
+
+                            db_op_add_leg(
+                                pilot_name, leg_num, dep, arr, rate,
+                                earned, report_id or "", report_url_op,
+                                base_points=leg_pts, coeff=coeff,
+                                net_bonus=net_bonus, on_network=on_network,
+                            )
+                            db_op_update_pilot(
+                                pilot_name,
+                                next_leg if not is_finished else leg_num,
+                                new_points, new_status,
+                            )
+
+                            coeff_str  = f"x{coeff}" if coeff != 1.0 else ""
+                            bonus_str  = f" +{net_bonus} (VATSIM/IVAO)" if net_bonus else ""
+                            detail_str = f"{leg_pts}{coeff_str}{bonus_str} = <b>{earned}</b>"
+
+                            ferry_num  = pilot.get("ferry_num", 1)
+
+                            if is_finished:
+                                tg_send(
+                                    f"🏁 <b>ФИНИШ! ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
+                                    f"👨‍✈️ <b>{pilot_name}</b> завершил перегон #{ferry_num}!\n"
+                                    f"✈️ Последний этап: {dep} → {arr}\n"
+                                    f"📊 Посадка: <b>{rate} fpm</b>\n"
+                                    f"⭐ Очки: {detail_str} | Итого: <b>{new_points:,}</b>\n\n"
+                                    f"🎉 Борт успешно перегнан в SBRJ!\n"
+                                    f"✈️ Готов к следующему перегону — "
+                                    f"/operation_admin add {pilot_name} | самолёт"
                                 )
                             else:
-                                limit_str = f"\n✅ Сегодня можно выполнить ещё <b>1 лег</b>"
-
-                            tg_send(
-                                f"✅ <b>LEG {leg_num} ВЫПОЛНЕН — «{OPERATION_NAME}»</b>\n\n"
-                                f"👨‍✈️ <b>{pilot_name}</b>\n"
-                                f"✈️ {dep} → {arr}\n"
-                                f"📊 Посадка: <b>{rate} fpm</b>\n"
-                                f"⭐ Очки: {detail_str} | Итого: <b>{new_points:,}</b>\n"
-                                f"➡️ Следующий: Leg {next_leg} {next_info}"
-                                f"{limit_str}"
-                            )
-                    logger.info(
-                        f"[Operation] {pilot_name} leg={leg_num} rate={rate} "
-                        f"aircraft={aircraft_icao_type} network={on_network} pts={earned if rate > -OPERATION_FAIL_RATE else 0}"
-                    )
+                                next_info = next(
+                                    (f"{d2}→{a2}" for n2, d2, a2, _ in OPERATION_LEGS if n2 == next_leg), ""
+                                )
+                                legs_after = legs_today + 1
+                                limit_str  = (
+                                    f"\n🕛 На сегодня лимит исчерпан. "
+                                    f"Следующий лег — после <b>00:00 UTC (03:00 МСК)</b>"
+                                    if legs_after >= 2 else
+                                    f"\n✅ Сегодня можно выполнить ещё <b>1 лег</b>"
+                                )
+                                tg_send(
+                                    f"✅ <b>LEG {leg_num} ВЫПОЛНЕН — «{OPERATION_NAME}»</b>\n\n"
+                                    f"👨‍✈️ <b>{pilot_name}</b>\n"
+                                    f"✈️ {dep} → {arr}\n"
+                                    f"📊 Посадка: <b>{rate} fpm</b>\n"
+                                    f"⭐ Очки: {detail_str} | Итого: <b>{new_points:,}</b>\n"
+                                    f"➡️ Следующий: Leg {next_leg} {next_info}"
+                                    f"{limit_str}"
+                                )
+                        logger.info(
+                            f"[Operation] {pilot_name} leg={leg_num} rate={rate} "
+                            f"network={on_network}"
+                        )
 
     # ─── Проверка конкурса Мастер Посадки ───────────────────────
     if is_contest_landing(rate):
@@ -2336,16 +2404,16 @@ def handle_tg_command(message: Dict):
         return
 
     # В канале/чате обрабатываем только команды с явным упоминанием бота:
-    # /runway@vaup_bot UHWW — сработает.
-    # /runway UHWW или обычный текст — игнорируем, чтобы не мешать общению.
+    # /runway@vaup_bot UHWW - сработает.
+    # /runway UHWW или обычный текст - игнорируем, чтобы не мешать общению.
     if str(chat_id) == str(CHAT_ID):
-        # Если пользователь уже в режиме ожидания ICAO — пропускаем фильтр,
+        # Если пользователь уже в режиме ожидания ICAO - пропускаем фильтр,
         # чтобы он мог ответить боту прямо в канале.
         with _awaiting_lock:
             user_is_awaiting = str(chat_id) in _awaiting_icao
         if not user_is_awaiting:
             # В канале реагируем только на команды с явным упоминанием бота:
-            # /runway@up_va_bot — сработает, обычный текст — нет.
+            # /runway@up_va_bot - сработает, обычный текст - нет.
             first_word = text.split()[0] if text.split() else ""
             addressed_to_bot = "@" in first_word and first_word.startswith("/")
             if not addressed_to_bot:
@@ -2353,7 +2421,7 @@ def handle_tg_command(message: Dict):
 
     logger.info(f"Command from chat={chat_id}: {text}")
 
-    # Парсим команду один раз — используется во всех блоках ниже
+    # Парсим команду один раз - используется во всех блоках ниже
     cmd_parts = text.split()
     base_cmd  = cmd_parts[0].split("@")[0] if cmd_parts else ""
 
@@ -2388,11 +2456,16 @@ def handle_tg_command(message: Dict):
                 tg_send("Использование: /operation_admin add Имя Фамилия | B738", chat_id)
                 return
             ok = db_op_register_pilot(pilot, aircraft)
-            tg_send(
-                f"✅ Пилот <b>{pilot}</b> зарегистрирован{' на ' + aircraft if aircraft else ''}."
-                if ok else f"⚠️ Пилот <b>{pilot}</b> уже зарегистрирован.",
-                chat_id
-            )
+            if ok:
+                p = db_op_get_pilot(pilot)
+                ferry = p["ferry_num"] if p else 1
+                msg = (
+                    f"✅ Пилот <b>{pilot}</b> — перегон #{ferry} начат"
+                    f"{' на ' + aircraft if aircraft else ''}."
+                )
+            else:
+                msg = f"⚠️ Пилот <b>{pilot}</b> уже ведёт активный перегон."
+            tg_send(msg, chat_id)
 
         elif sub == "set":
             # Формат: /operation_admin set Имя Фамилия | +500
@@ -2505,7 +2578,7 @@ def handle_tg_command(message: Dict):
 
     if base_cmd == "/runway":
         if len(cmd_parts) < 2:
-            # Аргумент не передан — переходим в режим ожидания ICAO
+            # Аргумент не передан - переходим в режим ожидания ICAO
             with _awaiting_lock:
                 _awaiting_icao[str(chat_id)] = True
             tg_send_with_cancel(
@@ -2595,13 +2668,13 @@ def init_scheduler():
         "cron", hour=23, minute=50,
         id="daily_economy_snapshot",
     )
-    # Финансовый отчёт за сутки — 23:00 МСК (20:00 UTC)
+    # Финансовый отчёт за сутки - 23:00 МСК (20:00 UTC)
     scheduler.add_job(
         lambda: tg_send(fmt_daily_economy()),
         "cron", hour=20, minute=0,
         id="daily_economy_report",
     )
-    # Статистика операций — 00:00 МСК (21:00 UTC)
+    # Статистика операций - 00:00 МСК (21:00 UTC)
     scheduler.add_job(
         lambda: tg_send(fmt_stats()),
         "cron", hour=21, minute=0,
@@ -2718,7 +2791,7 @@ def tg_webhook():
 
 
 # ═══════════════════════════════════════════════════════════════
-# STARTUP — выполняется один раз при загрузке модуля.
+# STARTUP - выполняется один раз при загрузке модуля.
 # Gunicorn с флагом --preload загружает модуль ДО форка воркеров,
 # поэтому планировщик стартует ровно один раз.
 #
