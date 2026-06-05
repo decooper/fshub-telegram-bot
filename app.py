@@ -500,7 +500,7 @@ OPERATION_LEGS = [
     (10, "NTGJ", "SCIP", 1430),
     (11, "SCIP", "SCFA", 2160),
     (12, "SCFA", "SGAS",  780),
-    (13, "SGAS", "SBRJ",  810),
+    (13, "SGAS", "SBGL",  810),
 ]
 OPERATION_LEG_MAP = {(dep, arr): (num, pts) for num, dep, arr, pts in OPERATION_LEGS}
 
@@ -1734,7 +1734,7 @@ def fmt_operation() -> str:
 
     header = (
         f"✈️ <b>ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n"
-        f"<i>VTBS → SBRJ • 13 этапов • {OPERATION_START} – {OPERATION_END}</i>\n"
+        f"<i>VTBS → SBGL • 13 этапов • {OPERATION_START} – {OPERATION_END}</i>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━\n"
     )
 
@@ -2153,7 +2153,7 @@ def handle_completed(data: Dict):
                         f"✈️ <b>НОВЫЙ ПЕРЕГОН #{new_ferry} — «{OPERATION_NAME}»</b>\n\n"
                         f"👨‍✈️ <b>{pilot_name}</b> начинает новый перегон!\n"
                         f"✈️ Самолёт: <b>{aircraft_name_op}</b>\n"
-                        f"🗺 Маршрут: VTBS → SBRJ"
+                        f"🗺 Маршрут: VTBS → SBGL"
                     )
 
             if pilot and pilot["status"] == "active":
@@ -2248,7 +2248,7 @@ def handle_completed(data: Dict):
                                     f"✈️ Последний этап: {dep} → {arr}\n"
                                     f"📊 Посадка: <b>{rate} fpm</b>\n"
                                     f"⭐ Очки: {detail_str} | Итого: <b>{new_points:,}</b>\n\n"
-                                    f"🎉 Борт успешно перегнан в SBRJ!\n"
+                                    f"🎉 Борт успешно перегнан в SBGL!\n"
                                     f"✈️ Готов к следующему перегону — "
                                     f"/operation_admin add {pilot_name} | самолёт"
                                 )
@@ -2788,6 +2788,157 @@ def tg_webhook():
     except Exception as e:
         logger.exception(f"Telegram webhook failure: {e}")
     return jsonify({"ok": True})
+
+
+# ═══════════════════════════════════════════════════════════════
+# PUBLIC API — для сайта va-up.ru
+# ═══════════════════════════════════════════════════════════════
+
+def _cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = 'https://va-up.ru'
+    response.headers['Access-Control-Allow-Methods'] = 'GET'
+    response.headers['Cache-Control'] = 'public, max-age=60'
+    return response
+
+
+@app.route("/api/operation")
+def api_operation():
+    """Таблица лидеров операции Тихий Вжух."""
+    try:
+        pilots = db_op_all_pilots()
+        total_legs = len(OPERATION_LEGS)
+        result = []
+        for i, p in enumerate(pilots, 1):
+            legs_done = max(0, p["current_leg"] - 1)
+            if p["status"] == "finished":
+                legs_done = total_legs
+            result.append({
+                "rank":         i,
+                "pilot_name":   p["pilot_name"],
+                "aircraft":     p["aircraft"] or "",
+                "current_leg":  p["current_leg"],
+                "total_legs":   total_legs,
+                "legs_done":    legs_done,
+                "total_points": p["total_points"],
+                "ferry_num":    p.get("ferry_num", 1),
+                "status":       p["status"],
+            })
+        resp = jsonify({
+            "ok": True,
+            "operation": {
+                "name":       OPERATION_NAME,
+                "start":      OPERATION_START,
+                "end":        OPERATION_END,
+                "active":     operation_is_active(),
+                "max_points": OPERATION_MAX_POINTS,
+            },
+            "pilots": result,
+            "total": len(result),
+        })
+        return _cors_headers(resp)
+    except Exception as e:
+        logger.exception(f"API /api/operation error: {e}")
+        return _cors_headers(jsonify({"ok": False, "error": str(e)})), 500
+
+
+@app.route("/api/flights")
+def api_flights():
+    """Последние рейсы из БД бота."""
+    try:
+        limit = min(int(request.args.get("limit", 10)), 50)
+        month_only = request.args.get("month", "0") == "1"
+        flights = db_flights_this_month()[:limit] if month_only else db_last_flights(limit)
+        result = []
+        for f in flights:
+            dep = f["departure"] or "????"
+            arr = f["arrival"]   or "????"
+            fno = f["flight_no"] or "N/A"
+            no_plan = fno in ("N/A", "", "None") or dep in ("????", "", "None") or arr in ("????", "", "None")
+            rating, _ = landing_rating(f["landing_rate"])
+            result.append({
+                "flight_no":    fno if not no_plan else None,
+                "pilot":        f["pilot"],
+                "departure":    dep if not no_plan else None,
+                "arrival":      arr if not no_plan else None,
+                "aircraft":     f["aircraft"],
+                "landing_rate": f["landing_rate"],
+                "rating":       rating,
+                "no_plan":      no_plan,
+                "report_url":   f"https://fshub.io/flight/{f['flight_id']}/report" if f.get("flight_id") else None,
+                "created_at":   f["created_at"].isoformat() if f.get("created_at") else None,
+            })
+        resp = jsonify({"ok": True, "flights": result, "total": len(result)})
+        return _cors_headers(resp)
+    except Exception as e:
+        logger.exception(f"API /api/flights error: {e}")
+        return _cors_headers(jsonify({"ok": False, "error": str(e)})), 500
+
+
+@app.route("/api/stats")
+def api_stats():
+    """Статистика операций."""
+    try:
+        from collections import Counter
+        flights_month = db_flights_this_month()
+        flights_all   = db_all_flights()
+        rates_month   = [f["landing_rate"] for f in flights_month]
+        rates_all     = [f["landing_rate"] for f in flights_all]
+        avg_month = round(sum(rates_month) / len(rates_month)) if rates_month else 0
+        avg_all   = round(sum(rates_all)   / len(rates_all))   if rates_all   else 0
+        pilot_counts = Counter(f["pilot"] for f in flights_month)
+        top_pilots = [{"pilot": n, "flights": c} for n, c in pilot_counts.most_common(5)]
+        now = datetime.now()
+        resp = jsonify({
+            "ok": True,
+            "month": {
+                "label":       f"{MONTH_NAMES[now.month]} {now.year}",
+                "flights":     len(flights_month),
+                "avg_landing": avg_month,
+                "top_pilots":  top_pilots,
+            },
+            "total": {"flights": len(flights_all), "avg_landing": avg_all},
+        })
+        return _cors_headers(resp)
+    except Exception as e:
+        logger.exception(f"API /api/stats error: {e}")
+        return _cors_headers(jsonify({"ok": False, "error": str(e)})), 500
+
+
+@app.route("/api/contest")
+def api_contest():
+    """Конкурс Мастер Посадки."""
+    try:
+        now     = datetime.now()
+        month   = now.strftime("%Y-%m")
+        entries = db_contest_month(month)
+        slots   = CONTEST_MONTHLY_LIMIT // CONTEST_POINTS_PER_LANDING
+        earned  = min(len(entries) * CONTEST_POINTS_PER_LANDING, CONTEST_MONTHLY_LIMIT)
+        result  = []
+        for i, e in enumerate(entries, 1):
+            result.append({
+                "rank":         i,
+                "pilot":        e["pilot"],
+                "flight_no":    e["flight_no"],
+                "departure":    e["departure"],
+                "arrival":      e["arrival"],
+                "landing_rate": e["landing_rate"],
+                "points":       CONTEST_POINTS_PER_LANDING if i <= slots else 0,
+                "report_url":   e.get("report_url", ""),
+            })
+        resp = jsonify({
+            "ok": True,
+            "month":         month,
+            "month_label":   f"{MONTH_NAMES[now.month]} {now.year}",
+            "slots_total":   slots,
+            "slots_used":    min(len(entries), slots),
+            "points_limit":  CONTEST_MONTHLY_LIMIT,
+            "points_earned": earned,
+            "entries":       result,
+        })
+        return _cors_headers(resp)
+    except Exception as e:
+        logger.exception(f"API /api/contest error: {e}")
+        return _cors_headers(jsonify({"ok": False, "error": str(e)})), 500
 
 
 # ═══════════════════════════════════════════════════════════════
