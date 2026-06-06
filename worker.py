@@ -1,20 +1,25 @@
 """
 worker.py — VA UP! Background Worker
+
 Запускается как отдельный сервис на Render (Background Worker).
 НЕ содержит Flask, Gunicorn или HTTP-обработчиков.
+
+Изменения v2:
+- Добавлена отправка в Discord через Webhook
+- discord_send() — аналог tg_send(), но для Discord
+- HTML-теги из Telegram автоматически очищаются для Discord
+- Все задачи отправляют уведомления в оба канала
 """
 
 import os
 import sys
+import re
 import time
 import logging
+import requests
 from datetime import datetime
 
 # ───── Импорт общих модулей из app.py ─────
-# Предполагается, что shared.py содержит:
-# tg_send, fmt_stats, fmt_top_landings, fmt_top_pilots,
-# fmt_monthly_economy, snapshot_daily_economy, _create_pool, _init_db
-
 try:
     from app import (
         tg_send,
@@ -36,15 +41,70 @@ from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 
 # ═══════════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════════
+
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+
+# ═══════════════════════════════════════════════════════════════
 # LOGGING
 # ═══════════════════════════════════════════════════════════════
 
 worker_logger = logging.getLogger("va_up_worker")
 worker_logger.setLevel(logging.INFO)
-
 handler = logging.StreamHandler(sys.stdout)
 handler.setFormatter(logging.Formatter("%(asctime)s | WORKER | %(levelname)s | %(message)s"))
 worker_logger.addHandler(handler)
+
+# ═══════════════════════════════════════════════════════════════
+# DISCORD
+# ═══════════════════════════════════════════════════════════════
+
+def _tg_to_discord(text: str) -> str:
+    """
+    Конвертирует Telegram HTML-разметку в читаемый текст для Discord.
+    Discord поддерживает Markdown, поэтому <b> → **bold**, <i> → *italic*.
+    """
+    text = re.sub(r"<b>(.*?)</b>", r"**\1**", text, flags=re.DOTALL)
+    text = re.sub(r"<i>(.*?)</i>", r"*\1*", text, flags=re.DOTALL)
+    text = re.sub(r"<code>(.*?)</code>", r"`\1`", text, flags=re.DOTALL)
+    text = re.sub(r'<a href="(.*?)">(.*?)</a>', r"[\2](\1)", text, flags=re.DOTALL)
+    # Убираем оставшиеся HTML-теги
+    text = re.sub(r"<[^>]+>", "", text)
+    return text.strip()
+
+
+def discord_send(text: str) -> bool:
+    """Отправляет сообщение в Discord через Webhook."""
+    if not DISCORD_WEBHOOK_URL:
+        worker_logger.warning("DISCORD_WEBHOOK_URL не задан, пропускаем Discord")
+        return False
+
+    clean = _tg_to_discord(text)
+
+    # Discord лимит — 2000 символов
+    if len(clean) > 2000:
+        clean = clean[:1997] + "..."
+
+    try:
+        r = requests.post(
+            DISCORD_WEBHOOK_URL,
+            json={"content": clean},
+            timeout=10,
+        )
+        if r.status_code in (200, 204):
+            return True
+        worker_logger.warning(f"Discord webhook failed: {r.status_code} — {r.text}")
+        return False
+    except Exception as e:
+        worker_logger.error(f"❌ Ошибка Discord webhook: {e}")
+        return False
+
+
+def broadcast(text: str) -> None:
+    """Отправляет сообщение в Telegram и Discord одновременно."""
+    tg_send(text)
+    discord_send(text)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -64,32 +124,52 @@ def safe_job(name: str, fn):
     return wrapper
 
 
+# ═══════════════════════════════════════════════════════════════
+# JOBS
+# ═══════════════════════════════════════════════════════════════
+
 def job_daily_economy():
     snapshot_daily_economy()
 
 
 def job_daily_stats():
-    tg_send(fmt_stats())
+    msg = fmt_stats()
+    tg_send(msg)
+    discord_send(msg)
 
 
 def job_night_stats():
-    tg_send(fmt_stats())
+    msg = fmt_stats()
+    tg_send(msg)
+    discord_send(msg)
 
 
 def job_weekly_landing_ranking():
-    tg_send(fmt_top_landings())
+    msg = fmt_top_landings()
+    tg_send(msg)
+    discord_send(msg)
 
 
 def job_weekly_top_pilots():
-    tg_send(fmt_top_pilots())
+    msg = fmt_top_pilots()
+    tg_send(msg)
+    discord_send(msg)
 
 
 def job_saturday_inv():
-    tg_send(
-        "🛫 <b>СОВМЕСТНАЯ СУББОТНЯЯ ОПЕРАЦИЯ!</b>\n\n"
-        "⏰ Москва: 09:00 ☀️  |  Камчатка: 18:00 🌙\n\n"
+    msg = (
+        "🛫 **СОВМЕСТНАЯ СУББОТНЯЯ ОПЕРАЦИЯ!**\n\n"
+        "⏰ Москва: 09:00 ☀️ | Камчатка: 18:00 🌙\n\n"
         "✈️ Предлагайте маршрут в комментариях!\nКто присоединяется? 👇"
     )
+    # Для Telegram отправляем с HTML-тегами
+    tg_send(
+        "🛫 <b>СОВМЕСТНАЯ СУББОТНЯЯ ОПЕРАЦИЯ!</b>\n\n"
+        "⏰ Москва: 09:00 ☀️ | Камчатка: 18:00 🌙\n\n"
+        "✈️ Предлагайте маршрут в комментариях!\nКто присоединяется? 👇"
+    )
+    # Для Discord — с Markdown
+    discord_send(msg)
 
 
 def job_monday_challenge():
@@ -98,10 +178,17 @@ def job_monday_challenge():
         "🔹 Цель: 3 рейса за 7 дней\n"
         "🔹 Бонус: лучшая посадка недели\n\nГотов принять вызов? 💪"
     )
+    discord_send(
+        "🏆 **ЕЖЕНЕДЕЛЬНЫЙ ВЫЗОВ ЭКИПАЖУ!**\n\n"
+        "🔹 Цель: 3 рейса за 7 дней\n"
+        "🔹 Бонус: лучшая посадка недели\n\nГотов принять вызов? 💪"
+    )
 
 
 def job_monthly_digest():
-    tg_send(fmt_monthly_economy())
+    msg = fmt_monthly_economy()
+    tg_send(msg)
+    discord_send(msg)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -120,8 +207,8 @@ def build_scheduler() -> BlockingScheduler:
     scheduler = BlockingScheduler(
         executors={"default": ThreadPoolExecutor(max_workers=2)},
         job_defaults={
-            "coalesce": True,         # Не накапливать пропущенные запуски
-            "max_instances": 1,       # Одновременно только 1 экземпляр задачи
+            "coalesce": True,        # Не накапливать пропущенные запуски
+            "max_instances": 1,      # Одновременно только 1 экземпляр задачи
             "misfire_grace_time": 3600,  # Терпеть опоздание до 1 часа
         },
         timezone="UTC",
@@ -183,8 +270,13 @@ def build_scheduler() -> BlockingScheduler:
 
 def main():
     worker_logger.info("═" * 60)
-    worker_logger.info("  VA UP! Background Worker — запуск")
+    worker_logger.info(" VA UP! Background Worker v2 — запуск")
     worker_logger.info("═" * 60)
+
+    if DISCORD_WEBHOOK_URL:
+        worker_logger.info("✅ Discord webhook настроен")
+    else:
+        worker_logger.warning("⚠️  DISCORD_WEBHOOK_URL не задан — уведомления только в Telegram")
 
     # Инициализация БД
     try:
@@ -196,17 +288,15 @@ def main():
         sys.exit(1)
 
     scheduler = build_scheduler()
-
     jobs = scheduler.get_jobs()
     worker_logger.info(f"📋 Зарегистрировано задач: {len(jobs)}")
     for job in jobs:
-        next_run = job.next_run_time
-        worker_logger.info(f"   • {job.id} → следующий запуск: {next_run}")
+        worker_logger.info(f"  • {job.id} → следующий запуск: {job.next_run_time}")
 
     worker_logger.info("🚀 Планировщик запущен. Ожидание задач...")
 
     try:
-        scheduler.start()  # BlockingScheduler — блокирует основной поток
+        scheduler.start()
     except (KeyboardInterrupt, SystemExit):
         worker_logger.info("🛑 Worker остановлен")
         scheduler.shutdown(wait=False)
