@@ -17,7 +17,7 @@ import re
 import time
 import logging
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ───── Импорт общих модулей из app.py ─────
 try:
@@ -259,6 +259,19 @@ def build_scheduler() -> BlockingScheduler:
         "cron", day=1, hour=9, minute=0,
         id="monthly_digest",
     )
+
+    # ── ТЕСТ — удалить после проверки ─────────────────────────
+    # Запускается через 1 минуту после старта воркера
+    scheduler.add_job(
+        safe_job("test_discord", lambda: discord_send(
+            "✅ **Тест Discord интеграции** — UP! Virtual Airlines\n"
+            "Если видишь это сообщение — webhook работает! 🛫"
+        )),
+        "date",
+        run_date=datetime.now() + timedelta(minutes=1),
+        id="test_discord",
+    )
+    # ── /ТЕСТ ──────────────────────────────────────────────────
 
     scheduler.add_listener(job_listener, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
     return scheduler
