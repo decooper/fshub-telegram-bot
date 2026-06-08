@@ -53,6 +53,17 @@ TG_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 FSA_ENRICH_DEPARTURE_DELAY = 90
 FSA_ENRICH_ARRIVAL_DELAY   = 180
 
+# ── Discord Webhooks ───────────────────────────────────────────
+# Три отдельных вебхука для разных каналов Discord.
+# Если переменная не задана — отправка в этот канал молча пропускается.
+#
+# DISCORD_WEBHOOK_FLIGHTS  → канал с вылетами и посадками (реал-тайм)
+# DISCORD_WEBHOOK_EVENT    → канал операции «Тихий Вжух» (реал-тайм)
+# DISCORD_WEBHOOK_URL      → канал плановых задач по расписанию (worker.py)
+DISCORD_WEBHOOK_FLIGHTS = os.environ.get("DISCORD_WEBHOOK_FLIGHTS", "")
+DISCORD_WEBHOOK_EVENT   = os.environ.get("DISCORD_WEBHOOK_EVENT",   "")
+DISCORD_WEBHOOK_URL     = os.environ.get("DISCORD_WEBHOOK_URL",     "")
+
 # ═══════════════════════════════════════════════════════════════
 # LOGGING
 # ═══════════════════════════════════════════════════════════════
@@ -88,6 +99,68 @@ _retry = Retry(
 _adapter = HTTPAdapter(max_retries=_retry)
 session.mount("https://", _adapter)
 session.mount("http://", _adapter)
+
+# ═══════════════════════════════════════════════════════════════
+# DISCORD
+# ═══════════════════════════════════════════════════════════════
+
+# Скомпилированные паттерны для конвертации Telegram HTML → Discord Markdown
+_RE_DC_BOLD = re.compile(r"<b>(.*?)</b>",              re.DOTALL)
+_RE_DC_ITAL = re.compile(r"<i>(.*?)</i>",              re.DOTALL)
+_RE_DC_CODE = re.compile(r"<code>(.*?)</code>",        re.DOTALL)
+_RE_DC_LINK = re.compile(r'<a href="(.*?)">(.*?)</a>', re.DOTALL)
+_RE_DC_TAGS = re.compile(r"<[^>]+>")
+
+
+def _tg_to_discord(text: str) -> str:
+    """Конвертирует Telegram HTML-разметку в Discord Markdown."""
+    text = _RE_DC_BOLD.sub(r"**\1**", text)
+    text = _RE_DC_ITAL.sub(r"*\1*",   text)
+    text = _RE_DC_CODE.sub(r"`\1`",   text)
+    text = _RE_DC_LINK.sub(r"[\2](\1)", text)
+    text = _RE_DC_TAGS.sub("", text)
+    return text.strip()
+
+
+def discord_send(text: str, webhook_url: str = "") -> bool:
+    """
+    Отправляет сообщение в Discord через Webhook (с retry).
+
+    webhook_url — конкретный вебхук для отправки.
+    Если не передан — используется DISCORD_WEBHOOK_URL (плановые задачи).
+    Если вебхук не задан — молча возвращает False без ошибок в лог.
+    """
+    url = webhook_url or DISCORD_WEBHOOK_URL
+    if not url:
+        return False
+
+    clean = _tg_to_discord(text)
+    if len(clean) > 2000:
+        clean = clean[:1997] + "..."
+
+    try:
+        r = session.post(
+            url,
+            json={"content": clean},
+            timeout=10,
+        )
+        if r.status_code in (200, 204):
+            return True
+        logger.warning(f"Discord webhook failed ({r.status_code}): {r.text[:200]}")
+        return False
+    except Exception as e:
+        logger.error(f"Discord send error: {e}")
+        return False
+
+
+def discord_send_flights(text: str) -> bool:
+    """Отправляет в канал вылетов/посадок."""
+    return discord_send(text, DISCORD_WEBHOOK_FLIGHTS)
+
+
+def discord_send_event(text: str) -> bool:
+    """Отправляет в канал операции «Тихий Вжух»."""
+    return discord_send(text, DISCORD_WEBHOOK_EVENT)
 
 # ═══════════════════════════════════════════════════════════════
 # DATABASE
