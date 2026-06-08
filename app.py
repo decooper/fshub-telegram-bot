@@ -293,7 +293,7 @@ def _enrich_departure_from_fsa(
             f"🛫 <b>ВЫЛЕТ ПОДТВЕРЖДЁН — CLEARED FOR TAKEOFF</b>\n\n"
             f"👨‍✈️ Captain: <b>{pilot_name}</b>\n"
             f"✈️ Aircraft: <b>{aircraft_name}</b>\n\n"
-            f"⚠️ <i>Маршрут не найден — пилот не активировал план в RLM Client</i>\n"
+            f"⚠️ <i>Маршрут не загружен в FSAirlines (RLM Client не активирован)</i>\n"
             f"✈️ <i>Желаем попутного ветра и мягкой посадки!</i>"
         )
         return
@@ -301,21 +301,31 @@ def _enrich_departure_from_fsa(
     status = fsa_get_pilot_status(pilot_id)
     if not status:
         logger.warning(f"[Enrich] Статус пилота {pilot_id} не получен из FSAirlines")
+        tg_edit_message(
+            chat_id_str, message_id,
+            f"🛫 <b>ВЫЛЕТ ПОДТВЕРЖДЁН — CLEARED FOR TAKEOFF</b>\n\n"
+            f"👨‍✈️ Captain: <b>{pilot_name}</b>\n"
+            f"✈️ Aircraft: <b>{aircraft_name}</b>\n\n"
+            f"⚠️ <i>Не удалось получить план из FSAirlines</i>\n"
+            f"✈️ <i>Желаем попутного ветра и мягкой посадки!</i>"
+        )
         return
 
-    dep       = status.get("departure", "????")
-    arr       = status.get("arrival", "????")
+    dep    = status.get("departure", "????")
+    arr    = status.get("arrival",   "????")
 
-    active  = fsa_active_flights()
-    flt_no  = "N/A"
+    # Номер рейса берём из активных рейсов FSHub (FSHub = источник данных полёта)
+    active = fsa_active_flights()
+    flt_no = "N/A"
     for f in active:
         if str(f.get("user_id")) == str(pilot_id):
             flt_no = f.get("number", "N/A")
             break
 
-    logger.info(f"[Enrich] Получены данные FSA: {dep}→{arr} flight={flt_no}")
+    logger.info(f"[Enrich] FSAirlines: {dep}→{arr} flight={flt_no}")
 
     if _is_valid_icao(dep) and _is_valid_icao(arr):
+        # Сохраняем в кэш только FSAirlines маршрут — from_fsa: True
         with _departure_cache_lock:
             _departure_cache[pilot_name] = {
                 "dep":       dep,
@@ -324,16 +334,25 @@ def _enrich_departure_from_fsa(
                 "ts":        time.time(),
                 "from_fsa":  True,
             }
-
-    tg_edit_message(
-        chat_id_str, message_id,
-        f"🛫 <b>ВЫЛЕТ ПОДТВЕРЖДЁН — CLEARED FOR TAKEOFF</b>\n\n"
-        f"👨‍✈️ Captain: <b>{pilot_name}</b>\n"
-        f"🆔 Flight: <b>{flt_no}</b>\n"
-        f"🗺 Route: <b>{dep} → {arr}</b>\n"
-        f"✈️ Aircraft: <b>{aircraft_name}</b>\n\n"
-        f"✈️ <i>Желаем попутного ветра и мягкой посадки!</i>"
-    )
+        tg_edit_message(
+            chat_id_str, message_id,
+            f"🛫 <b>ВЫЛЕТ ПОДТВЕРЖДЁН — CLEARED FOR TAKEOFF</b>\n\n"
+            f"👨‍✈️ Captain: <b>{pilot_name}</b>\n"
+            f"🆔 Flight: <b>{flt_no}</b>\n"
+            f"🗺 Route: <b>{dep} → {arr}</b>\n"
+            f"✈️ Aircraft: <b>{aircraft_name}</b>\n\n"
+            f"✈️ <i>Желаем попутного ветра и мягкой посадки!</i>"
+        )
+    else:
+        logger.warning(f"[Enrich] FSAirlines вернул невалидный маршрут: {dep}→{arr}")
+        tg_edit_message(
+            chat_id_str, message_id,
+            f"🛫 <b>ВЫЛЕТ ПОДТВЕРЖДЁН — CLEARED FOR TAKEOFF</b>\n\n"
+            f"👨‍✈️ Captain: <b>{pilot_name}</b>\n"
+            f"✈️ Aircraft: <b>{aircraft_name}</b>\n\n"
+            f"⚠️ <i>FSAirlines не вернул маршрут — план не активирован в RLM Client</i>\n"
+            f"✈️ <i>Желаем попутного ветра и мягкой посадки!</i>"
+        )
 
 
 def _enrich_completed_from_fsa(
@@ -415,73 +434,55 @@ def handle_departure(data: Dict):
     aircraft      = d.get("aircraft") or {}
     aircraft_name = aircraft.get("icao_name", "N/A")
 
-    if not _is_plan_empty(plan):
-        logger.info(f"[Departure] Полный план от FSHub для '{pilot_name}'")
-        with _departure_cache_lock:
-            _departure_cache[pilot_name] = {
-                "dep":       plan.get("departure", "????"),
-                "arr":       plan.get("arrival", "????"),
-                "flight_no": plan.get("flight_no", "N/A"),
-                "ts":        time.time(),
-            }
-        _dep_msg = (
-            f"🛫 <b>ВЫЛЕТ ПОДТВЕРЖДЁН — CLEARED FOR TAKEOFF</b>\n\n"
-            f"👨‍✈️ Captain: <b>{pilot_name}</b>\n"
-            f"🆔 Flight: <b>{plan.get('flight_no')}</b>\n"
-            f"🗺 Route: <b>{plan.get('departure')} → {plan.get('arrival')}</b>\n"
-            f"✈️ Aircraft: <b>{aircraft_name}</b>\n\n"
-            f"✈️ <i>Желаем попутного ветра и мягкой посадки!</i>"
-        )
-        tg_send(_dep_msg)
-        discord_send_departure(
-            pilot=pilot_name,
-            flight_no=plan.get("flight_no", "N/A"),
-            dep=plan.get("departure", "????"),
-            arr=plan.get("arrival", "????"),
-            aircraft=aircraft_name,
-        )
+    # FSHub план используем только для отображения номера рейса — в кэш НЕ сохраняем.
+    # Кэш заполняется только из FSAirlines (from_fsa: True) через _enrich_departure_from_fsa.
+    fshub_dep       = plan.get("icao_dep") or plan.get("departure", "????")
+    fshub_arr       = plan.get("icao_arr") or plan.get("arrival", "????")
+    fshub_flight_no = plan.get("callsign") or plan.get("flight_no", "N/A")
+    fshub_plan_valid = _is_valid_icao(fshub_dep) and _is_valid_icao(fshub_arr)
+
+    logger.info(
+        f"[Departure] FSHub план для '{pilot_name}': "
+        f"{'есть (' + fshub_dep + '→' + fshub_arr + ')' if fshub_plan_valid else 'пустой'} — "
+        f"запускаю обогащение из FSAirlines через {FSA_ENRICH_DEPARTURE_DELAY}с"
+    )
+    _dep_placeholder = (
+        f"🛫 <b>ВЫЛЕТ ПОДТВЕРЖДЁН — CLEARED FOR TAKEOFF</b>\n\n"
+        f"👨‍✈️ Captain: <b>{pilot_name}</b>\n"
+        f"✈️ Aircraft: <b>{aircraft_name}</b>\n"
+        f"🗺 Route: <b>⏳ Загружаю маршрут...</b>\n\n"
+        f"✈️ <i>Желаем попутного ветра и мягкой посадки!</i>"
+    )
+    # Discord — placeholder сразу
+    discord_send_departure(
+        pilot=pilot_name,
+        flight_no="N/A",
+        dep="????",
+        arr="????",
+        aircraft=aircraft_name,
+        is_loading=True,
+    )
+    r = session.post(
+        f"{TG_BASE}/sendMessage",
+        json={
+            "chat_id": CHAT_ID,
+            "text": _dep_placeholder,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+        timeout=20,
+    )
+    if r.status_code == 200:
+        message_id = r.json().get("result", {}).get("message_id")
+        if message_id:
+            threading.Thread(
+                target=_enrich_departure_from_fsa,
+                args=(message_id, CHAT_ID, pilot_name, aircraft_name,
+                      FSA_ENRICH_DEPARTURE_DELAY),
+                daemon=True,
+            ).start()
     else:
-        logger.info(
-            f"[Departure] Пустой план от FSHub для '{pilot_name}', "
-            f"запускаю обогащение через {FSA_ENRICH_DEPARTURE_DELAY}с"
-        )
-        _dep_placeholder = (
-            f"🛫 <b>ВЫЛЕТ ПОДТВЕРЖДЁН — CLEARED FOR TAKEOFF</b>\n\n"
-            f"👨‍✈️ Captain: <b>{pilot_name}</b>\n"
-            f"✈️ Aircraft: <b>{aircraft_name}</b>\n"
-            f"🗺 Route: <b>⏳ Загружаю маршрут...</b>\n\n"
-            f"✈️ <i>Желаем попутного ветра и мягкой посадки!</i>"
-        )
-        # В Discord сразу шлём placeholder — без редактирования
-        discord_send_departure(
-            pilot=pilot_name,
-            flight_no="N/A",
-            dep="????",
-            arr="????",
-            aircraft=aircraft_name,
-            is_loading=True,
-        )
-        r = session.post(
-            f"{TG_BASE}/sendMessage",
-            json={
-                "chat_id": CHAT_ID,
-                "text": _dep_placeholder,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            },
-            timeout=20,
-        )
-        if r.status_code == 200:
-            message_id = r.json().get("result", {}).get("message_id")
-            if message_id:
-                threading.Thread(
-                    target=_enrich_departure_from_fsa,
-                    args=(message_id, CHAT_ID, pilot_name, aircraft_name,
-                          FSA_ENRICH_DEPARTURE_DELAY),
-                    daemon=True,
-                ).start()
-        else:
-            logger.warning(f"[Departure] Не удалось отправить сообщение: {r.text}")
+        logger.warning(f"[Departure] Не удалось отправить сообщение: {r.text}")
 
 
 def handle_completed(data: Dict):
@@ -502,27 +503,34 @@ def handle_completed(data: Dict):
     dep = plan.get("icao_dep") or plan.get("departure", "????")
     arr = plan.get("icao_arr") or plan.get("arrival", "????")
 
-    # ── Фолбэк из кэша вылета если FSHub не передал маршрут ───
-    # Это позволяет засчитать лег ивента даже без плана в RLM Client,
-    # если пилот летел через FSAirlines и кэш был заполнен при вылете.
+    # ── Маршрут из FSAirlines (кэш вылета) — источник истины ──
+    # Берём только если кэш заполнен из FSAirlines (from_fsa: True).
+    # FSHub маршрут для ивента НЕ используем — только для отображения доп. данных.
     pilot_name_early = (
         (d.get("arrival") or {}).get("user") or d.get("user") or {}
     ).get("name", "")
-    if pilot_name_early and (not _is_valid_icao(dep) or not _is_valid_icao(arr)):
+    if pilot_name_early:
         with _departure_cache_lock:
             _cache_entry = _departure_cache.get(pilot_name_early)
-        if _cache_entry and (time.time() - _cache_entry.get("ts", 0)) < 86400:
+        if (
+            _cache_entry
+            and _cache_entry.get("from_fsa")  # только FSAirlines
+            and (time.time() - _cache_entry.get("ts", 0)) < 86400
+        ):
             _cached_dep = _cache_entry.get("dep", "????")
             _cached_arr = _cache_entry.get("arr", "????")
             _cached_fno = _cache_entry.get("flight_no", "N/A")
             if _is_valid_icao(_cached_dep) and _is_valid_icao(_cached_arr):
                 logger.info(
-                    f"[Completed] Маршрут из кэша вылета для '{pilot_name_early}': "
-                    f"{_cached_dep}→{_cached_arr} (FSHub дал: {dep}→{arr})"
+                    f"[Completed] Маршрут из FSAirlines-кэша для '{pilot_name_early}': "
+                    f"{_cached_dep}→{_cached_arr}"
                 )
                 dep       = _cached_dep
                 arr       = _cached_arr
-                flight_no = _cached_fno if flight_no in ("N/A", "", "None") else flight_no
+                # Номер рейса: FSHub в приоритете (он = источник данных полёта),
+                # FSAirlines только если FSHub не дал
+                if flight_no in ("N/A", "", "None"):
+                    flight_no = _cached_fno
     # ──────────────────────────────────────────────────────────
 
     rate           = int(arrival.get("landing_rate", 0))
