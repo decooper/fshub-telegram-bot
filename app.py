@@ -107,16 +107,16 @@ _processed_lock = threading.Lock()
 _DEDUP_TTL = 3600  # секунд
 
 
-def is_duplicate_event(event_id: str, event_type: str) -> bool:
+def is_duplicate_event(event_id: str, event_type: str, ttl: int = _DEDUP_TTL) -> bool:
     key = f"{event_type}:{event_id}"
     now = time.time()
     with _processed_lock:
-        # Удаляем протухшие записи (TTL 1 час)
+        # Удаляем протухшие записи
         expired = [k for k, ts in _processed_events.items() if now - ts > _DEDUP_TTL]
         for k in expired:
             del _processed_events[k]
-        # Проверяем дубль
-        if key in _processed_events:
+        # Проверяем дубль с учётом TTL конкретного события
+        if key in _processed_events and (now - _processed_events[key]) < ttl:
             return True
         _processed_events[key] = now
         return False
@@ -400,15 +400,19 @@ def handle_departure(data: Dict):
     d         = data.get("_data") or {}
     flight_id = str(d.get("id", ""))
 
-    if flight_id and is_duplicate_event(flight_id, "departure"):
-        logger.info(f"Пропуск дублирующего departure для рейса {flight_id}")
+    user       = d.get("user") or {}
+    pilot_name = user.get("name", "Unknown")
+
+    # Дедупликация по flight_id если он есть, иначе по имени пилота.
+    # FSHub иногда присылает несколько одинаковых departure за короткое время
+    # с разными или пустыми id — используем имя пилота как ключ с TTL 10 минут.
+    dedup_key = flight_id if flight_id and flight_id != "None" else f"pilot:{pilot_name}"
+    if is_duplicate_event(dedup_key, "departure", ttl=600):  # 10 минут
+        logger.info(f"Пропуск дублирующего departure для '{pilot_name}' (key={dedup_key})")
         return
 
-    user     = d.get("user") or {}
-    plan     = d.get("plan") or {}
-    aircraft = d.get("aircraft") or {}
-
-    pilot_name    = user.get("name", "Unknown")
+    plan          = d.get("plan") or {}
+    aircraft      = d.get("aircraft") or {}
     aircraft_name = aircraft.get("icao_name", "N/A")
 
     if not _is_plan_empty(plan):
