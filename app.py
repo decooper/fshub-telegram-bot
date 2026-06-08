@@ -1,51 +1,85 @@
+"""
+app.py — VA UP! Flask Web Service
+
+Отвечает за:
+ - приём вебхуков FSHub (flight.departed / flight.completed / ...)
+ - приём команд Telegram
+ - публичный API для сайта va-up.ru
+ - фоновый планировщик (APScheduler BackgroundScheduler)
+
+Вся бизнес-логика, DB-хелперы и форматтеры — в core.py.
+
+Start command на Render:
+    gunicorn app:app --workers 1 --threads 4 --timeout 120 --preload
+"""
+
+import re
 import os
 import sys
 import time
-import json
-import logging
+import hashlib
+import hmac
 import threading
-from logging.handlers import RotatingFileHandler
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse, urlencode, urlunparse, parse_qs
+import logging
+from collections import Counter
+from datetime import datetime
+from typing import Dict, List, Optional
 
-import psycopg2
-import psycopg2.extras
-import psycopg2.pool
-import requests
 from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
-# ═══════════════════════════════════════════════════════════════
-# CONFIG
-# ═══════════════════════════════════════════════════════════════
-
-BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN", "")
-CHAT_ID    = os.environ.get("TG_CHAT_ID", "")
-FSA_KEY    = os.environ.get("FSA_API_KEY", "")
-FSA_VA_ID  = os.environ.get("FSA_VA_ID", "56177")
-# Второй API - Профсоюз пилотов FSAirlines (добавить ключ когда договоритесь)
-FSA_KEY2   = os.environ.get("FSA_API_KEY2", "")
-FSA_VA_ID2 = os.environ.get("FSA_VA_ID2", "")
-PORT       = int(os.environ.get("PORT", 10000))
-HOSTNAME   = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "fshub-bot.onrender.com")
-
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-MAX_DB_FLIGHTS = int(os.environ.get("MAX_DB_FLIGHTS", "5000"))
-DATABASE_URL   = os.environ.get("DATABASE_URL", "")
-ADMIN_ID       = os.environ.get("ADMIN_TG_ID", "44859840")  # Telegram ID администратора
-
-FSA_URL = "https://www.fsairlines.net/va_interface2.php"
-TG_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
-
-# Задержки обогащения из FSAirlines (секунды)
-# Увеличьте если FSAirlines не успевает обновить данные
-FSA_ENRICH_DEPARTURE_DELAY = 90   # задержка для вылета
-FSA_ENRICH_ARRIVAL_DELAY   = 180  # задержка для посадки (3 минуты)
+# ── Вся бизнес-логика из core.py ──────────────────────────────
+from core import (
+    # config
+    BOT_TOKEN, CHAT_ID, FSA_KEY, ADMIN_ID,
+    WEBHOOK_SECRET, DATABASE_URL,
+    TG_BASE, FSA_ENRICH_DEPARTURE_DELAY, FSA_ENRICH_ARRIVAL_DELAY,
+    # logging
+    logger,
+    # db init
+    _create_pool, _init_db, db_execute,
+    # db flights
+    db_add_flight, db_update_flight_route,
+    db_last_flights, db_all_flights,
+    db_flights_this_month, db_top_landings,
+    # db economy
+    db_save_daily_economy, db_get_monthly_economy, db_get_today_economy,
+    # db contest
+    CONTEST_POINTS_PER_LANDING, CONTEST_MONTHLY_LIMIT,
+    CONTEST_RATE_MIN, CONTEST_RATE_MAX,
+    is_contest_landing, db_contest_add, db_contest_month,
+    # db operation
+    OPERATION_NAME, OPERATION_START, OPERATION_END,
+    OPERATION_LEGS, OPERATION_LEG_MAP,
+    OPERATION_HARD_CRASH, OPERATION_FAIL_RATE,
+    OPERATION_VATSIM_BONUS, OPERATION_MAX_POINTS,
+    operation_is_active, op_calc_points,
+    db_op_get_pilot, db_op_all_pilots, db_op_register_pilot,
+    db_op_add_leg, db_op_update_pilot, db_op_start_new_ferry,
+    db_op_admin_set, db_op_reset_pilot, db_op_check_daily_limit,
+    # telegram
+    session, tg_send, tg_photo, tg_setup_webhook, tg_edit_message,
+    # fsa
+    fsa_airline_data, fsa_active_flights, fsa_daily_transactions,
+    fsa_get_pilot_id, fsa_get_pilot_status, fsa_get_recent_report,
+    fsa_refresh_pilot_cache, fsa_refresh_pilot_cache2,
+    _departure_cache, _departure_cache_lock,
+    # helpers
+    _is_plan_empty, _is_valid_icao, _aggregate,
+    # formatters
+    MONTH_NAMES,
+    fmt_stats, fmt_last, fmt_top_landings, fmt_top_pilots,
+    fmt_daily_economy, fmt_monthly_economy,
+    fmt_active_flights, fmt_va_info,
+    fmt_contest, fmt_operation, fmt_operation_digest,
+    fmt_runway,
+    # economy
+    snapshot_daily_economy,
+    # landing rating
+    landing_rating,
+)
 
 if not BOT_TOKEN or not CHAT_ID:
     print("❌ TG_BOT_TOKEN or TG_CHAT_ID missing")
@@ -55,790 +89,44 @@ if not DATABASE_URL:
     print("❌ DATABASE_URL missing")
     sys.exit(1)
 
-# ═══════════════════════════════════════════════════════════════
-# LOGGING
-# ═══════════════════════════════════════════════════════════════
-
-logger = logging.getLogger("va_up_bot")
-logger.setLevel(logging.INFO)
-
-formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
-
-try:
-    file_handler = RotatingFileHandler(
-        "bot.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8"
-    )
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-except Exception:
-    logger.warning("Could not create log file, using console only")
-
 logger.info("Starting VA UP! PostgreSQL Edition")
 
 # ═══════════════════════════════════════════════════════════════
-# HTTP SESSION
+# ДЕДУПЛИКАЦИЯ СОБЫТИЙ FSHUB
+# Храним события с timestamp — удаляем старше 1 часа,
+# а не весь set целиком (защита от race condition при .clear()).
 # ═══════════════════════════════════════════════════════════════
 
-session = requests.Session()
-retry = Retry(
-    total=3, read=3, connect=3, backoff_factor=1,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["GET", "POST"],
-)
-adapter = HTTPAdapter(max_retries=retry)
-session.mount("https://", adapter)
-session.mount("http://", adapter)
-
-# ═══════════════════════════════════════════════════════════════
-# DATABASE - PostgreSQL connection pool (с keepalives для Neon.tech)
-# ═══════════════════════════════════════════════════════════════
-
-_pool: Optional[psycopg2.pool.ThreadedConnectionPool] = None
-_pool_lock = threading.Lock()
-
-
-def _build_dsn(base_url: str) -> str:
-    """
-    Добавляет keepalive-параметры к DATABASE_URL.
-    Neon.tech закрывает idle-соединения через ~5 минут —
-    TCP keepalives не дают соединению «протухнуть».
-    """
-    parsed = urlparse(base_url)
-    params = {
-        "sslmode": "require",
-        "keepalives": "1",
-        "keepalives_idle": "30",
-        "keepalives_interval": "10",
-        "keepalives_count": "5",
-        "connect_timeout": "10",
-    }
-    existing = parse_qs(parsed.query)
-    existing.update({k: [v] for k, v in params.items()})
-    flat = {k: v[0] for k, v in existing.items()}
-    new_query = urlencode(flat)
-    return urlunparse(parsed._replace(query=new_query))
-
-
-def _create_pool():
-    global _pool
-    dsn = _build_dsn(DATABASE_URL)
-    _pool = psycopg2.pool.ThreadedConnectionPool(
-        minconn=1,
-        maxconn=10,
-        dsn=dsn,
-        cursor_factory=psycopg2.extras.RealDictCursor,
-    )
-    logger.info("PostgreSQL connection pool created (keepalives enabled, maxconn=10)")
-
-
-def _test_conn(conn) -> bool:
-    """Проверяет, живо ли соединение."""
-    try:
-        conn.cursor().execute("SELECT 1")
-        return True
-    except Exception:
-        return False
-
-
-def get_conn():
-    """Берёт соединение из пула; при мёртвом соединении пересоздаёт пул."""
-    global _pool
-    for attempt in range(3):
-        try:
-            with _pool_lock:
-                if _pool is None:
-                    _create_pool()
-            conn = _pool.getconn()
-            if not _test_conn(conn):
-                logger.warning(f"Dead connection (attempt {attempt + 1}), recreating pool")
-                try:
-                    _pool.putconn(conn, close=True)
-                except Exception:
-                    pass
-                with _pool_lock:
-                    _pool = None
-                continue
-            return conn
-        except psycopg2.OperationalError as e:
-            logger.warning(f"OperationalError getting conn (attempt {attempt + 1}): {e}")
-            with _pool_lock:
-                _pool = None
-            if attempt == 2:
-                raise
-    raise RuntimeError("Could not get a database connection after 3 attempts")
-
-
-def put_conn(conn):
-    global _pool
-    if _pool is not None:
-        try:
-            _pool.putconn(conn)
-        except Exception as e:
-            logger.warning(f"Error returning connection to pool: {e}")
-
-
-def db_execute(query: str, params=None, fetch: str = "none"):
-    """
-    Выполняет запрос с гарантированным возвратом соединения в пул.
-    При OperationalError делает одну повторную попытку с новым соединением.
-    """
-    last_error = None
-    for attempt in range(2):
-        conn = None
-        try:
-            conn = get_conn()
-            with conn.cursor() as cur:
-                cur.execute(query, params or ())
-                conn.commit()
-                if fetch == "one":
-                    return cur.fetchone()
-                if fetch == "all":
-                    return cur.fetchall()
-                return None
-        except psycopg2.OperationalError as e:
-            last_error = e
-            logger.warning(f"OperationalError in db_execute (attempt {attempt + 1}): {e}")
-            if conn is not None:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                conn = None
-            with _pool_lock:
-                _pool = None  # пересоздадим пул на следующей попытке
-        except Exception as e:
-            last_error = e
-            logger.error(f"Database error: {e}")
-            if conn is not None:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-                put_conn(conn)
-                conn = None
-            raise
-        finally:
-            # Если соединение не было явно закрыто или возвращено - вернуть в пул
-            if conn is not None:
-                put_conn(conn)
-
-    logger.error(f"Database error after {2} attempts: {last_error}")
-    raise last_error
-
-
-def _init_db():
-    db_execute(
-        """
-        CREATE TABLE IF NOT EXISTS flights (
-            id           SERIAL PRIMARY KEY,
-            flight_id    TEXT UNIQUE,
-            pilot        TEXT,
-            flight_no    TEXT,
-            departure    TEXT,
-            arrival      TEXT,
-            aircraft     TEXT,
-            landing_rate INTEGER,
-            profit       INTEGER,
-            created_at   TIMESTAMPTZ DEFAULT NOW()
-        )
-        """
-    )
-    db_execute(
-        """
-        CREATE TABLE IF NOT EXISTS achievements (
-            id          SERIAL PRIMARY KEY,
-            pilot       TEXT,
-            achievement TEXT,
-            created_at  TIMESTAMPTZ DEFAULT NOW()
-        )
-        """
-    )
-    db_execute(
-        """
-        CREATE TABLE IF NOT EXISTS daily_economy (
-            id      SERIAL PRIMARY KEY,
-            day     DATE UNIQUE,
-            income  BIGINT DEFAULT 0,
-            expense BIGINT DEFAULT 0,
-            net     BIGINT DEFAULT 0,
-            detail  JSONB  DEFAULT '{}'
-        )
-        """
-    )
-    db_execute(
-        """
-        CREATE TABLE IF NOT EXISTS contest_entries (
-            id           SERIAL PRIMARY KEY,
-            flight_id    TEXT UNIQUE,
-            pilot        TEXT,
-            flight_no    TEXT,
-            departure    TEXT,
-            arrival      TEXT,
-            aircraft     TEXT,
-            landing_rate INTEGER,
-            report_url   TEXT,
-            contest_month TEXT,
-            created_at   TIMESTAMPTZ DEFAULT NOW()
-        )
-        """
-    )
-    db_execute(
-        """
-        CREATE TABLE IF NOT EXISTS operation_pilots (
-            id            SERIAL PRIMARY KEY,
-            pilot_name    TEXT UNIQUE,
-            aircraft      TEXT DEFAULT '',
-            current_leg   INTEGER DEFAULT 1,
-            total_points  INTEGER DEFAULT 0,
-            ferry_num     INTEGER DEFAULT 1,
-            status        TEXT DEFAULT 'active',
-            registered_at TIMESTAMPTZ DEFAULT NOW()
-        )
-        """
-    )
-    # Добавить колонки если их нет (миграция для существующей БД)
-    for col, definition in [
-        ("ferry_num", "INTEGER DEFAULT 1"),
-    ]:
-        try:
-            db_execute(f"ALTER TABLE operation_pilots ADD COLUMN IF NOT EXISTS {col} {definition}")
-        except Exception:
-            pass
-    db_execute(
-        """
-        CREATE TABLE IF NOT EXISTS operation_legs (
-            id           SERIAL PRIMARY KEY,
-            pilot_name   TEXT,
-            leg_num      INTEGER,
-            dep          TEXT,
-            arr          TEXT,
-            landing_rate INTEGER,
-            base_points  INTEGER DEFAULT 0,
-            coeff        NUMERIC(4,2) DEFAULT 1.0,
-            net_bonus    INTEGER DEFAULT 0,
-            points       INTEGER,
-            on_network   BOOLEAN DEFAULT FALSE,
-            flight_id    TEXT,
-            report_url   TEXT,
-            attempt      INTEGER DEFAULT 1,
-            created_at   TIMESTAMPTZ DEFAULT NOW()
-        )
-        """
-    )
-    logger.info("Database tables ready")
-
-
-# ═══════════════════════════════════════════════════════════════
-# DB HELPERS - FLIGHTS
-# ═══════════════════════════════════════════════════════════════
-
-def db_add_flight(
-    flight_id: Optional[str],
-    pilot: str,
-    flight_no: str,
-    departure: str,
-    arrival: str,
-    aircraft: str,
-    landing_rate: int,
-    profit: Optional[int],
-):
-    db_execute(
-        """
-        INSERT INTO flights
-            (flight_id, pilot, flight_no, departure, arrival,
-             aircraft, landing_rate, profit)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (flight_id) DO NOTHING
-        """,
-        (flight_id, pilot, flight_no, departure, arrival,
-         aircraft, landing_rate, profit),
-    )
-    db_execute(
-        """
-        DELETE FROM flights
-        WHERE id NOT IN (
-            SELECT id FROM flights ORDER BY id DESC LIMIT %s
-        )
-        """,
-        (MAX_DB_FLIGHTS,),
-    )
-
-
-def db_update_flight_route(flight_id: str, flight_no: str, departure: str, arrival: str) -> None:
-    """Обновляет маршрут рейса в БД после обогащения из FSAirlines."""
-    if not flight_id:
-        return
-    db_execute(
-        """
-        UPDATE flights
-        SET flight_no  = %s,
-            departure  = %s,
-            arrival    = %s
-        WHERE flight_id = %s
-          AND (flight_no = 'N/A' OR departure = '????' OR arrival = '????')
-        """,
-        (flight_no, departure, arrival, flight_id),
-    )
-    db_execute(
-        """
-        UPDATE contest_entries
-        SET flight_no  = %s,
-            departure  = %s,
-            arrival    = %s
-        WHERE flight_id = %s
-          AND (flight_no = 'N/A' OR departure = '????' OR arrival = '????')
-        """,
-        (flight_no, departure, arrival, flight_id),
-    )
-
-
-def db_last_flights(limit: int = 5) -> List:
-    return db_execute(
-        "SELECT * FROM flights ORDER BY id DESC LIMIT %s",
-        (limit,), fetch="all",
-    ) or []
-
-
-def db_all_flights() -> List:
-    return db_execute(
-        "SELECT * FROM flights ORDER BY id DESC",
-        fetch="all",
-    ) or []
-
-
-def db_flights_this_month() -> List:
-    """Рейсы за текущий календарный месяц."""
-    return db_execute(
-        """
-        SELECT * FROM flights
-        WHERE DATE_TRUNC('month', created_at) = DATE_TRUNC('month', NOW())
-        ORDER BY id DESC
-        """,
-        fetch="all",
-    ) or []
-
-
-def db_top_landings(limit: int = 10) -> List:
-    """Топ посадок за текущий календарный месяц."""
-    return db_execute(
-        """
-        SELECT * FROM flights
-        WHERE DATE_TRUNC('month', created_at) = DATE_TRUNC('month', NOW())
-        ORDER BY ABS(landing_rate) ASC LIMIT %s
-        """,
-        (limit,), fetch="all",
-    ) or []
-
-
-# ═══════════════════════════════════════════════════════════════
-# DB HELPERS - DAILY ECONOMY
-# ═══════════════════════════════════════════════════════════════
-
-def db_save_daily_economy(day: str, income: int, expense: int, detail: Dict):
-    db_execute(
-        """
-        INSERT INTO daily_economy (day, income, expense, net, detail)
-        VALUES (%s, %s, %s, %s, %s)
-        ON CONFLICT (day) DO UPDATE SET
-            income  = EXCLUDED.income,
-            expense = EXCLUDED.expense,
-            net     = EXCLUDED.net,
-            detail  = EXCLUDED.detail
-        """,
-        (day, income, expense, income - expense, json.dumps(detail)),
-    )
-
-
-def db_get_monthly_economy(days: int = 30) -> List:
-    """Финансовые данные за текущий календарный месяц."""
-    return db_execute(
-        """
-        SELECT * FROM daily_economy
-        WHERE DATE_TRUNC('month', day) = DATE_TRUNC('month', CURRENT_DATE)
-        ORDER BY day ASC
-        """,
-        fetch="all",
-    ) or []
-
-
-def db_get_today_economy() -> Optional[Dict]:
-    return db_execute(
-        "SELECT * FROM daily_economy WHERE day = CURRENT_DATE",
-        fetch="one",
-    )
-
-
-# ═══════════════════════════════════════════════════════════════
-# OPERATION "ТИХИЙ ВЖУХ" - ДАННЫЕ
-# ═══════════════════════════════════════════════════════════════
-
-OPERATION_NAME       = "Тихий Вжух"
-OPERATION_START      = "2026-06-10"
-OPERATION_END        = "2026-08-31"
-OPERATION_HARD_CRASH = 1200   # fpm — борт утерян, полный сброс
-OPERATION_FAIL_RATE  = 600    # fpm — этап провален, 0 очков
-
-# 13 этапов: (dep, arr, очки за успешную посадку)
-OPERATION_LEGS = [
-    (1,  "VTBS", "VVPQ",  290),
-    (2,  "VVPQ", "RPVP",  880),
-    (3,  "RPVP", "WAMM",  620),
-    (4,  "WAMM", "WAJJ",  970),
-    (5,  "WAJJ", "NWWW", 1900),
-    (6,  "NWWW", "NFFN",  690),
-    (7,  "NFFN", "NSFA",  670),
-    (8,  "NSFA", "NTAA", 1350),
-    (9,  "NTAA", "NTGJ",  970),
-    (10, "NTGJ", "SCIP", 1430),
-    (11, "SCIP", "SCFA", 2160),
-    (12, "SCFA", "SGAS",  780),
-    (13, "SGAS", "SBGL",  810),
-]
-OPERATION_LEG_MAP = {(dep, arr): (num, pts) for num, dep, arr, pts in OPERATION_LEGS}
-
-# Коэффициенты воздушных судов по ICAO-типу
-OPERATION_AIRCRAFT_COEFF: Dict[str, float] = {
-    "A310":  1.3,
-    "A318":  1.3,
-    "A319":  1.3,
-    "A320":  1.1,
-    "A321":  1.0,
-    "A330":  1.0,
-    "ATR72": 2.5,  # ATR-72
-    "AT72":  2.5,  # альтернативный ICAO код ATR-72
-    "B727":  2.0,
-    "B736":  1.1,
-    "B737":  1.1,
-    "B738":  1.0,
-    "B38M":  1.3,  # B738M
-    "B773":  1.0,
-    "CRJ7":  1.5,
-    "MD11":  1.1,
-}
-OPERATION_VATSIM_BONUS = 50   # очков за полёт в VATSIM или IVAO
-
-# Максимум очков без коэффициентов
-OPERATION_MAX_POINTS = sum(pts for _, _, _, pts in OPERATION_LEGS)  # 13360
-
-
-def op_get_aircraft_coeff(aircraft_icao: str) -> float:
-    """Возвращает коэффициент ВС по ICAO-типу. По умолчанию 1.0."""
-    if not aircraft_icao:
-        return 1.0
-    # Нормализуем: убираем пробелы, приводим к верхнему регистру
-    key = aircraft_icao.upper().strip()
-    # Прямое совпадение
-    if key in OPERATION_AIRCRAFT_COEFF:
-        return OPERATION_AIRCRAFT_COEFF[key]
-    # Частичное совпадение (например "Boeing 737-800" → B738)
-    for icao_key, coeff in OPERATION_AIRCRAFT_COEFF.items():
-        if icao_key in key:
-            return coeff
-    return 1.0
-
-
-def op_calc_points(base_pts: int, aircraft_icao: str, on_network: bool) -> tuple:
-    """
-    Рассчитывает итоговые очки за лег.
-    Формула: round(base_pts * коэффициент_ВС) + бонус_сети
-    Возвращает (итого, коэффициент, бонус_сети)
-    """
-    coeff       = op_get_aircraft_coeff(aircraft_icao)
-    base_calc   = round(base_pts * coeff)
-    net_bonus   = OPERATION_VATSIM_BONUS if on_network else 0
-    total       = base_calc + net_bonus
-    return total, coeff, net_bonus
-
-
-def operation_is_active() -> bool:
-    """Проверяет, активен ли ивент сейчас."""
-    today = datetime.now().date()
-    try:
-        start = datetime.strptime(OPERATION_START, "%Y-%m-%d").date()
-        end   = datetime.strptime(OPERATION_END,   "%Y-%m-%d").date()
-        return start <= today <= end
-    except Exception:
-        return False
-
-
-def db_op_get_pilot(pilot_name: str) -> Optional[Dict]:
-    return db_execute(
-        "SELECT * FROM operation_pilots WHERE pilot_name = %s",
-        (pilot_name,), fetch="one",
-    )
-
-
-def db_op_all_pilots() -> List:
-    return db_execute(
-        "SELECT * FROM operation_pilots ORDER BY total_points DESC",
-        fetch="all",
-    ) or []
-
-
-def db_op_register_pilot(pilot_name: str, aircraft: str = "") -> bool:
-    """
-    Регистрирует пилота.
-    Если пилот уже есть и статус finished — начинает новый перегон.
-    Возвращает True если новый или начат новый перегон, False если уже активен.
-    """
-    existing = db_op_get_pilot(pilot_name)
-    if existing:
-        if existing["status"] == "finished":
-            # Начать новый перегон
-            new_ferry = existing["ferry_num"] + 1
-            db_execute(
-                """
-                UPDATE operation_pilots
-                SET current_leg = 1, status = 'active',
-                    aircraft = %s, ferry_num = %s
-                WHERE pilot_name = %s
-                """,
-                (aircraft, new_ferry, pilot_name),
-            )
-            return True  # новый перегон начат
-        return False  # уже активный перегон
-    db_execute(
-        "INSERT INTO operation_pilots (pilot_name, aircraft, ferry_num) VALUES (%s, %s, 1)",
-        (pilot_name, aircraft),
-    )
-    return True
-
-
-def db_op_add_leg(
-    pilot_name: str, leg_num: int, dep: str, arr: str,
-    landing_rate: int, points: int, flight_id: str, report_url: str,
-    base_points: int = 0, coeff: float = 1.0,
-    net_bonus: int = 0, on_network: bool = False,
-) -> None:
-    """Записывает выполненный этап."""
-    attempt_row = db_execute(
-        "SELECT COUNT(*) as cnt FROM operation_legs WHERE pilot_name=%s AND leg_num=%s",
-        (pilot_name, leg_num), fetch="one",
-    )
-    attempt = (attempt_row["cnt"] + 1) if attempt_row else 1
-    db_execute(
-        """
-        INSERT INTO operation_legs
-            (pilot_name, leg_num, dep, arr, landing_rate,
-             base_points, coeff, net_bonus, points, on_network,
-             flight_id, report_url, attempt)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """,
-        (pilot_name, leg_num, dep, arr, landing_rate,
-         base_points, coeff, net_bonus, points, on_network,
-         flight_id, report_url, attempt),
-    )
-
-
-def db_op_update_pilot(
-    pilot_name: str, current_leg: int, total_points: int, status: str = "active"
-) -> None:
-    db_execute(
-        """
-        UPDATE operation_pilots
-        SET current_leg = %s, total_points = %s, status = %s
-        WHERE pilot_name = %s
-        """,
-        (current_leg, total_points, status, pilot_name),
-    )
-
-
-def db_op_start_new_ferry(pilot_name: str, aircraft: str) -> Optional[int]:
-    """
-    Начинает новый перегон для пилота после завершения предыдущего.
-    Возвращает номер нового перегона или None если пилот не найден / перегон активен.
-    """
-    pilot = db_op_get_pilot(pilot_name)
-    if not pilot:
-        return None
-    if pilot["status"] != "finished":
-        return None
-    new_ferry = pilot["ferry_num"] + 1
-    db_execute(
-        """
-        UPDATE operation_pilots
-        SET current_leg = 1, status = 'active',
-            aircraft = %s, ferry_num = %s
-        WHERE pilot_name = %s
-        """,
-        (aircraft, new_ferry, pilot_name),
-    )
-    return new_ferry
-
-
-def db_op_admin_set(pilot_name: str, leg_num: int, points_delta: int) -> None:
-    """Ручная корректировка очков администратором."""
-    pilot = db_op_get_pilot(pilot_name)
-    if not pilot:
-        return
-    new_points = max(0, pilot["total_points"] + points_delta)
-    db_execute(
-        "UPDATE operation_pilots SET total_points = %s WHERE pilot_name = %s",
-        (new_points, pilot_name),
-    )
-
-
-def db_op_reset_pilot(pilot_name: str) -> None:
-    """Полный сброс прогресса пилота (потеря борта)."""
-    db_execute(
-        """
-        UPDATE operation_pilots
-        SET current_leg = 1, total_points = 0, status = 'active'
-        WHERE pilot_name = %s
-        """,
-        (pilot_name,),
-    )
-
-
-def db_op_check_daily_limit(pilot_name: str) -> tuple:
-    """
-    Проверяет лимит 2 лега в календарные сутки UTC.
-    Счётчик сбрасывается в 00:00 UTC каждый день.
-
-    Возвращает (allowed: bool, legs_today: int)
-    """
-    rows = db_execute(
-        """
-        SELECT created_at FROM operation_legs
-        WHERE pilot_name = %s
-          AND points > 0
-          AND DATE(created_at AT TIME ZONE 'UTC') = CURRENT_DATE
-        ORDER BY created_at ASC
-        """,
-        (pilot_name,), fetch="all",
-    ) or []
-
-    count = len(rows)
-    allowed = count < 2
-    return allowed, count
-
-
-# ═══════════════════════════════════════════════════════════════
-# DB HELPERS - CONTEST
-# ═══════════════════════════════════════════════════════════════
-
-CONTEST_POINTS_PER_LANDING = 100  # баллов за посадку
-CONTEST_MONTHLY_LIMIT      = 1000 # максимум баллов в месяц
-CONTEST_RATE_MIN          = -30   # fpm (не мягче)
-CONTEST_RATE_MAX          = -10   # fpm (не жёстче)
-
-
-def is_contest_landing(rate: int) -> bool:
-    """Проверяет, попадает ли посадка в диапазон конкурса."""
-    return CONTEST_RATE_MAX >= rate >= CONTEST_RATE_MIN
-
-
-def db_contest_add(
-    flight_id: str, pilot: str, flight_no: str,
-    departure: str, arrival: str, aircraft: str,
-    landing_rate: int, report_url: str,
-):
-    month = datetime.now().strftime("%Y-%m")
-    db_execute(
-        """
-        INSERT INTO contest_entries
-            (flight_id, pilot, flight_no, departure, arrival,
-             aircraft, landing_rate, report_url, contest_month)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (flight_id) DO NOTHING
-        """,
-        (flight_id, pilot, flight_no, departure, arrival,
-         aircraft, landing_rate, report_url, month),
-    )
-
-
-def db_contest_month(month: Optional[str] = None) -> List:
-    m = month or datetime.now().strftime("%Y-%m")
-    return db_execute(
-        """
-        SELECT * FROM contest_entries
-        WHERE contest_month = %s
-        ORDER BY created_at ASC
-        """,
-        (m,), fetch="all",
-    ) or []
-
-
-def db_contest_recent_months(n: int = 4) -> List[str]:
-    """Возвращает список месяцев у которых есть записи - текущий + до n-1 предыдущих."""
-    rows = db_execute(
-        """
-        SELECT DISTINCT contest_month
-        FROM contest_entries
-        ORDER BY contest_month DESC
-        LIMIT %s
-        """,
-        (n,), fetch="all",
-    ) or []
-    return [r["contest_month"] for r in rows]
-
-
-# ═══════════════════════════════════════════════════════════════
-# TELEGRAM
-# ═══════════════════════════════════════════════════════════════
-
-def tg_send(text: str, chat_id=None) -> bool:
-    target = str(chat_id) if chat_id else CHAT_ID
-    try:
-        r = session.post(
-            f"{TG_BASE}/sendMessage",
-            json={
-                "chat_id": target,
-                "text": text[:4096],
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            },
-            timeout=20,
-        )
-        if r.status_code != 200:
-            logger.warning(f"Telegram send failed: {r.text}")
-            return False
-        return True
-    except Exception as e:
-        logger.exception(f"Telegram send error: {e}")
-        return False
-
-
-def tg_photo(url: str, caption: str) -> bool:
-    try:
-        r = session.post(
-            f"{TG_BASE}/sendPhoto",
-            json={
-                "chat_id": CHAT_ID,
-                "photo": url,
-                "caption": caption[:1024],
-                "parse_mode": "HTML",
-            },
-            timeout=30,
-        )
-        if r.status_code == 200:
+_processed_events: Dict[str, float] = {}   # key → timestamp добавления
+_processed_lock = threading.Lock()
+_DEDUP_TTL = 3600  # секунд
+
+
+def is_duplicate_event(event_id: str, event_type: str) -> bool:
+    key = f"{event_type}:{event_id}"
+    now = time.time()
+    with _processed_lock:
+        # Удаляем протухшие записи (TTL 1 час)
+        expired = [k for k, ts in _processed_events.items() if now - ts > _DEDUP_TTL]
+        for k in expired:
+            del _processed_events[k]
+        # Проверяем дубль
+        if key in _processed_events:
             return True
-        logger.warning(f"Photo failed: {r.text}")
-    except Exception as e:
-        logger.exception(f"Photo error: {e}")
-    return tg_send(f'📸 <b>Screenshot</b>\n<a href="{url}">Open media</a>')
+        _processed_events[key] = now
+        return False
 
 
-def tg_setup_webhook():
-    url = f"https://{HOSTNAME}/bot/{BOT_TOKEN}"
-    try:
-        r = session.post(
-            f"{TG_BASE}/setWebhook",
-            json={"url": url},
-            timeout=20,
-        )
-        logger.info(f"Telegram webhook: {r.text}")
-    except Exception as e:
-        logger.exception(f"Webhook setup error: {e}")
+# ═══════════════════════════════════════════════════════════════
+# СОСТОЯНИЕ ДИАЛОГА /runway
+# ═══════════════════════════════════════════════════════════════
 
+_awaiting_icao: Dict[str, bool] = {}
+_awaiting_lock = threading.Lock()
+
+# ═══════════════════════════════════════════════════════════════
+# TELEGRAM — вспомогательные функции (специфичные для app.py)
+# ═══════════════════════════════════════════════════════════════
 
 def tg_send_with_cancel(text: str, chat_id) -> bool:
     """Отправляет сообщение с inline-кнопкой Отмена."""
@@ -868,7 +156,6 @@ def tg_send_with_cancel(text: str, chat_id) -> bool:
 
 
 def tg_answer_callback(callback_query_id: str, text: str = "") -> None:
-    """Закрывает «часики» на кнопке после нажатия."""
     try:
         session.post(
             f"{TG_BASE}/answerCallbackQuery",
@@ -879,26 +166,7 @@ def tg_answer_callback(callback_query_id: str, text: str = "") -> None:
         logger.exception(f"answerCallbackQuery error: {e}")
 
 
-def tg_edit_message(chat_id, message_id: int, text: str) -> None:
-    """Редактирует сообщение бота (убирает кнопку после отмены)."""
-    try:
-        session.post(
-            f"{TG_BASE}/editMessageText",
-            json={
-                "chat_id": str(chat_id),
-                "message_id": message_id,
-                "text": text[:4096],
-                "parse_mode": "HTML",
-                "reply_markup": {"inline_keyboard": []},
-            },
-            timeout=10,
-        )
-    except Exception as e:
-        logger.exception(f"editMessageText error: {e}")
-
-
 def tg_send_menu(chat_id) -> bool:
-    """Отправляет главное меню с inline-кнопками."""
     try:
         r = session.post(
             f"{TG_BASE}/sendMessage",
@@ -909,24 +177,24 @@ def tg_send_menu(chat_id) -> bool:
                 "reply_markup": {
                     "inline_keyboard": [
                         [
-                            {"text": "📊 Статистика",   "callback_data": "cmd_stats"},
+                            {"text": "📊 Статистика",      "callback_data": "cmd_stats"},
                             {"text": "✈️ Последние рейсы", "callback_data": "cmd_last"},
                         ],
                         [
-                            {"text": "🏆 Топ пилоты",   "callback_data": "cmd_top"},
-                            {"text": "🛬 Топ посадки",  "callback_data": "cmd_top_landing"},
+                            {"text": "🏆 Топ пилоты",    "callback_data": "cmd_top"},
+                            {"text": "🛬 Топ посадки",   "callback_data": "cmd_top_landing"},
                         ],
                         [
-                            {"text": "💰 Финансы",      "callback_data": "cmd_economy"},
-                            {"text": "📅 За месяц",     "callback_data": "cmd_monthly"},
+                            {"text": "💰 Финансы",       "callback_data": "cmd_economy"},
+                            {"text": "📅 За месяц",      "callback_data": "cmd_monthly"},
                         ],
                         [
-                            {"text": "📡 Онлайн",       "callback_data": "cmd_live"},
-                            {"text": "🏢 О компании",   "callback_data": "cmd_va"},
+                            {"text": "📡 Онлайн",        "callback_data": "cmd_live"},
+                            {"text": "🏢 О компании",    "callback_data": "cmd_va"},
                         ],
                         [
-                            {"text": "🛫 Полосы (Runway)", "callback_data": "cmd_runway"},
-                            {"text": "🎯 Мастер Посадки",  "callback_data": "cmd_contest"},
+                            {"text": "🛫 Полосы (Runway)",  "callback_data": "cmd_runway"},
+                            {"text": "🎯 Мастер Посадки",   "callback_data": "cmd_contest"},
                         ],
                         [
                             {"text": "✈️ Операция «Тихий Вжух»", "callback_data": "cmd_operation"},
@@ -945,12 +213,22 @@ def tg_send_menu(chat_id) -> bool:
         return False
 
 
-# Маппинг callback_data команд меню → функции-форматтеры
-MENU_CALLBACKS: Dict[str, callable] = {}  # заполняется после определения форматтеров
+# Маппинг callback_data → форматтер (заполняется после определения всех функций)
+MENU_CALLBACKS: Dict[str, callable] = {
+    "cmd_stats":       fmt_stats,
+    "cmd_last":        fmt_last,
+    "cmd_top":         fmt_top_pilots,
+    "cmd_top_landing": fmt_top_landings,
+    "cmd_economy":     fmt_daily_economy,
+    "cmd_monthly":     fmt_monthly_economy,
+    "cmd_live":        fmt_active_flights,
+    "cmd_va":          fmt_va_info,
+    "cmd_contest":     fmt_contest,
+    "cmd_operation":   fmt_operation,
+}
 
 
 def handle_callback_query(cq: Dict) -> None:
-    """Обрабатывает нажатие inline-кнопки."""
     cq_id      = cq.get("id", "")
     data       = cq.get("data", "")
     chat_id    = str(cq.get("message", {}).get("chat", {}).get("id", ""))
@@ -989,169 +267,8 @@ def handle_callback_query(cq: Dict) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════
-# FSA API
+# FSA — обогащение сообщений в фоне
 # ═══════════════════════════════════════════════════════════════
-
-def fsa_call(function: str, extra: Optional[Dict] = None, key: str = "", va_id: str = ""):
-    """Вызов FSAirlines API. Использует UP! по умолчанию."""
-    api_key   = key   or FSA_KEY
-    api_va_id = va_id or FSA_VA_ID
-    if not api_key:
-        return None
-    params = {
-        "function": function,
-        "va_id":    api_va_id,
-        "apikey":   api_key,
-        "format":   "json",
-    }
-    if extra:
-        params.update(extra)
-    try:
-        r = session.get(FSA_URL, params=params, timeout=30)
-        r.raise_for_status()
-        body = r.json()
-        if body.get("status") == "SUCCESS":
-            return body.get("data")
-        logger.warning(f"FSA failure: {body}")
-        return None
-    except Exception as e:
-        logger.exception(f"FSA error: {e}")
-        return None
-
-
-def fsa_call2(function: str, extra: Optional[Dict] = None):
-    """Вызов FSAirlines API Профсоюза (второй ключ)."""
-    if not FSA_KEY2 or not FSA_VA_ID2:
-        return None
-    return fsa_call(function, extra, key=FSA_KEY2, va_id=FSA_VA_ID2)
-
-
-def _safe_ts(ts) -> Optional[datetime]:
-    try:
-        return datetime.fromtimestamp(float(ts))
-    except Exception:
-        return None
-
-
-def fsa_daily_transactions() -> List[Dict]:
-    data = fsa_call("getDailyTransactions")
-    if not isinstance(data, list):
-        return []
-    today = datetime.now().date()
-    result = []
-    for t in data:
-        dt = _safe_ts(t.get("ts"))
-        if dt and dt.date() == today:
-            result.append(t)
-    return result
-
-
-def fsa_active_flights() -> List[Dict]:
-    data = fsa_call("getActiveFlights")
-    return data if isinstance(data, list) else []
-
-
-def fsa_airline_data() -> Optional[Dict]:
-    data = fsa_call("getAirlineData")
-    if isinstance(data, list) and data:
-        return data[0]
-    return data if isinstance(data, dict) else None
-
-
-def get_flight_profit(report_id: int) -> Optional[int]:
-    # TODO: найти маппинг flight_id (FSHub) → report_id (FSAirlines)
-    return None
-
-
-# ─── FSAirlines: кэш пилотов и обогащение данных вылета ────────
-
-# Кэш: "Имя Фамилия" → pilot_id в FSAirlines
-# Обновляется при первом обращении и живёт до перезапуска сервиса
-_fsa_pilot_cache: Dict[str, int] = {}
-_fsa_pilot_cache_lock = threading.Lock()
-_fsa_pilot_cache_ts: float = 0  # время последнего обновления
-
-# Кэш данных вылета: pilot_name → {dep, arr, flight_no, ts}
-# Используется при посадке если план FSHub пустой
-_departure_cache: Dict[str, Dict] = {}
-_departure_cache_lock = threading.Lock()
-
-
-def fsa_refresh_pilot_cache() -> None:
-    """Загружает список пилотов FSAirlines в кэш."""
-    global _fsa_pilot_cache_ts
-    data = fsa_call("getPilotList")
-    if not isinstance(data, list):
-        return
-    with _fsa_pilot_cache_lock:
-        _fsa_pilot_cache.clear()
-        for p in data:
-            full_name = f"{p.get('name', '')} {p.get('surname', '')}".strip()
-            if full_name and p.get("id"):
-                _fsa_pilot_cache[full_name] = int(p["id"])
-        _fsa_pilot_cache_ts = time.time()
-    logger.info(f"FSA pilot cache refreshed: {len(_fsa_pilot_cache)} pilots")
-
-
-def fsa_refresh_pilot_cache2() -> None:
-    """Загружает список пилотов Профсоюза FSAirlines в кэш."""
-    if not FSA_KEY2 or not FSA_VA_ID2:
-        return
-    data = fsa_call2("getPilotList")
-    if not isinstance(data, list):
-        return
-    with _fsa_pilot_cache_lock:
-        for p in data:
-            full_name = f"{p.get('name', '')} {p.get('surname', '')}".strip()
-            if full_name and p.get("id") and full_name not in _fsa_pilot_cache:
-                _fsa_pilot_cache[full_name] = int(p["id"])
-    logger.info(f"FSA2 pilot cache merged: total {len(_fsa_pilot_cache)} pilots")
-
-
-def fsa_get_pilot_id(name: str) -> Optional[int]:
-    """
-    Возвращает pilot_id FSAirlines по полному имени.
-    Сначала ищет в UP!, затем в Профсоюзе.
-    """
-    if not _fsa_pilot_cache or (time.time() - _fsa_pilot_cache_ts) > 3600:
-        fsa_refresh_pilot_cache()
-        if FSA_KEY2 and FSA_VA_ID2:
-            fsa_refresh_pilot_cache2()
-    with _fsa_pilot_cache_lock:
-        return _fsa_pilot_cache.get(name)
-
-
-def fsa_get_pilot_status(pilot_id: int) -> Optional[Dict]:
-    """Возвращает текущий статус пилота из FSAirlines."""
-    data = fsa_call("getPilotStatus", {"pilot_id": pilot_id})
-    if isinstance(data, list) and data:
-        return data[0]
-    return data if isinstance(data, dict) else None
-
-
-def _is_plan_empty(plan: Dict) -> bool:
-    """Проверяет, пустой ли план полёта из FSHub."""
-    flight_no = plan.get("flight_no", "")
-    departure = plan.get("departure", "")
-    arrival   = plan.get("arrival", "")
-    return (
-        not flight_no or flight_no in ("N/A", "", "None") or
-        not departure or departure in ("????", "", "None") or
-        not arrival   or arrival   in ("????", "", "None")
-    )
-
-
-def _is_valid_icao(icao: str) -> bool:
-    """
-    Базовая валидация ICAO: 4 символа, начинается с буквы,
-    только буквы и цифры. Защита от мусорных данных FSAirlines.
-    """
-    if not icao or len(icao) != 4:
-        return False
-    if not icao[0].isalpha():
-        return False
-    return icao.isalnum()
-
 
 def _enrich_departure_from_fsa(
     message_id: int,
@@ -1160,10 +277,6 @@ def _enrich_departure_from_fsa(
     aircraft_name: str,
     delay: int = 90,
 ) -> None:
-    """
-    Запускается в отдельном треде через `delay` секунд после вылета.
-    Запрашивает FSAirlines, получает маршрут и редактирует сообщение бота.
-    """
     time.sleep(delay)
     logger.info(f"[Enrich] Запрос FSAirlines для пилота '{pilot_name}' (delay={delay}s)")
 
@@ -1186,12 +299,10 @@ def _enrich_departure_from_fsa(
         return
 
     dep       = status.get("departure", "????")
-    arr       = status.get("arrival",   "????")
-    flight_no = status.get("route_id",  "")  # route_id как запасной вариант
+    arr       = status.get("arrival", "????")
 
-    # Попробуем получить номер рейса из активных рейсов FSAirlines
-    active = fsa_active_flights()
-    flt_no = "N/A"
+    active  = fsa_active_flights()
+    flt_no  = "N/A"
     for f in active:
         if str(f.get("user_id")) == str(pilot_id):
             flt_no = f.get("number", "N/A")
@@ -1199,7 +310,6 @@ def _enrich_departure_from_fsa(
 
     logger.info(f"[Enrich] Получены данные FSA: {dep}→{arr} flight={flt_no}")
 
-    # Сохраняем обогащённые данные в кэш для использования при посадке
     if _is_valid_icao(dep) and _is_valid_icao(arr):
         with _departure_cache_lock:
             _departure_cache[pilot_name] = {
@@ -1221,34 +331,6 @@ def _enrich_departure_from_fsa(
     )
 
 
-def fsa_get_recent_report(pilot_id: int, arrival_time: str) -> Optional[Dict]:
-    """
-    Ищет последний отчёт пилота в FSAirlines близкий по времени к arrival_time.
-    arrival_time — строка ISO формата из _data.arrival_at.
-    """
-    data = fsa_call("getFlightReports", {"pilot_id": pilot_id, "count": 5})
-    if not isinstance(data, list):
-        return None
-    try:
-        arr_dt = datetime.fromisoformat(arrival_time.replace("Z", "+00:00"))
-    except Exception:
-        arr_dt = None
-
-    for report in data:
-        if arr_dt:
-            # Сравниваем по timestamp рейса (поле ts)
-            try:
-                rep_dt = _safe_ts(report.get("ts"))
-                if rep_dt and abs((arr_dt.replace(tzinfo=None) - rep_dt).total_seconds()) < 600:
-                    return report
-            except Exception:
-                pass
-        else:
-            # Без времени - берём первый отчёт
-            return report
-    return None
-
-
 def _enrich_completed_from_fsa(
     message_id: int,
     chat_id_str: str,
@@ -1264,10 +346,6 @@ def _enrich_completed_from_fsa(
     delay: int = 60,
     flight_id_for_db: Optional[str] = None,
 ) -> None:
-    """
-    Запускается в отдельном треде через delay секунд после посадки.
-    Запрашивает FSAirlines, получает маршрут и редактирует сообщение бота.
-    """
     time.sleep(delay)
     logger.info(f"[Enrich arrival] Запрос FSAirlines для пилота '{pilot_name}'")
 
@@ -1281,8 +359,6 @@ def _enrich_completed_from_fsa(
             arr       = report.get("arr", "????") or "????"
             flight_no = report.get("number", "N/A") or "N/A"
             logger.info(f"[Enrich arrival] Найден маршрут FSA: {dep}→{arr} {flight_no}")
-
-            # Обновляем БД если получили валидные данные
             if _is_valid_icao(dep) and _is_valid_icao(arr) and flight_id_for_db:
                 db_update_flight_route(flight_id_for_db, flight_no, dep, arr)
                 logger.info(f"[Enrich arrival] БД обновлена для flight_id={flight_id_for_db}")
@@ -1312,565 +388,11 @@ def _enrich_completed_from_fsa(
 
 
 # ═══════════════════════════════════════════════════════════════
-# FINANCIAL AGGREGATION
-# ═══════════════════════════════════════════════════════════════
-
-# Транзакции которые являются внутренними переводами между флотами.
-# Они всегда парные (приход = расход) и не влияют на реальный Net,
-# но засоряют отчёт - исключаем из отображения.
-INTERNAL_TRANSFER_REASONS = {
-    "Fleet Money Transfer",
-}
-
-
-def _aggregate(transactions: List[Dict]) -> Dict:
-    inc, exp = 0.0, 0.0
-    inc_cat: Dict[str, float] = {}
-    exp_cat: Dict[str, float] = {}
-    internal_volume = 0.0  # объём внутренних переводов (для справки)
-
-    for t in transactions:
-        try:
-            v = float(t.get("value", 0))
-        except (ValueError, TypeError):
-            continue
-        r = t.get("reason") or "Other"
-
-        # Внутренние переводы: учитываем в net (они нейтральны),
-        # но НЕ показываем в топах доходов/расходов
-        if r in INTERNAL_TRANSFER_REASONS:
-            internal_volume += abs(v)
-            continue
-
-        if v >= 0:
-            inc += v
-            inc_cat[r] = inc_cat.get(r, 0) + v
-        else:
-            exp += abs(v)
-            exp_cat[r] = exp_cat.get(r, 0) + abs(v)
-
-    return {
-        "inc": inc, "exp": exp, "net": inc - exp,
-        "inc_cat": inc_cat, "exp_cat": exp_cat,
-        "internal_volume": internal_volume,
-    }
-
-
-def _top(d: Dict, n: int = 3) -> List[Tuple]:
-    return sorted(d.items(), key=lambda x: x[1], reverse=True)[:n]
-
-
-def _nem(net: float) -> str:
-    return "📈" if net > 0 else "📉" if net < 0 else "➡️"
-
-
-def snapshot_daily_economy():
-    if not FSA_KEY:
-        return
-    txs = fsa_daily_transactions()
-    if not txs:
-        logger.info("snapshot_daily_economy: no transactions today")
-        return
-    ag = _aggregate(txs)
-    day = datetime.now().strftime("%Y-%m-%d")
-    detail = {
-        "inc_cat": ag["inc_cat"],
-        "exp_cat": ag["exp_cat"],
-        "internal_volume": ag.get("internal_volume", 0),
-    }
-    db_save_daily_economy(
-        day=day,
-        income=int(ag["inc"]),
-        expense=int(ag["exp"]),
-        detail=detail,
-    )
-    logger.info(f"Economy snapshot saved for {day}: net={ag['net']:,.0f}")
-
-
-# ═══════════════════════════════════════════════════════════════
-# LANDING RATING
-# ═══════════════════════════════════════════════════════════════
-
-def landing_rating(rate: int) -> Tuple[str, str]:
-    if rate < -1000: return "UNSAFE LANDING",  "🔴"
-    if rate < -600:  return "HARD LANDING",    "🟠"
-    if rate < -500:  return "FIRM LANDING",    "🟡"
-    if rate < -350:  return "STABLE LANDING",  "🟢"
-    if rate < -50:   return "SMOOTH LANDING",  "✅"
-    return                  "BUTTER LANDING",  "🧈✨"
-
-
-# ═══════════════════════════════════════════════════════════════
-# COMMAND FORMATTERS
-# ═══════════════════════════════════════════════════════════════
-
-def fmt_stats() -> str:
-    now = datetime.now()
-    month_label = f"{MONTH_NAMES[now.month]} {now.year}"
-    flights = db_flights_this_month()
-    if not flights:
-        return f"📊 <b>ОПЕРАЦИИ VA UP!</b>\n📅 {month_label}\n\nРейсов пока нет."
-    rates = [f["landing_rate"] for f in flights]
-    avg = round(sum(rates) / len(rates))
-    return (
-        f"📊 <b>ОПЕРАЦИИ VA UP!</b>\n"
-        f"📅 <i>{month_label}</i>\n\n"
-        f"🛬 Рейсов выполнено: <b>{len(flights)}</b>\n"
-        f"📐 Средняя посадка: <b>{avg} fpm</b>"
-    )
-
-
-def fmt_last(limit: int = 5) -> str:
-    flights = db_last_flights(limit)
-    if not flights:
-        return "✈️ Рейсов пока не зафиксировано."
-    lines = []
-    for f in flights:
-        rating, emoji = landing_rating(f["landing_rate"])
-        dep = f["departure"] or "????"
-        arr = f["arrival"]   or "????"
-        fno = f["flight_no"] or "N/A"
-
-        no_plan = (
-            fno in ("N/A", "", "None") or
-            dep in ("????", "", "None") or
-            arr in ("????", "", "None")
-        )
-
-        if no_plan:
-            # Маршрут неизвестен - не показываем ???? мусор
-            lines.append(
-                f"{emoji} <b>{f['pilot']}</b>\n"
-                f"✈️ {f['aircraft'] or 'N/A'}\n"
-                f"📊 {f['landing_rate']} fpm — <i>план не подан в RLM</i>"
-            )
-        else:
-            lines.append(
-                f"{emoji} <b>{fno}</b>\n"
-                f"👨‍✈️ {f['pilot']}\n"
-                f"🗺 {dep} → {arr}\n"
-                f"📊 {f['landing_rate']} fpm"
-            )
-    return "✈️ <b>ПОСЛЕДНИЕ РЕЙСЫ</b>\n\n" + "\n\n".join(lines)
-
-
-def fmt_top_landings(limit: int = 10) -> str:
-    now = datetime.now()
-    month_label = f"{MONTH_NAMES[now.month]} {now.year}"
-    rows = db_top_landings(limit)
-    if not rows:
-        return f"🏆 <b>ЛУЧШИЕ ПОСАДКИ</b>\n📅 {month_label}\n\nПосадок пока нет."
-    medals = ["🥇", "🥈", "🥉"]
-    lines = []
-    for i, row in enumerate(rows, 1):
-        prefix = medals[i - 1] if i <= 3 else f"{i}."
-        lines.append(f"{prefix} <b>{row['pilot']}</b> — {row['landing_rate']} fpm")
-    return (
-        f"🏆 <b>ЛУЧШИЕ ПОСАДКИ</b>\n"
-        f"📅 <i>{month_label}</i>\n\n"
-        + "\n".join(lines)
-    )
-
-
-def fmt_top_pilots() -> str:
-    flights = db_all_flights()
-    if not flights:
-        return "🏆 Данных о рейсах пока нет."
-    week_ago = datetime.utcnow() - timedelta(days=7)
-    counts: Dict[str, int] = {}
-    for f in flights:
-        try:
-            ca = f["created_at"]
-            if isinstance(ca, str):
-                ca = datetime.fromisoformat(ca)
-            if ca.replace(tzinfo=None) >= week_ago:
-                counts[f["pilot"]] = counts.get(f["pilot"], 0) + 1
-        except Exception:
-            pass
-    if not counts:
-        return "🏆 Рейсов за последние 7 дней нет."
-    sorted_pilots = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:10]
-    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    lines = [
-        f"{medals.get(i, f'{i}.')} <b>{pilot}</b> — {n} рейс(ов)"
-        for i, (pilot, n) in enumerate(sorted_pilots, 1)
-    ]
-    return "🏆 <b>ТОП ПИЛОТЫ (7 дней)</b>\n\n" + "\n".join(lines)
-
-
-def fmt_daily_economy() -> str:
-    row = db_get_today_economy()
-    if row:
-        inc = row["income"]
-        exp = row["expense"]
-        net = row["net"]
-        detail = row["detail"] or {}
-        inc_cat = detail.get("inc_cat", {})
-        exp_cat = detail.get("exp_cat", {})
-        internal = detail.get("internal_volume", 0)
-    else:
-        txs = fsa_daily_transactions()
-        if not txs:
-            return "📊 Финансовых данных за сегодня пока нет."
-        ag = _aggregate(txs)
-        inc, exp, net = ag["inc"], ag["exp"], ag["net"]
-        inc_cat, exp_cat = ag["inc_cat"], ag["exp_cat"]
-        internal = ag.get("internal_volume", 0)
-
-    # Текущий баланс компании из FSAirlines
-    va_data = fsa_airline_data()
-    budget = va_data.get("budget") if va_data else None
-
-    em = _nem(net)
-    sign = "+" if net >= 0 else ""
-
-    budget_line = (
-        f"💼 <b>Баланс компании: {budget:,.0f} v$</b>\n"
-        if budget is not None else ""
-    )
-
-    msg = (
-        f"📊 <b>ФИНАНСОВЫЙ ОТЧЁТ ЗА СЕГОДНЯ</b>\n\n"
-        f"{budget_line}"
-        f"\n"
-        f"📈 <b>Оборот за сутки:</b>\n"
-        f"💰 Доходы: <b>+{inc:,.0f} v$</b>\n"
-        f"📉 Расходы: <b>-{exp:,.0f} v$</b>\n"
-        f"{em} Итог: <b>{sign}{net:,.0f} v$</b>\n"
-    )
-    if internal:
-        msg += f"↔️ <i>Внутр. переводы: {internal:,.0f} v$ (не учитываются)</i>\n"
-    if inc_cat:
-        msg += "\n🔝 <b>ОСНОВНЫЕ ДОХОДЫ:</b>\n"
-        for reason, amount in _top(inc_cat):
-            msg += f"   • {reason}: <b>+{amount:,.0f} v$</b>\n"
-    if exp_cat:
-        msg += "\n⚠️ <b>ОСНОВНЫЕ РАСХОДЫ:</b>\n"
-        for reason, amount in _top(exp_cat):
-            msg += f"   • {reason}: <b>-{amount:,.0f} v$</b>\n"
-    return msg
-
-
-def fmt_monthly_economy() -> str:
-    now = datetime.now()
-    month_label = f"{MONTH_NAMES[now.month]} {now.year}"
-
-    # Форматирование знака без дублирования
-    def _fmt_net(v: int) -> str:
-        sign = "+" if v >= 0 else ""
-        return f"{sign}{v:,.0f} v$"
-
-    # Текущий баланс компании из FSAirlines
-    va_data = fsa_airline_data()
-    budget = va_data.get("budget", 0) if va_data else None
-
-    # Месячная динамика из БД (снимки 23:50 каждый день)
-    rows = db_get_monthly_economy()
-
-    budget_line = (
-        f"💼 <b>Текущий баланс: {budget:,.0f} v$</b>\n"
-        if budget is not None else
-        f"💼 <b>Текущий баланс: недоступен</b>\n"
-    )
-
-    if not rows:
-        return (
-            f"🏆 <b>ФИНАНСОВЫЙ ДАЙДЖЕСТ ЗА МЕСЯЦ</b>\n"
-            f"📅 <i>{month_label}</i>\n\n"
-            f"{budget_line}\n"
-            "📊 Данных по транзакциям пока нет.\n"
-            "ℹ️ История собирается ежедневно в 23:50 UTC."
-        )
-
-    total_inc = sum(r["income"] for r in rows)
-    total_exp = sum(r["expense"] for r in rows)
-    month_net = total_inc - total_exp
-
-    msg = (
-        f"🏆 <b>ФИНАНСОВЫЙ ДАЙДЖЕСТ ЗА МЕСЯЦ</b>\n"
-        f"📅 <i>{month_label}</i>\n\n"
-        f"{budget_line}"
-        f"\n"
-        f"📈 <b>Динамика за месяц:</b>\n"
-        f"💰 Доходы: <b>+{total_inc:,.0f} v$</b>\n"
-        f"📉 Расходы: <b>-{total_exp:,.0f} v$</b>\n"
-        f"{_nem(month_net)} Оборот: <b>{_fmt_net(month_net)}</b>\n\n"
-        f"📊 Дней с данными: <b>{len(rows)}</b>"
-    )
-
-    # Лучший/худший день только если данных больше одного дня
-    if len(rows) > 1:
-        best_row  = max(rows, key=lambda r: r["net"])
-        worst_row = min(rows, key=lambda r: r["net"])
-        msg += (
-            f"\n🌟 Лучший день: <b>{best_row['day']}</b> ({_fmt_net(best_row['net'])})\n"
-            f"⚠️ Худший день: <b>{worst_row['day']}</b> ({_fmt_net(worst_row['net'])})"
-        )
-
-    return msg
-
-
-def fmt_active_flights() -> str:
-    flights = fsa_active_flights()
-    if not flights:
-        return "✈️ В воздухе нет воздушных судов."
-    lines = [
-        f"✈️ <b>{f.get('number', 'N/A')}</b> "
-        f"{f.get('departure', '???')} → {f.get('arrival', '???')} "
-        f"[{f.get('passengers', 0)} пасс.]"
-        for f in flights[:10]
-    ]
-    return f"🛫 <b>В ВОЗДУХЕ СЕЙЧАС ({len(flights)})</b>\n\n" + "\n".join(lines)
-
-
-def fmt_va_info() -> str:
-    data = fsa_airline_data()
-    if not data:
-        return "📊 Данные авиакомпании недоступны."
-    return (
-        f"🏢 <b>О КОМПАНИИ VA UP!</b>\n\n"
-        f"📛 Название: <b>{data.get('name', 'N/A')}</b>\n"
-        f"💰 Бюджет: <b>{data.get('budget', 0):,.0f} v$</b>\n"
-        f"⭐ Репутация: <b>{data.get('reputation', 0)}</b>\n"
-        f"📍 База: <b>{data.get('base', 'N/A')}</b>\n"
-        f"✈️ Код: <b>{data.get('code', 'N/A')}</b>"
-    )
-
-
-MONTH_NAMES = {
-    1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
-    5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
-    9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь",
-}
-
-
-def _month_label(m: str) -> str:
-    try:
-        dt = datetime.strptime(m, "%Y-%m")
-        return f"{MONTH_NAMES[dt.month]} {dt.year}"
-    except Exception:
-        return m
-
-
-def _fmt_contest_block(m: str) -> str:
-    """Форматирует блок одного месяца для вывода в /contest."""
-    entries = db_contest_month(m)
-    limit   = CONTEST_MONTHLY_LIMIT
-    earned  = min(len(entries) * CONTEST_POINTS_PER_LANDING, limit)
-    remain  = limit - earned
-    label   = _month_label(m)
-
-    if not entries:
-        return (
-            f"📅 <b>{label}</b>\n"
-            f"Пока нет кандидатов."
-        )
-
-    lines = []
-    for i, e in enumerate(entries, 1):
-        in_limit = i <= limit
-        pts_str  = f"⭐ +{CONTEST_POINTS_PER_LANDING} баллов" if in_limit else "— (лимит исчерпан)"
-        lines.append(
-            f"  {i}. <b>{e['pilot']}</b> "
-            f"{e['flight_no']} {e['departure']}→{e['arrival']} "
-            f"<b>{e['landing_rate']} fpm</b> {pts_str}\n"
-            f"      🔍 Находится на проверке — результат в конце месяца"
-        )
-
-    return (
-        f"📅 <b>{label}</b> — "
-        f"Начислено: <b>{earned} балл.</b> | Остаток фонда: <b>{remain} балл.</b>\n"
-        + "\n".join(lines)
-    )
-
-
-def fmt_contest(month: Optional[str] = None) -> str:
-    """
-    Без аргумента — текущий месяц + до 3 предыдущих с данными.
-    С аргументом (YYYY-MM) — только указанный месяц.
-    """
-    slots = CONTEST_MONTHLY_LIMIT // CONTEST_POINTS_PER_LANDING
-    header = (
-        f"🎯 <b>МАСТЕР ПОСАДКИ</b>\n"
-        f"<i>Диапазон: от {CONTEST_RATE_MAX} до {CONTEST_RATE_MIN} fpm | "
-        f"1 посадка = {CONTEST_POINTS_PER_LANDING} баллов | Фонд: {CONTEST_MONTHLY_LIMIT} баллов/мес</i>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-    )
-    footer = (
-        f"\n<i>⚠️ Финальная проверка (FSAirlines, штрафы, реал-тайм) — директор</i>"
-    )
-
-    # Конкретный месяц по запросу
-    if month:
-        return header + _fmt_contest_block(month) + footer
-
-    # Текущий + до 3 предыдущих месяцев с данными
-    current = datetime.now().strftime("%Y-%m")
-    recent  = db_contest_recent_months(n=4)
-
-    # Убедимся что текущий месяц всегда первый, даже если данных нет
-    if current not in recent:
-        months_to_show = [current] + recent[:3]
-    else:
-        # Текущий в начале, остальные по убыванию
-        months_to_show = [current] + [m for m in recent if m != current][:3]
-
-    blocks = []
-    for m in months_to_show:
-        entries = db_contest_month(m)
-        # Прошлые месяцы без данных - пропускаем
-        if not entries and m != current:
-            continue
-        blocks.append(_fmt_contest_block(m))
-
-    return header + "\n\n".join(blocks) + footer
-
-
-def fmt_operation() -> str:
-    """Таблица лидеров и прогресс участников ивента."""
-    pilots = db_op_all_pilots()
-    total_legs = len(OPERATION_LEGS)
-    max_pts    = OPERATION_MAX_POINTS
-
-    header = (
-        f"✈️ <b>ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n"
-        f"<i>VTBS → SBGL • 13 этапов • {OPERATION_START} – {OPERATION_END}</i>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-    )
-
-    if not pilots:
-        return header + "Участников пока нет."
-
-    lines = []
-    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    for i, p in enumerate(pilots, 1):
-        prefix  = medals.get(i, f"{i}.")
-        status  = "✅" if p["status"] == "finished" else ("💀" if p["status"] == "lost" else "🛫")
-        leg_str = f"Leg {p['current_leg']}/{total_legs}"
-        pts_str = f"{p['total_points']:,} очк."
-        bar_len     = 13  # каждый символ = 1 лег
-        legs_done   = max(0, p["current_leg"] - 1)  # текущий лег ещё не выполнен
-        if p["status"] == "finished":
-            legs_done = total_legs
-        bar         = "█" * legs_done + "░" * (total_legs - legs_done)
-        aircraft   = f" ({p['aircraft']})" if p.get("aircraft") else ""
-        ferry_str  = f" • Перегон #{p['ferry_num']}" if p.get("ferry_num", 1) > 1 else ""
-        lines.append(
-            f"{prefix} {status} <b>{p['pilot_name']}</b>{aircraft}{ferry_str}\n"
-            f"   {bar} {pts_str} | {leg_str}"
-        )
-
-    footer = (
-        f"\n<i>Макс. очков: {max_pts:,} | "
-        f"Активен до {OPERATION_END}</i>"
-    )
-    return header + "\n\n".join(lines) + footer
-
-
-def fmt_operation_digest() -> str:
-    """Еженедельный дайджест по ивенту."""
-    pilots = db_op_all_pilots()
-    active = [p for p in pilots if p["status"] == "active"]
-    finished = [p for p in pilots if p["status"] == "finished"]
-
-    now = datetime.now()
-    week_label = f"{now.strftime('%d.%m')} — еженедельный отчёт"
-
-    msg = (
-        f"✈️ <b>ОПЕРАЦИЯ «{OPERATION_NAME}» — ДАЙДЖЕСТ</b>\n"
-        f"<i>{week_label}</i>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    )
-
-    if finished:
-        msg += f"🏁 <b>Завершили маршрут ({len(finished)}):</b>\n"
-        for p in finished:
-            msg += f"  ✅ {p['pilot_name']} — {p['total_points']:,} очк.\n"
-        msg += "\n"
-
-    if active:
-        msg += f"🛫 <b>В пути ({len(active)}):</b>\n"
-        for p in active:
-            leg_info = next((f"{dep}→{arr}" for n, dep, arr, _ in OPERATION_LEGS if n == p["current_leg"]), "—")
-            msg += f"  • {p['pilot_name']} — Leg {p['current_leg']}: {leg_info} | {p['total_points']:,} очк.\n"
-
-    if not pilots:
-        msg += "Участников пока нет."
-
-    return msg
-
-
-def fmt_operation_digest() -> str:
-    """Еженедельный дайджест по ивенту."""
-    pilots = db_op_all_pilots()
-    active   = [p for p in pilots if p["status"] == "active"]
-    finished = [p for p in pilots if p["status"] == "finished"]
-    now = datetime.now()
-
-    msg = (
-        f"✈️ <b>ОПЕРАЦИЯ «{OPERATION_NAME}» — ДАЙДЖЕСТ</b>\n"
-        f"<i>{now.strftime('%d.%m.%Y')}</i>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    )
-    if finished:
-        msg += f"🏁 <b>Финишировали ({len(finished)}):</b>\n"
-        for p in finished:
-            msg += f"  ✅ {p['pilot_name']} — {p['total_points']:,} очк.\n"
-        msg += "\n"
-    if active:
-        msg += f"🛫 <b>В пути ({len(active)}):</b>\n"
-        for p in active:
-            next_leg = next(
-                (f"Leg {n}: {dep}→{arr}" for n, dep, arr, _ in OPERATION_LEGS if n == p["current_leg"]),
-                "завершён"
-            )
-            msg += f"  • {p['pilot_name']} | {next_leg} | {p['total_points']:,} очк.\n"
-    if not pilots:
-        msg += "Участников пока нет."
-    return msg
-
-
-def fmt_runway(icao: str) -> str:
-    """Возвращает METAR и рекомендации по полосам через metar-taf.com."""
-    icao = icao.upper()
-    url = f"https://metar-taf.com/metar/{icao.lower()}"
-    return (
-        f"🛫 <b>METAR И ПОЛОСЫ — {icao}</b>\n\n"
-        f"🔗 <a href='{url}'>Открыть METAR на metar-taf.com</a>\n\n"
-        f"💡 <b>Как выбрать полосу:</b>\n"
-        f"• Смотрим направление и скорость ветра в METAR\n"
-        f"• Выбираем полосу с <b>встречным</b> ветром\n"
-        f"• Курс полосы ≈ направление ветра (±30°)\n\n"
-        f"📡 <i>METAR обновляется каждые 30 минут</i>"
-    )
-
-
-# ═══════════════════════════════════════════════════════════════
 # FSHUB EVENT HANDLERS
 # ═══════════════════════════════════════════════════════════════
 
-_processed_events = set()
-_processed_lock = threading.Lock()
-
-# Состояние диалога: chat_id -> "awaiting_icao"
-# Используется для /runway без аргумента - бот спрашивает ICAO и ждёт ответа
-_awaiting_icao: Dict[str, bool] = {}
-_awaiting_lock = threading.Lock()
-
-
-def is_duplicate_event(event_id: str, event_type: str) -> bool:
-    key = f"{event_type}:{event_id}"
-    with _processed_lock:
-        if key in _processed_events:
-            return True
-        _processed_events.add(key)
-        if len(_processed_events) > 1000:
-            _processed_events.clear()
-        return False
-
-
 def handle_departure(data: Dict):
-    d = data.get("_data") or {}
+    d         = data.get("_data") or {}
     flight_id = str(d.get("id", ""))
 
     if flight_id and is_duplicate_event(flight_id, "departure"):
@@ -1881,11 +403,10 @@ def handle_departure(data: Dict):
     plan     = d.get("plan") or {}
     aircraft = d.get("aircraft") or {}
 
-    pilot_name   = user.get("name", "Unknown")
+    pilot_name    = user.get("name", "Unknown")
     aircraft_name = aircraft.get("icao_name", "N/A")
 
     if not _is_plan_empty(plan):
-        # Данные полные - сохраняем в кэш и отправляем сразу
         logger.info(f"[Departure] Полный план от FSHub для '{pilot_name}'")
         with _departure_cache_lock:
             _departure_cache[pilot_name] = {
@@ -1903,10 +424,10 @@ def handle_departure(data: Dict):
             f"✈️ <i>Желаем попутного ветра и мягкой посадки!</i>"
         )
     else:
-        # Пустой план - отправляем краткое сообщение и запускаем обогащение
-        logger.info(f"[Departure] Пустой план от FSHub для '{pilot_name}', запускаю обогащение через 90с")
-
-        # Краткое сообщение - сохраняем message_id для последующего редактирования
+        logger.info(
+            f"[Departure] Пустой план от FSHub для '{pilot_name}', "
+            f"запускаю обогащение через {FSA_ENRICH_DEPARTURE_DELAY}с"
+        )
         r = session.post(
             f"{TG_BASE}/sendMessage",
             json={
@@ -1928,7 +449,8 @@ def handle_departure(data: Dict):
             if message_id:
                 threading.Thread(
                     target=_enrich_departure_from_fsa,
-                    args=(message_id, CHAT_ID, pilot_name, aircraft_name, FSA_ENRICH_DEPARTURE_DELAY),
+                    args=(message_id, CHAT_ID, pilot_name, aircraft_name,
+                          FSA_ENRICH_DEPARTURE_DELAY),
                     daemon=True,
                 ).start()
         else:
@@ -1936,38 +458,26 @@ def handle_departure(data: Dict):
 
 
 def handle_completed(data: Dict):
-    """
-    flight.completed — приходит после обработки рейса FSHub.
-    Структура: _data.id = ID отчёта (правильный для URL),
-               _data.arrival = данные о посадке,
-               _data.departure = данные о вылете,
-               _data.plan = план полёта.
-    """
-    d = data.get("_data") or {}
+    d         = data.get("_data") or {}
     report_id = str(d.get("id", ""))
 
     if report_id and is_duplicate_event(report_id, "completed"):
         logger.info(f"Пропуск дублирующего completed для рейса {report_id}")
         return
 
-    # Данные о посадке - в блоке arrival
     arrival  = d.get("arrival") or {}
     plan     = d.get("plan") or {}
     user     = arrival.get("user") or d.get("user") or {}
     aircraft = arrival.get("aircraft") or d.get("aircraft") or {}
     airport  = arrival.get("airport") or {}
 
-    # flight_no может быть в plan.callsign (flight.completed) или plan.flight_no
     flight_no = plan.get("callsign") or plan.get("flight_no", "N/A")
-
-    # Маршрут: в flight.completed plan использует icao_dep/icao_arr
     dep = plan.get("icao_dep") or plan.get("departure", "????")
     arr = plan.get("icao_arr") or plan.get("arrival", "????")
 
-    rate = int(arrival.get("landing_rate", 0))
-    rating, emoji = landing_rating(rate)
+    rate           = int(arrival.get("landing_rate", 0))
+    rating, emoji  = landing_rating(rate)
 
-    # Дополнительные данные рейса
     distance_nm = (d.get("distance") or {}).get("nm")
     fuel_burnt  = d.get("fuel_burnt")
     max_alt     = (d.get("max") or {}).get("alt")
@@ -2015,12 +525,10 @@ def handle_completed(data: Dict):
     )
 
     if plan_empty and FSA_KEY:
-        # Проверяем кэш данных вылета
         airport_icao = airport.get("icao", "").upper()
         cached = None
         with _departure_cache_lock:
             entry = _departure_cache.get(pilot_name)
-            # Кэш актуален если не старше 24 часов
             if entry and (time.time() - entry.get("ts", 0)) < 86400:
                 cached = entry
 
@@ -2028,27 +536,23 @@ def handle_completed(data: Dict):
             cached_arr = cached.get("arr", "????").upper()
             cached_dep = cached.get("dep", "????")
             cached_fno = cached.get("flight_no", "N/A")
-
-            # Валидируем данные из кэша
             if not _is_valid_icao(cached_dep) or not _is_valid_icao(cached_arr):
-                logger.warning(f"[Completed] Невалидные ICAO в кэше: {cached_dep}→{cached_arr}, игнорируем")
+                logger.warning(
+                    f"[Completed] Невалидные ICAO в кэше: {cached_dep}→{cached_arr}, игнорируем"
+                )
                 cached = None
 
         if cached:
-            # Сравниваем аэропорт прилёта из кэша с фактическим из FSHub
             if airport_icao and cached_arr != airport_icao and _is_valid_icao(airport_icao):
-                # Запасной аэропорт - ждём 15 минут пока пилот завершит рейс в FSAirlines
                 logger.info(
                     f"[Completed] Запасной аэропорт для '{pilot_name}': "
                     f"план={cached_arr}, факт={airport_icao} — жду 15 мин"
                 )
-                # Отправляем с placeholder
-                msg_placeholder = msg_text  # уже содержит ⏳
                 r = session.post(
                     f"{TG_BASE}/sendMessage",
                     json={
                         "chat_id": CHAT_ID,
-                        "text": msg_placeholder,
+                        "text": msg_text,
                         "parse_mode": "HTML",
                         "disable_web_page_preview": True,
                     },
@@ -2062,14 +566,16 @@ def handle_completed(data: Dict):
                             args=(
                                 message_id, CHAT_ID, pilot_name, aircraft_name,
                                 airport_name, rate, rating, emoji,
-                                extras, flight_link, arrival_time, 900,  # 15 минут
+                                extras, flight_link, arrival_time, 900,
                             ),
                             kwargs={"flight_id_for_db": report_id or None},
                             daemon=True,
                         ).start()
             else:
-                # Аэропорт совпадает - используем данные из кэша сразу
-                logger.info(f"[Completed] Используем кэш вылета для '{pilot_name}': {cached_dep}→{cached_arr}")
+                logger.info(
+                    f"[Completed] Используем кэш вылета для '{pilot_name}': "
+                    f"{cached_dep}→{cached_arr}"
+                )
                 final_msg = (
                     f"🛬 <b>ПОСАДКА ВЫПОЛНЕНА — TOUCHDOWN</b> {emoji}\n\n"
                     f"👨‍✈️ Captain: <b>{pilot_name}</b>\n"
@@ -2082,16 +588,16 @@ def handle_completed(data: Dict):
                     f"{flight_link}"
                 )
                 tg_send(final_msg)
-                # Обновляем БД если данные из кэша валидные
                 if _is_valid_icao(cached_dep) and _is_valid_icao(cached_arr) and report_id:
                     db_update_flight_route(report_id, cached_fno, cached_dep, cached_arr)
                     logger.info(f"[Completed] БД обновлена из кэша для flight_id={report_id}")
-                # Очищаем кэш после использования
                 with _departure_cache_lock:
                     _departure_cache.pop(pilot_name, None)
         else:
-            # Нет кэша - стандартное обогащение через FSAirlines с задержкой 3 мин
-            logger.info(f"[Completed] Нет кэша вылета для '{pilot_name}', запускаю обогащение через {FSA_ENRICH_ARRIVAL_DELAY}с")
+            logger.info(
+                f"[Completed] Нет кэша вылета для '{pilot_name}', "
+                f"запускаю обогащение через {FSA_ENRICH_ARRIVAL_DELAY}с"
+            )
             r = session.post(
                 f"{TG_BASE}/sendMessage",
                 json={
@@ -2133,21 +639,19 @@ def handle_completed(data: Dict):
         leg_key = (dep.upper(), arr.upper())
         if leg_key in OPERATION_LEG_MAP:
             leg_num, leg_pts = OPERATION_LEG_MAP[leg_key]
-            pilot = db_op_get_pilot(pilot_name)
+            op_pilot = db_op_get_pilot(pilot_name)
 
-            # Авторегистрация при первом совпавшем рейсе
-            if not pilot:
+            if not op_pilot:
                 aircraft_name_op = aircraft.get("icao_name", "")
                 db_op_register_pilot(pilot_name, aircraft_name_op)
-                pilot = db_op_get_pilot(pilot_name)
+                op_pilot = db_op_get_pilot(pilot_name)
                 logger.info(f"[Operation] Авторегистрация пилота '{pilot_name}'")
 
-            # Автостарт нового перегона если предыдущий завершён и это Leg 1
-            if pilot and pilot["status"] == "finished" and leg_num == 1:
+            if op_pilot and op_pilot["status"] == "finished" and leg_num == 1:
                 aircraft_name_op = aircraft.get("icao_name", "")
                 new_ferry = db_op_start_new_ferry(pilot_name, aircraft_name_op)
                 if new_ferry:
-                    pilot = db_op_get_pilot(pilot_name)
+                    op_pilot = db_op_get_pilot(pilot_name)
                     logger.info(f"[Operation] Автостарт перегона #{new_ferry} для '{pilot_name}'")
                     tg_send(
                         f"✈️ <b>НОВЫЙ ПЕРЕГОН #{new_ferry} — «{OPERATION_NAME}»</b>\n\n"
@@ -2156,17 +660,17 @@ def handle_completed(data: Dict):
                         f"🗺 Маршрут: VTBS → SBGL"
                     )
 
-            if pilot and pilot["status"] == "active":
-                report_url_op = f"https://fshub.io/flight/{report_id}/report" if report_id else ""
+            if op_pilot and op_pilot["status"] == "active":
+                report_url_op = (
+                    f"https://fshub.io/flight/{report_id}/report" if report_id else ""
+                )
 
-                # Засчитываем только ожидаемый следующий лег
-                if leg_num != pilot["current_leg"]:
+                if leg_num != op_pilot["current_leg"]:
                     logger.info(
                         f"[Operation] {pilot_name} Leg {leg_num} ignored, "
-                        f"expected Leg {pilot['current_leg']}"
+                        f"expected Leg {op_pilot['current_leg']}"
                     )
                 else:
-                    # Проверка лимита 2 лега в сутки UTC
                     allowed, legs_today = db_op_check_daily_limit(pilot_name)
                     if not allowed:
                         tg_send(
@@ -2178,15 +682,15 @@ def handle_completed(data: Dict):
                         )
                         logger.info(f"[Operation] {pilot_name} leg={leg_num} — дневной лимит")
                     else:
-                        # Определяем тип ВС и сеть
                         aircraft_icao_type = (
                             d.get("aircraft") or {}
                         ).get("icao") or aircraft.get("icao_name", "")
                         user_handles = user.get("handles") or {}
-                        on_network   = bool(user_handles.get("vatsim") or user_handles.get("ivao"))
+                        on_network   = bool(
+                            user_handles.get("vatsim") or user_handles.get("ivao")
+                        )
 
                         if rate <= -OPERATION_HARD_CRASH:
-                            # Крушение — полный сброс
                             db_op_add_leg(
                                 pilot_name, leg_num, dep, arr, rate,
                                 0, report_id or "", report_url_op,
@@ -2201,7 +705,6 @@ def handle_completed(data: Dict):
                                 f"Пилот начинает с Leg 1."
                             )
                         elif rate <= -OPERATION_FAIL_RATE:
-                            # Жёсткая посадка — этап провален, 0 очков
                             db_op_add_leg(
                                 pilot_name, leg_num, dep, arr, rate,
                                 0, report_id or "", report_url_op,
@@ -2214,14 +717,13 @@ def handle_completed(data: Dict):
                                 f"❌ Очки не начислены. Повторите Leg {leg_num}."
                             )
                         else:
-                            # Успешная посадка — рассчитываем очки
                             earned, coeff, net_bonus = op_calc_points(
                                 leg_pts, aircraft_icao_type, on_network
                             )
                             next_leg    = leg_num + 1
                             is_finished = next_leg > len(OPERATION_LEGS)
                             new_status  = "finished" if is_finished else "active"
-                            new_points  = pilot["total_points"] + earned
+                            new_points  = op_pilot["total_points"] + earned
 
                             db_op_add_leg(
                                 pilot_name, leg_num, dep, arr, rate,
@@ -2238,8 +740,7 @@ def handle_completed(data: Dict):
                             coeff_str  = f"x{coeff}" if coeff != 1.0 else ""
                             bonus_str  = f" +{net_bonus} (VATSIM/IVAO)" if net_bonus else ""
                             detail_str = f"{leg_pts}{coeff_str}{bonus_str} = <b>{earned}</b>"
-
-                            ferry_num  = pilot.get("ferry_num", 1)
+                            ferry_num  = op_pilot.get("ferry_num", 1)
 
                             if is_finished:
                                 tg_send(
@@ -2254,7 +755,12 @@ def handle_completed(data: Dict):
                                 )
                             else:
                                 next_info = next(
-                                    (f"{d2}→{a2}" for n2, d2, a2, _ in OPERATION_LEGS if n2 == next_leg), ""
+                                    (
+                                        f"{d2}→{a2}"
+                                        for n2, d2, a2, _ in OPERATION_LEGS
+                                        if n2 == next_leg
+                                    ),
+                                    "",
                                 )
                                 legs_after = legs_today + 1
                                 limit_str  = (
@@ -2330,10 +836,10 @@ def handle_screenshots(data: Dict):
 
 
 def handle_achievement(data: Dict):
-    d = data.get("_data", {})
+    d           = data.get("_data", {})
     achievement = d.get("achievement", {})
-    flight = d.get("flight", {})
-    user = flight.get("user", {})
+    flight      = d.get("flight", {})
+    user        = flight.get("user", {})
     tg_send(
         f"🏆 <b>ACHIEVEMENT UNLOCKED</b>\n\n"
         f"👨‍✈️ {user.get('name', 'Unknown')}\n"
@@ -2342,8 +848,8 @@ def handle_achievement(data: Dict):
 
 
 FSHUB_HANDLERS = {
-    "flight.departed":   handle_departure,
-    "flight.completed":  handle_completed,
+    "flight.departed":      handle_departure,
+    "flight.completed":     handle_completed,
     "screenshots.uploaded": handle_screenshots,
     "airline.achievement":  handle_achievement,
 }
@@ -2353,75 +859,39 @@ FSHUB_HANDLERS = {
 # ═══════════════════════════════════════════════════════════════
 
 COMMANDS = {
-    "/stats":     fmt_stats,
-    "/last":      fmt_last,
+    "/stats":       fmt_stats,
+    "/last":        fmt_last,
     "/top_landing": fmt_top_landings,
-    "/top":       fmt_top_pilots,
-    "/economy":   fmt_daily_economy,
-    "/monthly":   fmt_monthly_economy,
-    "/live":      fmt_active_flights,
-    "/va":        fmt_va_info,
-    "/operation": fmt_operation,
+    "/top":         fmt_top_pilots,
+    "/economy":     fmt_daily_economy,
+    "/monthly":     fmt_monthly_economy,
+    "/live":        fmt_active_flights,
+    "/va":          fmt_va_info,
+    "/operation":   fmt_operation,
 }
 
-HELP_TEXT = (
-    "<b>VA UP! Панель управления</b>\n\n"
-    "📊 <b>Операции:</b>\n"
-    "/stats — статистика операций\n"
-    "/last — последние рейсы\n"
-    "/top — топ пилоты (7 дней)\n"
-    "/top_landing — лучшие посадки\n\n"
-    "🛫 <b>Предполётная подготовка:</b>\n"
-    "/runway ICAO — METAR и рабочая полоса\n"
-    "   Пример: /runway UHWW\n\n"
-    "💰 <b>Финансы:</b>\n"
-    "/economy — финансовый отчёт за день\n"
-    "/monthly — дайджест за месяц\n"
-    "/live — рейсы в воздухе\n"
-    "/va — информация о компании"
-)
-
-# Инициализируем маппинг после определения всех форматтеров
-MENU_CALLBACKS.update({
-    "cmd_stats":       fmt_stats,
-    "cmd_last":        fmt_last,
-    "cmd_top":         fmt_top_pilots,
-    "cmd_top_landing": fmt_top_landings,
-    "cmd_economy":     fmt_daily_economy,
-    "cmd_monthly":     fmt_monthly_economy,
-    "cmd_live":        fmt_active_flights,
-    "cmd_va":          fmt_va_info,
-    "cmd_contest":     fmt_contest,
-    "cmd_operation":   fmt_operation,
-})
+# Скомпилированный паттерн для валидации YYYY-MM (один раз на уровне модуля)
+_RE_MONTH = re.compile(r"^\d{4}-\d{2}$")
 
 
 def handle_tg_command(message: Dict):
     chat_id = message.get("chat", {}).get("id")
-    text = (message.get("text") or "").strip()
+    text    = (message.get("text") or "").strip()
 
     if not chat_id or not text:
         return
 
-    # В канале/чате обрабатываем только команды с явным упоминанием бота:
-    # /runway@vaup_bot UHWW - сработает.
-    # /runway UHWW или обычный текст - игнорируем, чтобы не мешать общению.
     if str(chat_id) == str(CHAT_ID):
-        # Если пользователь уже в режиме ожидания ICAO - пропускаем фильтр,
-        # чтобы он мог ответить боту прямо в канале.
         with _awaiting_lock:
             user_is_awaiting = str(chat_id) in _awaiting_icao
         if not user_is_awaiting:
-            # В канале реагируем только на команды с явным упоминанием бота:
-            # /runway@up_va_bot - сработает, обычный текст - нет.
-            first_word = text.split()[0] if text.split() else ""
+            first_word       = text.split()[0] if text.split() else ""
             addressed_to_bot = "@" in first_word and first_word.startswith("/")
             if not addressed_to_bot:
-                return  # тихо игнорируем
+                return
 
     logger.info(f"Command from chat={chat_id}: {text}")
 
-    # Парсим команду один раз - используется во всех блоках ниже
     cmd_parts = text.split()
     base_cmd  = cmd_parts[0].split("@")[0] if cmd_parts else ""
 
@@ -2429,25 +899,20 @@ def handle_tg_command(message: Dict):
         tg_send_menu(chat_id)
         return
 
-    # ─── Обработка /operation_admin ────────────────────────────
+    # ─── /operation_admin ───────────────────────────────────────
     if base_cmd == "/operation_admin":
         if str(chat_id) != str(ADMIN_ID):
             tg_send("⛔ Нет доступа.", chat_id)
             return
-        # /operation_admin add <имя> [самолёт]
-        # /operation_admin set <имя> <очки_дельта>
-        # /operation_admin reset <имя>
-        # /operation_admin list
+
         parts = text.split(None, 3)
-        sub = parts[1] if len(parts) > 1 else ""
+        sub   = parts[1] if len(parts) > 1 else ""
 
         if sub == "add":
-            # Формат: /operation_admin add Имя Фамилия | B738
-            # Разделитель | отделяет имя от самолёта
             rest = text.split(None, 2)[2] if len(text.split(None, 2)) > 2 else ""
             if "|" in rest:
                 pilot_part, aircraft_part = rest.split("|", 1)
-                pilot   = pilot_part.strip()
+                pilot    = pilot_part.strip()
                 aircraft = aircraft_part.strip()
             else:
                 pilot    = rest.strip()
@@ -2457,9 +922,9 @@ def handle_tg_command(message: Dict):
                 return
             ok = db_op_register_pilot(pilot, aircraft)
             if ok:
-                p = db_op_get_pilot(pilot)
+                p     = db_op_get_pilot(pilot)
                 ferry = p["ferry_num"] if p else 1
-                msg = (
+                msg   = (
                     f"✅ Пилот <b>{pilot}</b> — перегон #{ferry} начат"
                     f"{' на ' + aircraft if aircraft else ''}."
                 )
@@ -2468,7 +933,6 @@ def handle_tg_command(message: Dict):
             tg_send(msg, chat_id)
 
         elif sub == "set":
-            # Формат: /operation_admin set Имя Фамилия | +500
             rest = text.split(None, 2)[2] if len(text.split(None, 2)) > 2 else ""
             if "|" not in rest:
                 tg_send("Использование: /operation_admin set Имя Фамилия | +500", chat_id)
@@ -2486,10 +950,12 @@ def handle_tg_command(message: Dict):
                 return
             db_op_admin_set(pilot, 0, delta)
             p2 = db_op_get_pilot(pilot)
-            tg_send(f"✅ <b>{pilot}</b>: {p['total_points']:,} → <b>{p2['total_points']:,}</b> очков.", chat_id)
+            tg_send(
+                f"✅ <b>{pilot}</b>: {p['total_points']:,} → <b>{p2['total_points']:,}</b> очков.",
+                chat_id,
+            )
 
         elif sub == "leg":
-            # Формат: /operation_admin leg Имя Фамилия | 3
             rest = text.split(None, 2)[2] if len(text.split(None, 2)) > 2 else ""
             if "|" not in rest:
                 tg_send("Использование: /operation_admin leg Имя Фамилия | 3", chat_id)
@@ -2515,8 +981,7 @@ def handle_tg_command(message: Dict):
             tg_send(f"✅ <b>{pilot}</b>: текущий лег установлен на <b>{leg}</b>.", chat_id)
 
         elif sub == "reset":
-            # Формат: /operation_admin reset Имя Фамилия
-            rest = text.split(None, 2)[2] if len(text.split(None, 2)) > 2 else ""
+            rest  = text.split(None, 2)[2] if len(text.split(None, 2)) > 2 else ""
             pilot = rest.strip()
             if not pilot:
                 tg_send("Использование: /operation_admin reset Имя Фамилия", chat_id)
@@ -2533,12 +998,11 @@ def handle_tg_command(message: Dict):
             if not pilots:
                 tg_send("Участников нет.", chat_id)
                 return
-            lines = []
-            for p in pilots:
-                lines.append(
-                    f"• <b>{p['pilot_name']}</b> ({p['aircraft'] or '—'}) "
-                    f"Leg {p['current_leg']} | {p['total_points']:,} очк. [{p['status']}]"
-                )
+            lines = [
+                f"• <b>{p['pilot_name']}</b> ({p['aircraft'] or '—'}) "
+                f"Leg {p['current_leg']} | {p['total_points']:,} очк. [{p['status']}]"
+                for p in pilots
+            ]
             tg_send("📋 <b>Участники операции:</b>\n\n" + "\n".join(lines), chat_id)
 
         else:
@@ -2552,16 +1016,13 @@ def handle_tg_command(message: Dict):
                 chat_id,
             )
         return
-    # ─── Конец /operation_admin ──────────────────────────────────
 
-    # ─── Обработка /contest [YYYY-MM] ───────────────────────────
+    # ─── /contest [YYYY-MM] ─────────────────────────────────────
     if base_cmd == "/contest":
-        # Опциональный аргумент: /contest 2026-05
         month_arg = None
         if len(cmd_parts) >= 2:
-            import re
             raw = cmd_parts[1].strip()
-            if re.match(r"^\d{4}-\d{2}$", raw):
+            if _RE_MONTH.match(raw):
                 month_arg = raw
             else:
                 tg_send(
@@ -2572,13 +1033,10 @@ def handle_tg_command(message: Dict):
                 return
         tg_send(fmt_contest(month_arg), chat_id)
         return
-    # ─── Конец обработки /contest ───────────────────────────────
 
-    # ─── Обработка /runway ──────────────────────────────────────
-
+    # ─── /runway [ICAO] ─────────────────────────────────────────
     if base_cmd == "/runway":
         if len(cmd_parts) < 2:
-            # Аргумент не передан - переходим в режим ожидания ICAO
             with _awaiting_lock:
                 _awaiting_icao[str(chat_id)] = True
             tg_send_with_cancel(
@@ -2597,9 +1055,8 @@ def handle_tg_command(message: Dict):
                 logger.info(f"Runway request: {icao_raw} from {chat_id}")
                 tg_send(fmt_runway(icao_raw), chat_id)
         return
-    # ─── Конец обработки /runway ────────────────────────────────
 
-    # ─── Обработка ответа на запрос ICAO ────────────────────────
+    # ─── Ответ на диалог /runway ─────────────────────────────────
     with _awaiting_lock:
         is_awaiting = _awaiting_icao.pop(str(chat_id), False)
 
@@ -2615,10 +1072,9 @@ def handle_tg_command(message: Dict):
             logger.info(f"Runway request (dialog): {icao_raw} from {chat_id}")
             tg_send(fmt_runway(icao_raw), chat_id)
         return
-    # ─── Конец обработки ответа ICAO ────────────────────────────
 
+    # ─── Стандартные команды ─────────────────────────────────────
     cmd = text.split("@")[0]
-
     if cmd in COMMANDS:
         try:
             tg_send(COMMANDS[cmd](), chat_id)
@@ -2637,7 +1093,7 @@ def handle_tg_command(message: Dict):
 app = Flask(__name__)
 
 
-def job_listener(event):
+def _job_listener(event):
     if event.exception:
         logger.error(f"Job {event.job_id} crashed: {event.exception}")
     else:
@@ -2645,12 +1101,6 @@ def job_listener(event):
 
 
 def init_scheduler():
-    """
-    Инициализирует и запускает планировщик.
-    Вызывается ОДИН РАЗ в блоке STARTUP при загрузке модуля.
-    Gunicorn запускается с --workers 1 --preload, поэтому планировщик
-    живёт в единственном процессе и не дублируется.
-    """
     scheduler = BackgroundScheduler(
         daemon=True,
         executors={"default": ThreadPoolExecutor(max_workers=2)},
@@ -2668,13 +1118,11 @@ def init_scheduler():
         "cron", hour=23, minute=50,
         id="daily_economy_snapshot",
     )
-    # Финансовый отчёт за сутки - 23:00 МСК (20:00 UTC)
     scheduler.add_job(
         lambda: tg_send(fmt_daily_economy()),
         "cron", hour=20, minute=0,
         id="daily_economy_report",
     )
-    # Статистика операций - 00:00 МСК (21:00 UTC)
     scheduler.add_job(
         lambda: tg_send(fmt_stats()),
         "cron", hour=21, minute=0,
@@ -2728,7 +1176,15 @@ def init_scheduler():
         id="monthly_digest",
     )
 
-    scheduler.add_listener(job_listener, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
+    # ─── Фоновое обновление кэша пилотов FSAirlines (раз в час) ─
+    scheduler.add_job(
+        _refresh_fsa_pilot_cache_bg,
+        "interval", hours=1,
+        id="fsa_pilot_cache_refresh",
+        next_run_time=datetime.now(),  # сразу при старте
+    )
+
+    scheduler.add_listener(_job_listener, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
     scheduler.start()
 
     jobs = scheduler.get_jobs()
@@ -2739,11 +1195,25 @@ def init_scheduler():
     return scheduler
 
 
+def _refresh_fsa_pilot_cache_bg():
+    """Фоновое обновление кэша пилотов — не блокирует вебхуки."""
+    try:
+        fsa_refresh_pilot_cache()
+        if FSA_KEY:  # FSA_KEY2 проверяется внутри fsa_refresh_pilot_cache2
+            fsa_refresh_pilot_cache2()
+    except Exception as e:
+        logger.warning(f"fsa_pilot_cache refresh error: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# FLASK ROUTES
+# ═══════════════════════════════════════════════════════════════
+
 @app.route("/")
 def home():
     return jsonify({
-        "status": "running",
-        "service": "VA UP! PostgreSQL Edition",
+        "status":      "running",
+        "service":     "VA UP! PostgreSQL Edition",
         "fsa_enabled": bool(FSA_KEY),
     })
 
@@ -2753,10 +1223,39 @@ def health():
     return jsonify({"ok": True}), 200
 
 
+def _verify_fshub_signature(payload: bytes, signature_header: str) -> bool:
+    """
+    Проверяет HMAC-SHA256 подпись FSHub.
+    Если WEBHOOK_SECRET не задан — пропускаем проверку (совместимость).
+    """
+    if not WEBHOOK_SECRET:
+        return True
+    if not signature_header:
+        return False
+    try:
+        expected = hmac.new(
+            WEBHOOK_SECRET.encode(), payload, hashlib.sha256
+        ).hexdigest()
+        # FSHub присылает подпись в формате "sha256=<hex>"
+        parts = signature_header.split("=", 1)
+        actual = parts[1] if len(parts) == 2 else signature_header
+        return hmac.compare_digest(expected, actual)
+    except Exception as e:
+        logger.warning(f"Signature verification error: {e}")
+        return False
+
+
 @app.route("/webhook", methods=["GET", "POST"])
 def fshub_webhook():
     if request.method == "GET":
         return jsonify({"status": "ok"})
+
+    # Проверка подписи FSHub
+    sig = request.headers.get("X-FSHub-Signature", "")
+    if not _verify_fshub_signature(request.get_data(), sig):
+        logger.warning("FSHub webhook: invalid signature")
+        return jsonify({"error": "invalid signature"}), 403
+
     try:
         data = request.get_json(force=True)
         if not data:
@@ -2779,7 +1278,6 @@ def fshub_webhook():
 def tg_webhook():
     try:
         data = request.get_json(force=True) or {}
-        # Inline-кнопки приходят как callback_query, не как message
         if "callback_query" in data:
             handle_callback_query(data["callback_query"])
         else:
@@ -2795,19 +1293,18 @@ def tg_webhook():
 # ═══════════════════════════════════════════════════════════════
 
 def _cors_headers(response):
-    response.headers['Access-Control-Allow-Origin'] = 'https://va-up.ru'
-    response.headers['Access-Control-Allow-Methods'] = 'GET'
-    response.headers['Cache-Control'] = 'public, max-age=60'
+    response.headers["Access-Control-Allow-Origin"] = "https://va-up.ru"
+    response.headers["Access-Control-Allow-Methods"] = "GET"
+    response.headers["Cache-Control"] = "public, max-age=60"
     return response
 
 
 @app.route("/api/operation")
 def api_operation():
-    """Таблица лидеров операции Тихий Вжух."""
     try:
-        pilots = db_op_all_pilots()
+        pilots     = db_op_all_pilots()
         total_legs = len(OPERATION_LEGS)
-        result = []
+        result     = []
         for i, p in enumerate(pilots, 1):
             legs_done = max(0, p["current_leg"] - 1)
             if p["status"] == "finished":
@@ -2833,7 +1330,7 @@ def api_operation():
                 "max_points": OPERATION_MAX_POINTS,
             },
             "pilots": result,
-            "total": len(result),
+            "total":  len(result),
         })
         return _cors_headers(resp)
     except Exception as e:
@@ -2843,17 +1340,20 @@ def api_operation():
 
 @app.route("/api/flights")
 def api_flights():
-    """Последние рейсы из БД бота."""
     try:
-        limit = min(int(request.args.get("limit", 10)), 50)
+        limit      = min(int(request.args.get("limit", 10)), 50)
         month_only = request.args.get("month", "0") == "1"
-        flights = db_flights_this_month()[:limit] if month_only else db_last_flights(limit)
-        result = []
+        flights    = db_flights_this_month()[:limit] if month_only else db_last_flights(limit)
+        result     = []
         for f in flights:
-            dep = f["departure"] or "????"
-            arr = f["arrival"]   or "????"
-            fno = f["flight_no"] or "N/A"
-            no_plan = fno in ("N/A", "", "None") or dep in ("????", "", "None") or arr in ("????", "", "None")
+            dep      = f["departure"] or "????"
+            arr      = f["arrival"]   or "????"
+            fno      = f["flight_no"] or "N/A"
+            no_plan  = (
+                fno in ("N/A", "", "None") or
+                dep in ("????", "", "None") or
+                arr in ("????", "", "None")
+            )
             rating, _ = landing_rating(f["landing_rate"])
             result.append({
                 "flight_no":    fno if not no_plan else None,
@@ -2864,8 +1364,13 @@ def api_flights():
                 "landing_rate": f["landing_rate"],
                 "rating":       rating,
                 "no_plan":      no_plan,
-                "report_url":   f"https://fshub.io/flight/{f['flight_id']}/report" if f.get("flight_id") else None,
-                "created_at":   f["created_at"].isoformat() if f.get("created_at") else None,
+                "report_url":   (
+                    f"https://fshub.io/flight/{f['flight_id']}/report"
+                    if f.get("flight_id") else None
+                ),
+                "created_at":   (
+                    f["created_at"].isoformat() if f.get("created_at") else None
+                ),
             })
         resp = jsonify({"ok": True, "flights": result, "total": len(result)})
         return _cors_headers(resp)
@@ -2876,9 +1381,7 @@ def api_flights():
 
 @app.route("/api/stats")
 def api_stats():
-    """Статистика операций."""
     try:
-        from collections import Counter
         flights_month = db_flights_this_month()
         flights_all   = db_all_flights()
         rates_month   = [f["landing_rate"] for f in flights_month]
@@ -2886,7 +1389,7 @@ def api_stats():
         avg_month = round(sum(rates_month) / len(rates_month)) if rates_month else 0
         avg_all   = round(sum(rates_all)   / len(rates_all))   if rates_all   else 0
         pilot_counts = Counter(f["pilot"] for f in flights_month)
-        top_pilots = [{"pilot": n, "flights": c} for n, c in pilot_counts.most_common(5)]
+        top_pilots   = [{"pilot": n, "flights": c} for n, c in pilot_counts.most_common(5)]
         now = datetime.now()
         resp = jsonify({
             "ok": True,
@@ -2906,7 +1409,6 @@ def api_stats():
 
 @app.route("/api/contest")
 def api_contest():
-    """Конкурс Мастер Посадки."""
     try:
         now     = datetime.now()
         month   = now.strftime("%Y-%m")
@@ -2926,7 +1428,7 @@ def api_contest():
                 "report_url":   e.get("report_url", ""),
             })
         resp = jsonify({
-            "ok": True,
+            "ok":            True,
             "month":         month,
             "month_label":   f"{MONTH_NAMES[now.month]} {now.year}",
             "slots_total":   slots,
@@ -2942,12 +1444,9 @@ def api_contest():
 
 
 # ═══════════════════════════════════════════════════════════════
-# STARTUP - выполняется один раз при загрузке модуля.
-# Gunicorn с флагом --preload загружает модуль ДО форка воркеров,
-# поэтому планировщик стартует ровно один раз.
-#
-# Start Command на Render:
-#   gunicorn app:app --workers 1 --threads 4 --timeout 120 --preload
+# STARTUP
+# Выполняется один раз при загрузке модуля.
+# Gunicorn с --preload загружает ДО форка воркеров.
 # ═══════════════════════════════════════════════════════════════
 
 try:
@@ -2959,11 +1458,11 @@ except Exception as e:
     logger.exception(f"Startup failed: {e}")
     sys.exit(1)
 
-logger.info(f"Сервис запущен на порту {PORT} — VA UP! готова к полётам")
+logger.info(f"Сервис запущен на порту {os.environ.get('PORT', 10000)} — VA UP! готова к полётам")
 
 # ═══════════════════════════════════════════════════════════════
-# MAIN (для локального запуска)
+# MAIN (локальный запуск)
 # ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT, threaded=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), threaded=True)
