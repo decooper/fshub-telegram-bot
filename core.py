@@ -1290,10 +1290,13 @@ def fsa_get_recent_report(pilot_id: int, arrival_time: str) -> Optional[Dict]:
             try:
                 rep_dt = _safe_ts(report.get("ts"))
                 if rep_dt and abs((arr_dt.replace(tzinfo=None) - rep_dt).total_seconds()) < 600:
+                    # Логируем полную структуру отчёта для изучения полей violations/simrate
+                    logger.info(f"[FSA Report DEBUG] Полная структура: {json.dumps(report, ensure_ascii=False)}")
                     return report
             except Exception:
                 pass
         else:
+            logger.info(f"[FSA Report DEBUG] Полная структура: {json.dumps(report, ensure_ascii=False)}")
             return report
     return None
 
