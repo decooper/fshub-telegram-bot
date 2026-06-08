@@ -689,6 +689,16 @@ def handle_departure(data: Dict):
 
 
 def handle_completed(data: Dict):
+    """
+    СХЕМА:
+    1. Берём данные полёта из FSHub (пилот, ВС, посадка, дистанция, топливо)
+    2. Маршрут: сначала из кэша FSAirlines (_departure_cache[from_fsa=True]),
+       если нет — из FSHub плана, если нет — "????"
+    3. Отправляем сообщение о посадке сразу
+    4. Если ивент активен и маршрут совпадает — запускаем тред проверки simrate
+    5. Тред: ждёт FSA_ENRICH_ARRIVAL_DELAY → берёт отчёт FSAirlines →
+       проверяет simrate → засчитывает лег → редактирует сообщение с маршрутом
+    """
     d         = data.get("_data") or {}
     report_id = str(d.get("id", ""))
 
@@ -696,88 +706,98 @@ def handle_completed(data: Dict):
         logger.info(f"Пропуск дублирующего completed для рейса {report_id}")
         return
 
+    # ── 1. Данные полёта из FSHub ──────────────────────────────
     arrival  = d.get("arrival") or {}
-    plan     = d.get("plan") or {}
-    user     = arrival.get("user") or d.get("user") or {}
+    plan     = d.get("plan")    or {}
+    user     = arrival.get("user")     or d.get("user")     or {}
     aircraft = arrival.get("aircraft") or d.get("aircraft") or {}
-    airport  = arrival.get("airport") or {}
+    airport  = arrival.get("airport")  or {}
 
-    flight_no = plan.get("callsign") or plan.get("flight_no", "N/A")
-    dep = plan.get("icao_dep") or plan.get("departure", "????")
-    arr = plan.get("icao_arr") or plan.get("arrival", "????")
+    pilot_name    = user.get("name",        "Unknown")
+    aircraft_name = aircraft.get("icao_name", "Unknown")
+    airport_name  = airport.get("name",      "Unknown")
+    arrival_time  = d.get("arrival_at", "") or ""
 
-    # ── Маршрут из FSAirlines (кэш вылета) — источник истины ──
-    # Берём только если кэш заполнен из FSAirlines (from_fsa: True).
-    # FSHub маршрут для ивента НЕ используем — только для отображения доп. данных.
-    pilot_name_early = (
-        (d.get("arrival") or {}).get("user") or d.get("user") or {}
-    ).get("name", "")
-    if pilot_name_early:
-        with _departure_cache_lock:
-            _cache_entry = _departure_cache.get(pilot_name_early)
-        if (
-            _cache_entry
-            and _cache_entry.get("from_fsa")  # только FSAirlines
-            and (time.time() - _cache_entry.get("ts", 0)) < 86400
-        ):
-            _cached_dep = _cache_entry.get("dep", "????")
-            _cached_arr = _cache_entry.get("arr", "????")
-            _cached_fno = _cache_entry.get("flight_no", "N/A")
-            if _is_valid_icao(_cached_dep) and _is_valid_icao(_cached_arr):
-                logger.info(
-                    f"[Completed] Маршрут из FSAirlines-кэша для '{pilot_name_early}': "
-                    f"{_cached_dep}→{_cached_arr}"
-                )
-                dep       = _cached_dep
-                arr       = _cached_arr
-                # Номер рейса: FSHub в приоритете (он = источник данных полёта),
-                # FSAirlines только если FSHub не дал
-                if flight_no in ("N/A", "", "None"):
-                    flight_no = _cached_fno
-    # ──────────────────────────────────────────────────────────
-
-    rate           = int(arrival.get("landing_rate", 0))
-    rating, emoji  = landing_rating(rate)
+    rate          = int(arrival.get("landing_rate", 0))
+    rating, emoji = landing_rating(rate)
 
     distance_nm = (d.get("distance") or {}).get("nm")
     fuel_burnt  = d.get("fuel_burnt")
     max_alt     = (d.get("max") or {}).get("alt")
 
+    # Номер рейса из FSHub
+    fshub_flight_no = plan.get("callsign") or plan.get("flight_no", "N/A")
+
+    # ── 2. Маршрут: FSAirlines-кэш в приоритете ───────────────
+    dep       = "????"
+    arr       = "????"
+    flight_no = fshub_flight_no
+    route_from = "none"  # для лога
+
+    with _departure_cache_lock:
+        cache_entry = _departure_cache.get(pilot_name)
+
+    if (
+        cache_entry
+        and cache_entry.get("from_fsa")
+        and (time.time() - cache_entry.get("ts", 0)) < 86400
+        and _is_valid_icao(cache_entry.get("dep", ""))
+        and _is_valid_icao(cache_entry.get("arr", ""))
+    ):
+        dep        = cache_entry["dep"]
+        arr        = cache_entry["arr"]
+        flight_no  = fshub_flight_no if fshub_flight_no not in ("N/A", "", "None") \
+                     else cache_entry.get("flight_no", "N/A")
+        route_from = "fsa_cache"
+        logger.info(f"[Completed] Маршрут из FSAirlines-кэша: {dep}→{arr} пилот='{pilot_name}'")
+    else:
+        # FSAirlines-кэша нет — пробуем FSHub план
+        fshub_dep = plan.get("icao_dep") or plan.get("departure", "????")
+        fshub_arr = plan.get("icao_arr") or plan.get("arrival",   "????")
+        if _is_valid_icao(fshub_dep) and _is_valid_icao(fshub_arr):
+            dep        = fshub_dep
+            arr        = fshub_arr
+            route_from = "fshub"
+            logger.info(
+                f"[Completed] FSAirlines-кэша нет, маршрут из FSHub: "
+                f"{dep}→{arr} пилот='{pilot_name}'"
+            )
+        else:
+            route_from = "none"
+            logger.info(
+                f"[Completed] Маршрут неизвестен для '{pilot_name}' — "
+                f"нет ни FSAirlines-кэша ни FSHub плана"
+            )
+
+    # ── 3. Запись в БД ─────────────────────────────────────────
     db_add_flight(
         flight_id=report_id or None,
-        pilot=user.get("name", "Unknown"),
+        pilot=pilot_name,
         flight_no=flight_no,
         departure=dep,
         arrival=arr,
-        aircraft=aircraft.get("icao_name", "Unknown"),
+        aircraft=aircraft_name,
         landing_rate=rate,
         profit=None,
     )
 
+    # ── 4. Сообщение о посадке ─────────────────────────────────
     flight_link = (
         f"\n🔗 <a href='https://fshub.io/flight/{report_id}/report'>Открыть отчёт о рейсе</a>"
         if report_id else ""
     )
-
     extras = ""
-    if distance_nm:
-        extras += f"\n📏 Distance: <b>{distance_nm} nm</b>"
-    if fuel_burnt:
-        extras += f"\n⛽ Fuel burnt: <b>{fuel_burnt} kg</b>"
-    if max_alt:
-        extras += f"\n🏔 Max altitude: <b>{max_alt:,} ft</b>"
+    if distance_nm: extras += f"\n📏 Distance: <b>{distance_nm} nm</b>"
+    if fuel_burnt:  extras += f"\n⛽ Fuel burnt: <b>{fuel_burnt} kg</b>"
+    if max_alt:     extras += f"\n🏔 Max altitude: <b>{max_alt:,} ft</b>"
 
-    pilot_name    = user.get("name", "Unknown")
-    aircraft_name = aircraft.get("icao_name", "Unknown")
-    airport_name  = airport.get("name", "Unknown")
-    arrival_time  = d.get("arrival_at", "") or ""
-    plan_empty    = _is_plan_empty({"flight_no": flight_no, "departure": dep, "arrival": arr})
+    route_display = f"{dep} → {arr}" if route_from != "none" else "⏳ Загружаю маршрут..."
 
     msg_text = (
         f"🛬 <b>ПОСАДКА ВЫПОЛНЕНА — TOUCHDOWN</b> {emoji}\n\n"
         f"👨‍✈️ Captain: <b>{pilot_name}</b>\n"
         f"🆔 Flight: <b>{flight_no}</b>\n"
-        f"🗺 Route: <b>{'⏳ Загружаю маршрут...' if plan_empty else f'{dep} → {arr}'}</b>\n"
+        f"🗺 Route: <b>{route_display}</b>\n"
         f"📍 Airport: <b>{airport_name}</b>\n"
         f"✈️ Aircraft: <b>{aircraft_name}</b>\n"
         f"📊 Landing Rate: <b>{rate} fpm</b> — {rating}"
@@ -785,190 +805,78 @@ def handle_completed(data: Dict):
         f"{flight_link}"
     )
 
-    if plan_empty and FSA_KEY:
-        airport_icao = airport.get("icao", "").upper()
-        cached = None
-        with _departure_cache_lock:
-            entry = _departure_cache.get(pilot_name)
-            if entry and (time.time() - entry.get("ts", 0)) < 86400:
-                cached = entry
-
-        if cached:
-            cached_arr = cached.get("arr", "????").upper()
-            cached_dep = cached.get("dep", "????")
-            cached_fno = cached.get("flight_no", "N/A")
-            if not _is_valid_icao(cached_dep) or not _is_valid_icao(cached_arr):
-                logger.warning(
-                    f"[Completed] Невалидные ICAO в кэше: {cached_dep}→{cached_arr}, игнорируем"
-                )
-                cached = None
-
-        if cached:
-            if airport_icao and cached_arr != airport_icao and _is_valid_icao(airport_icao):
-                logger.info(
-                    f"[Completed] Запасной аэропорт для '{pilot_name}': "
-                    f"план={cached_arr}, факт={airport_icao} — жду 15 мин"
-                )
-                r = session.post(
-                    f"{TG_BASE}/sendMessage",
-                    json={
-                        "chat_id": CHAT_ID,
-                        "text": msg_text,
-                        "parse_mode": "HTML",
-                        "disable_web_page_preview": True,
-                    },
-                    timeout=20,
-                )
-                if r.status_code == 200:
-                    message_id = r.json().get("result", {}).get("message_id")
-                    if message_id:
-                        threading.Thread(
-                            target=_enrich_completed_from_fsa,
-                            args=(
-                                message_id, CHAT_ID, pilot_name, aircraft_name,
-                                airport_name, rate, rating, emoji,
-                                extras, flight_link, arrival_time, 900,
-                            ),
-                            kwargs={
-                                "flight_id_for_db": report_id or None,
-                                "op_leg_num":       op_leg_num,
-                                "op_leg_pts":       op_leg_pts,
-                                "op_report_url":    op_report_url,
-                                "op_aircraft_icao": op_aircraft_icao,
-                                "op_on_network":    op_on_network,
-                            },
-                            daemon=True,
-                        ).start()
-            else:
-                logger.info(
-                    f"[Completed] Используем кэш вылета для '{pilot_name}': "
-                    f"{cached_dep}→{cached_arr}"
-                )
-                final_msg = (
-                    f"🛬 <b>ПОСАДКА ВЫПОЛНЕНА — TOUCHDOWN</b> {emoji}\n\n"
-                    f"👨‍✈️ Captain: <b>{pilot_name}</b>\n"
-                    f"🆔 Flight: <b>{cached_fno}</b>\n"
-                    f"🗺 Route: <b>{cached_dep} → {cached_arr}</b>\n"
-                    f"📍 Airport: <b>{airport_name}</b>\n"
-                    f"✈️ Aircraft: <b>{aircraft_name}</b>\n"
-                    f"📊 Landing Rate: <b>{rate} fpm</b> — {rating}"
-                    f"{extras}"
-                    f"{flight_link}"
-                )
-                tg_send(final_msg)
-                discord_send_landing(
-                    pilot=pilot_name, flight_no=cached_fno,
-                    dep=cached_dep, arr=cached_arr,
-                    aircraft=aircraft_name, airport=airport_name,
-                    rate=rate, rating=rating,
-                    distance_nm=distance_nm, fuel_burnt=fuel_burnt, max_alt=max_alt,
-                    report_url=f"https://fshub.io/flight/{report_id}/report" if report_id else "",
-                )
-                if _is_valid_icao(cached_dep) and _is_valid_icao(cached_arr) and report_id:
-                    db_update_flight_route(report_id, cached_fno, cached_dep, cached_arr)
-                    logger.info(f"[Completed] БД обновлена из кэша для flight_id={report_id}")
-                with _departure_cache_lock:
-                    _departure_cache.pop(pilot_name, None)
-        else:
-            logger.info(
-                f"[Completed] Нет кэша вылета для '{pilot_name}', "
-                f"запускаю обогащение через {FSA_ENRICH_ARRIVAL_DELAY}с"
-            )
-            r = session.post(
-                f"{TG_BASE}/sendMessage",
-                json={
-                    "chat_id": CHAT_ID,
-                    "text": msg_text,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True,
-                },
-                timeout=20,
-            )
-            if r.status_code == 200:
-                message_id = r.json().get("result", {}).get("message_id")
-                if message_id:
-                    threading.Thread(
-                        target=_enrich_completed_from_fsa,
-                        args=(
-                            message_id, CHAT_ID, pilot_name, aircraft_name,
-                            airport_name, rate, rating, emoji,
-                            extras, flight_link, arrival_time, FSA_ENRICH_ARRIVAL_DELAY,
-                        ),
-                        kwargs={
-                            "flight_id_for_db": report_id or None,
-                            "op_leg_num":       op_leg_num,
-                            "op_leg_pts":       op_leg_pts,
-                            "op_report_url":    op_report_url,
-                            "op_aircraft_icao": op_aircraft_icao,
-                            "op_on_network":    op_on_network,
-                        },
-                        daemon=True,
-                    ).start()
-            else:
-                logger.warning(f"[Completed] Не удалось отправить: {r.text}")
-            # В Discord шлём сразу embed — маршрут будет "загружается..."
-            discord_send_landing(
-                pilot=pilot_name, flight_no=flight_no,
-                dep=dep, arr=arr,
-                aircraft=aircraft_name, airport=airport_name,
-                rate=rate, rating=rating,
-                distance_nm=distance_nm, fuel_burnt=fuel_burnt, max_alt=max_alt,
-                report_url=f"https://fshub.io/flight/{report_id}/report" if report_id else "",
-                is_loading=plan_empty,
-            )
+    # Telegram — всегда отправляем (редактируем позже если маршрут неизвестен)
+    tg_resp = session.post(
+        f"{TG_BASE}/sendMessage",
+        json={
+            "chat_id": CHAT_ID,
+            "text": msg_text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+        timeout=20,
+    )
+    tg_message_id = None
+    if tg_resp.status_code == 200:
+        tg_message_id = tg_resp.json().get("result", {}).get("message_id")
     else:
-        tg_send(msg_text)
-        discord_send_landing(
-            pilot=pilot_name, flight_no=flight_no,
-            dep=dep, arr=arr,
-            aircraft=aircraft_name, airport=airport_name,
-            rate=rate, rating=rating,
-            distance_nm=distance_nm, fuel_burnt=fuel_burnt, max_alt=max_alt,
-            report_url=f"https://fshub.io/flight/{report_id}/report" if report_id else "",
-        )
+        logger.warning(f"[Completed] Telegram send failed: {tg_resp.text}")
 
+    # Discord
+    discord_send_landing(
+        pilot=pilot_name, flight_no=flight_no,
+        dep=dep, arr=arr,
+        aircraft=aircraft_name, airport=airport_name,
+        rate=rate, rating=rating,
+        distance_nm=distance_nm, fuel_burnt=fuel_burnt, max_alt=max_alt,
+        report_url=f"https://fshub.io/flight/{report_id}/report" if report_id else "",
+        is_loading=(route_from == "none"),
+    )
+
+    # Hard landing alert
     if rate < -600:
         _hard_msg = (
             f"⚠️ <b>HARD LANDING ALERT</b>\n\n"
-            f"👨‍✈️ Pilot: <b>{user.get('name', 'Unknown')}</b>\n"
+            f"👨‍✈️ Pilot: <b>{pilot_name}</b>\n"
             f"📊 Landing Rate: <b>{rate} fpm</b>\n"
             f"✈️ Aircraft inspection recommended."
         )
         tg_send(_hard_msg)
-        discord_send_hard_landing(pilot=user.get("name", "Unknown"), rate=rate)
+        discord_send_hard_landing(pilot=pilot_name, rate=rate)
 
-    # ─── Проверка ивента «Тихий Вжух» ──────────────────────────
-    # Авторегистрация и старт нового перегона — сразу.
-    # Засчёт лега — в _enrich_completed_from_fsa после получения simrate из FSAirlines.
-    op_leg_num      = None
-    op_leg_pts      = None
-    op_report_url   = f"https://fshub.io/flight/{report_id}/report" if report_id else ""
-    op_aircraft_icao = (d.get("aircraft") or {}).get("icao") or aircraft.get("icao_name", "")
-    user_handles    = user.get("handles") or {}
-    op_on_network   = bool(user_handles.get("vatsim") or user_handles.get("ivao"))
+    # ── 5. Ивент «Тихий Вжух» ─────────────────────────────────
+    # Для засчёта лега нужен маршрут из FSAirlines (from_fsa).
+    # FSHub маршрут — только для отображения, для ивента не используем.
+    op_leg_num       = None
+    op_leg_pts       = None
+    op_report_url    = f"https://fshub.io/flight/{report_id}/report" if report_id else ""
+    op_aircraft_icao = (d.get("aircraft") or {}).get("icao") or aircraft_name
+    user_handles     = user.get("handles") or {}
+    op_on_network    = bool(user_handles.get("vatsim") or user_handles.get("ivao"))
 
-    if operation_is_active() and _is_valid_icao(dep) and _is_valid_icao(arr):
+    if operation_is_active() and route_from == "fsa_cache":
+        # Маршрут из FSAirlines — проверяем совпадение с легом ивента
         leg_key = (dep.upper(), arr.upper())
         if leg_key in OPERATION_LEG_MAP:
             leg_num, leg_pts = OPERATION_LEG_MAP[leg_key]
             op_pilot = db_op_get_pilot(pilot_name)
 
+            # Авторегистрация
             if not op_pilot:
-                aircraft_name_op = aircraft.get("icao_name", "")
-                db_op_register_pilot(pilot_name, aircraft_name_op)
+                db_op_register_pilot(pilot_name, aircraft_name)
                 op_pilot = db_op_get_pilot(pilot_name)
                 logger.info(f"[Operation] Авторегистрация пилота '{pilot_name}'")
 
+            # Автостарт нового перегона
             if op_pilot and op_pilot["status"] == "finished" and leg_num == 1:
-                aircraft_name_op = aircraft.get("icao_name", "")
-                new_ferry = db_op_start_new_ferry(pilot_name, aircraft_name_op)
+                new_ferry = db_op_start_new_ferry(pilot_name, aircraft_name)
                 if new_ferry:
                     op_pilot = db_op_get_pilot(pilot_name)
-                    logger.info(f"[Operation] Автостарт перегона #{new_ferry} для '{pilot_name}'")
+                    logger.info(f"[Operation] Новый перегон #{new_ferry} для '{pilot_name}'")
                     _ferry_msg = (
                         f"✈️ <b>НОВЫЙ ПЕРЕГОН #{new_ferry} — «{OPERATION_NAME}»</b>\n\n"
                         f"👨‍✈️ <b>{pilot_name}</b> начинает новый перегон!\n"
-                        f"✈️ Самолёт: <b>{aircraft_name_op}</b>\n"
+                        f"✈️ Самолёт: <b>{aircraft_name}</b>\n"
                         f"🗺 Маршрут: VTBS → SBGL"
                     )
                     tg_send(_ferry_msg)
@@ -976,37 +884,71 @@ def handle_completed(data: Dict):
                         title=f"✈️  НОВЫЙ ПЕРЕГОН #{new_ferry} — «{OPERATION_NAME}»",
                         color=0x5865F2,
                         fields=[
-                            {"name": "Пилот",   "value": pilot_name,            "inline": True},
-                            {"name": "Самолёт", "value": aircraft_name_op or "N/A", "inline": True},
-                            {"name": "Маршрут", "value": "VTBS → SBGL",         "inline": False},
+                            {"name": "Пилот",   "value": pilot_name,          "inline": True},
+                            {"name": "Самолёт", "value": aircraft_name or "N/A", "inline": True},
+                            {"name": "Маршрут", "value": "VTBS → SBGL",       "inline": False},
                         ],
                     )
 
             if op_pilot and op_pilot["status"] == "active":
                 if leg_num != op_pilot["current_leg"]:
                     logger.info(
-                        f"[Operation] {pilot_name} Leg {leg_num} ignored, "
-                        f"expected Leg {op_pilot['current_leg']}"
+                        f"[Operation] {pilot_name} Leg {leg_num} пропущен — "
+                        f"ожидается Leg {op_pilot['current_leg']}"
                     )
                 else:
-                    # Передаём параметры лега в _enrich — засчёт будет после simrate-проверки
                     op_leg_num = leg_num
                     op_leg_pts = leg_pts
                     logger.info(
-                        f"[Operation] {pilot_name} Leg {leg_num} будет засчитан "
-                        f"после проверки simrate в FSAirlines"
+                        f"[Operation] {pilot_name} Leg {leg_num} — "
+                        f"запускаю проверку simrate через {FSA_ENRICH_ARRIVAL_DELAY}с"
                     )
+        else:
+            logger.info(
+                f"[Operation] Маршрут {dep}→{arr} не совпадает с легами ивента"
+            )
+    elif operation_is_active() and route_from != "fsa_cache":
+        logger.info(
+            f"[Operation] {pilot_name} — маршрут не из FSAirlines ({route_from}), "
+            f"лег ивента не засчитывается"
+        )
 
-    # ─── Проверка конкурса Мастер Посадки ───────────────────────
+    # ── 6. Тред FSAirlines: simrate + редактирование сообщения ─
+    # Запускаем всегда — нужен для редактирования сообщения с маршрутом
+    # и для проверки simrate если op_leg_num задан.
+    if tg_message_id:
+        threading.Thread(
+            target=_enrich_completed_from_fsa,
+            args=(
+                tg_message_id, CHAT_ID, pilot_name, aircraft_name,
+                airport_name, rate, rating, emoji,
+                extras, flight_link, arrival_time, FSA_ENRICH_ARRIVAL_DELAY,
+            ),
+            kwargs={
+                "flight_id_for_db": report_id or None,
+                "op_leg_num":       op_leg_num,
+                "op_leg_pts":       op_leg_pts,
+                "op_report_url":    op_report_url,
+                "op_aircraft_icao": op_aircraft_icao,
+                "op_on_network":    op_on_network,
+            },
+            daemon=True,
+        ).start()
+
+    # Очищаем кэш вылета после посадки
+    with _departure_cache_lock:
+        _departure_cache.pop(pilot_name, None)
+
+    # ── 7. Конкурс Мастер Посадки ──────────────────────────────
     if is_contest_landing(rate):
         report_url = f"https://fshub.io/flight/{report_id}/report" if report_id else ""
         db_contest_add(
             flight_id=report_id,
-            pilot=user.get("name", "Unknown"),
+            pilot=pilot_name,
             flight_no=flight_no,
             departure=dep,
             arrival=arr,
-            aircraft=aircraft.get("icao_name", "Unknown"),
+            aircraft=aircraft_name,
             landing_rate=rate,
             report_url=report_url,
         )
@@ -1016,7 +958,7 @@ def handle_completed(data: Dict):
         if position <= slots:
             tg_send(
                 f"🎯 <b>КАНДИДАТ — МАСТЕР ПОСАДКИ!</b>\n\n"
-                f"👨‍✈️ <b>{user.get('name', 'Unknown')}</b>\n"
+                f"👨‍✈️ <b>{pilot_name}</b>\n"
                 f"📊 Landing Rate: <b>{rate} fpm</b>\n"
                 f"⭐ Позиция в этом месяце: <b>#{position}</b>\n"
                 f"🏅 Начислено: <b>{CONTEST_POINTS_PER_LANDING} баллов</b>\n\n"
@@ -1025,7 +967,7 @@ def handle_completed(data: Dict):
         else:
             tg_send(
                 f"🎯 <b>СНАЙПЕРСКАЯ ПОСАДКА!</b>\n\n"
-                f"👨‍✈️ <b>{user.get('name', 'Unknown')}</b>\n"
+                f"👨‍✈️ <b>{pilot_name}</b>\n"
                 f"📊 Landing Rate: <b>{rate} fpm</b>\n"
                 f"📅 Фонд {CONTEST_MONTHLY_LIMIT} баллов на этот месяц исчерпан — ждём следующего!"
             )
