@@ -63,6 +63,9 @@ from core import (
     session, tg_send, tg_photo, tg_setup_webhook, tg_edit_message,
     # discord
     discord_send, discord_send_flights, discord_send_event,
+    discord_send_departure, discord_send_landing, discord_send_hard_landing,
+    discord_send_operation, discord_send_screenshots,
+    DISCORD_WEBHOOK_SCREENSHOTS,
     # fsa
     fsa_airline_data, fsa_active_flights, fsa_daily_transactions,
     fsa_get_pilot_id, fsa_get_pilot_status, fsa_get_recent_report,
@@ -426,7 +429,13 @@ def handle_departure(data: Dict):
             f"✈️ <i>Желаем попутного ветра и мягкой посадки!</i>"
         )
         tg_send(_dep_msg)
-        discord_send_flights(_dep_msg)
+        discord_send_departure(
+            pilot=pilot_name,
+            flight_no=plan.get("flight_no", "N/A"),
+            dep=plan.get("departure", "????"),
+            arr=plan.get("arrival", "????"),
+            aircraft=aircraft_name,
+        )
     else:
         logger.info(
             f"[Departure] Пустой план от FSHub для '{pilot_name}', "
@@ -440,7 +449,14 @@ def handle_departure(data: Dict):
             f"✈️ <i>Желаем попутного ветра и мягкой посадки!</i>"
         )
         # В Discord сразу шлём placeholder — без редактирования
-        discord_send_flights(_dep_placeholder)
+        discord_send_departure(
+            pilot=pilot_name,
+            flight_no="N/A",
+            dep="????",
+            arr="????",
+            aircraft=aircraft_name,
+            is_loading=True,
+        )
         r = session.post(
             f"{TG_BASE}/sendMessage",
             json={
@@ -595,7 +611,14 @@ def handle_completed(data: Dict):
                     f"{flight_link}"
                 )
                 tg_send(final_msg)
-                discord_send_flights(final_msg)
+                discord_send_landing(
+                    pilot=pilot_name, flight_no=cached_fno,
+                    dep=cached_dep, arr=cached_arr,
+                    aircraft=aircraft_name, airport=airport_name,
+                    rate=rate, rating=rating,
+                    distance_nm=distance_nm, fuel_burnt=fuel_burnt, max_alt=max_alt,
+                    report_url=f"https://fshub.io/flight/{report_id}/report" if report_id else "",
+                )
                 if _is_valid_icao(cached_dep) and _is_valid_icao(cached_arr) and report_id:
                     db_update_flight_route(report_id, cached_fno, cached_dep, cached_arr)
                     logger.info(f"[Completed] БД обновлена из кэша для flight_id={report_id}")
@@ -631,11 +654,26 @@ def handle_completed(data: Dict):
                     ).start()
             else:
                 logger.warning(f"[Completed] Не удалось отправить: {r.text}")
-            # В Discord шлём сразу — без редактирования (маршрут появится когда FSA ответит)
-            discord_send_flights(msg_text)
+            # В Discord шлём сразу embed — маршрут будет "загружается..."
+            discord_send_landing(
+                pilot=pilot_name, flight_no=flight_no,
+                dep=dep, arr=arr,
+                aircraft=aircraft_name, airport=airport_name,
+                rate=rate, rating=rating,
+                distance_nm=distance_nm, fuel_burnt=fuel_burnt, max_alt=max_alt,
+                report_url=f"https://fshub.io/flight/{report_id}/report" if report_id else "",
+                is_loading=plan_empty,
+            )
     else:
         tg_send(msg_text)
-        discord_send_flights(msg_text)
+        discord_send_landing(
+            pilot=pilot_name, flight_no=flight_no,
+            dep=dep, arr=arr,
+            aircraft=aircraft_name, airport=airport_name,
+            rate=rate, rating=rating,
+            distance_nm=distance_nm, fuel_burnt=fuel_burnt, max_alt=max_alt,
+            report_url=f"https://fshub.io/flight/{report_id}/report" if report_id else "",
+        )
 
     if rate < -600:
         _hard_msg = (
@@ -645,7 +683,7 @@ def handle_completed(data: Dict):
             f"✈️ Aircraft inspection recommended."
         )
         tg_send(_hard_msg)
-        discord_send_flights(_hard_msg)
+        discord_send_hard_landing(pilot=user.get("name", "Unknown"), rate=rate)
 
     # ─── Проверка ивента «Тихий Вжух» ──────────────────────────
     if operation_is_active() and _is_valid_icao(dep) and _is_valid_icao(arr):
@@ -673,7 +711,15 @@ def handle_completed(data: Dict):
                         f"🗺 Маршрут: VTBS → SBGL"
                     )
                     tg_send(_ferry_msg)
-                    discord_send_event(_ferry_msg)
+                    discord_send_operation(
+                        title=f"✈️  НОВЫЙ ПЕРЕГОН #{new_ferry} — «{OPERATION_NAME}»",
+                        color=0x5865F2,
+                        fields=[
+                            {"name": "Пилот",    "value": pilot_name,      "inline": True},
+                            {"name": "Самолёт",  "value": aircraft_name_op or "N/A", "inline": True},
+                            {"name": "Маршрут",  "value": "VTBS → SBGL",   "inline": False},
+                        ],
+                    )
 
             if op_pilot and op_pilot["status"] == "active":
                 report_url_op = (
@@ -696,7 +742,15 @@ def handle_completed(data: Dict):
                             f"🕛 Счётчик сбросится в <b>00:00 UTC (03:00 МСК)</b>"
                         )
                         tg_send(_limit_msg)
-                        discord_send_event(_limit_msg)
+                        discord_send_operation(
+                            title=f"⏳  ЛИМИТ ЛЕГОВ — «{OPERATION_NAME}»",
+                            color=0xF0A332,
+                            fields=[
+                                {"name": "Пилот", "value": pilot_name, "inline": True},
+                                {"name": "Лег",   "value": f"Leg {leg_num}: {dep} → {arr}", "inline": True},
+                                {"name": "Статус", "value": "Сегодня уже 2 лега. Сброс в 00:00 UTC (03:00 МСК)", "inline": False},
+                            ],
+                        )
                         logger.info(f"[Operation] {pilot_name} leg={leg_num} — дневной лимит")
                     else:
                         aircraft_icao_type = (
@@ -722,7 +776,16 @@ def handle_completed(data: Dict):
                                 f"Пилот начинает с Leg 1."
                             )
                             tg_send(_crash_msg)
-                            discord_send_event(_crash_msg)
+                            discord_send_operation(
+                                title=f"💥  КРУШЕНИЕ — «{OPERATION_NAME}»",
+                                color=0xED4245,
+                                fields=[
+                                    {"name": "Пилот",    "value": pilot_name,   "inline": True},
+                                    {"name": "Этап",     "value": f"Leg {leg_num}: {dep} → {arr}", "inline": True},
+                                    {"name": "Посадка",  "value": f"{rate} fpm", "inline": True},
+                                    {"name": "Статус",   "value": "Борт утерян. Прогресс сброшен. Начинает с Leg 1.", "inline": False},
+                                ],
+                            )
                         elif rate <= -OPERATION_FAIL_RATE:
                             db_op_add_leg(
                                 pilot_name, leg_num, dep, arr, rate,
@@ -736,7 +799,16 @@ def handle_completed(data: Dict):
                                 f"❌ Очки не начислены. Повторите Leg {leg_num}."
                             )
                             tg_send(_fail_msg)
-                            discord_send_event(_fail_msg)
+                            discord_send_operation(
+                                title=f"🔴  ЭТАП ПРОВАЛЕН — «{OPERATION_NAME}»",
+                                color=0xED4245,
+                                fields=[
+                                    {"name": "Пилот",   "value": pilot_name,   "inline": True},
+                                    {"name": "Этап",    "value": f"Leg {leg_num}: {dep} → {arr}", "inline": True},
+                                    {"name": "Посадка", "value": f"{rate} fpm — слишком жёстко!", "inline": True},
+                                    {"name": "Статус",  "value": f"Очки не начислены. Повторите Leg {leg_num}.", "inline": False},
+                                ],
+                            )
                         else:
                             earned, coeff, net_bonus = op_calc_points(
                                 leg_pts, aircraft_icao_type, on_network
@@ -775,7 +847,19 @@ def handle_completed(data: Dict):
                                     f"/operation_admin add {pilot_name} | самолёт"
                                 )
                                 tg_send(_finish_msg)
-                                discord_send_event(_finish_msg)
+                                discord_send_operation(
+                                    title=f"🏁  ФИНИШ! — «{OPERATION_NAME}»",
+                                    color=0x23A55A,
+                                    fields=[
+                                        {"name": "Пилот",    "value": pilot_name,  "inline": True},
+                                        {"name": "Перегон",  "value": f"#{ferry_num}", "inline": True},
+                                        {"name": "Этап",     "value": f"{dep} → {arr}", "inline": True},
+                                        {"name": "Посадка",  "value": f"{rate} fpm", "inline": True},
+                                        {"name": "Очки",     "value": detail_str,  "inline": True},
+                                        {"name": "Итого",    "value": f"{new_points:,}", "inline": True},
+                                    ],
+                                    footer_extra="Борт успешно перегнан в SBGL!",
+                                )
                             else:
                                 next_info = next(
                                     (
@@ -802,7 +886,18 @@ def handle_completed(data: Dict):
                                     f"{limit_str}"
                                 )
                                 tg_send(_leg_msg)
-                                discord_send_event(_leg_msg)
+                                discord_send_operation(
+                                    title=f"✅  LEG {leg_num} ВЫПОЛНЕН — «{OPERATION_NAME}»",
+                                    color=0xFEE75C,
+                                    fields=[
+                                        {"name": "Пилот",      "value": pilot_name, "inline": True},
+                                        {"name": "Этап",       "value": f"{dep} → {arr}", "inline": True},
+                                        {"name": "Посадка",    "value": f"{rate} fpm", "inline": True},
+                                        {"name": "Очки",       "value": detail_str, "inline": True},
+                                        {"name": "Итого",      "value": f"{new_points:,}", "inline": True},
+                                        {"name": "Следующий",  "value": f"Leg {next_leg} {next_info}".strip(), "inline": True},
+                                    ],
+                                )
                         logger.info(
                             f"[Operation] {pilot_name} leg={leg_num} rate={rate} "
                             f"network={on_network}"
@@ -842,22 +937,30 @@ def handle_completed(data: Dict):
             )
 
 
-def _send_screenshots_async(screenshots: List):
+def _send_screenshots_async(screenshots: List, pilot: str = "", flight_no: str = ""):
     for scr in screenshots[:3]:
         url = scr.get("screenshot_url")
         if url:
             tg_photo(url, "📸 <b>Flight Screenshot</b>")
             time.sleep(1)
+    # Discord: все скриншоты разом (с паузами внутри функции)
+    discord_send_screenshots(screenshots, pilot=pilot, flight_no=flight_no)
 
 
 def handle_screenshots(data: Dict):
     screenshots = data.get("_data", [])
-    if screenshots:
-        threading.Thread(
-            target=_send_screenshots_async,
-            args=(screenshots,),
-            daemon=True,
-        ).start()
+    if not screenshots:
+        return
+    # Пробуем извлечь пилота и рейс из первого скриншота если FSHub их передаёт
+    first = screenshots[0] if screenshots else {}
+    pilot    = (first.get("flight") or {}).get("user", {}).get("name", "")
+    flight_no = (first.get("flight") or {}).get("plan", {}).get("callsign", "")
+    threading.Thread(
+        target=_send_screenshots_async,
+        args=(screenshots,),
+        kwargs={"pilot": pilot, "flight_no": flight_no},
+        daemon=True,
+    ).start()
 
 
 def handle_achievement(data: Dict):
