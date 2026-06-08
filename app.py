@@ -61,6 +61,8 @@ from core import (
     db_op_admin_set, db_op_reset_pilot, db_op_check_daily_limit,
     # telegram
     session, tg_send, tg_photo, tg_setup_webhook, tg_edit_message,
+    # discord
+    discord_send, discord_send_flights, discord_send_event,
     # fsa
     fsa_airline_data, fsa_active_flights, fsa_daily_transactions,
     fsa_get_pilot_id, fsa_get_pilot_status, fsa_get_recent_report,
@@ -415,7 +417,7 @@ def handle_departure(data: Dict):
                 "flight_no": plan.get("flight_no", "N/A"),
                 "ts":        time.time(),
             }
-        tg_send(
+        _dep_msg = (
             f"🛫 <b>ВЫЛЕТ ПОДТВЕРЖДЁН — CLEARED FOR TAKEOFF</b>\n\n"
             f"👨‍✈️ Captain: <b>{pilot_name}</b>\n"
             f"🆔 Flight: <b>{plan.get('flight_no')}</b>\n"
@@ -423,22 +425,27 @@ def handle_departure(data: Dict):
             f"✈️ Aircraft: <b>{aircraft_name}</b>\n\n"
             f"✈️ <i>Желаем попутного ветра и мягкой посадки!</i>"
         )
+        tg_send(_dep_msg)
+        discord_send_flights(_dep_msg)
     else:
         logger.info(
             f"[Departure] Пустой план от FSHub для '{pilot_name}', "
             f"запускаю обогащение через {FSA_ENRICH_DEPARTURE_DELAY}с"
         )
+        _dep_placeholder = (
+            f"🛫 <b>ВЫЛЕТ ПОДТВЕРЖДЁН — CLEARED FOR TAKEOFF</b>\n\n"
+            f"👨‍✈️ Captain: <b>{pilot_name}</b>\n"
+            f"✈️ Aircraft: <b>{aircraft_name}</b>\n"
+            f"🗺 Route: <b>⏳ Загружаю маршрут...</b>\n\n"
+            f"✈️ <i>Желаем попутного ветра и мягкой посадки!</i>"
+        )
+        # В Discord сразу шлём placeholder — без редактирования
+        discord_send_flights(_dep_placeholder)
         r = session.post(
             f"{TG_BASE}/sendMessage",
             json={
                 "chat_id": CHAT_ID,
-                "text": (
-                    f"🛫 <b>ВЫЛЕТ ПОДТВЕРЖДЁН — CLEARED FOR TAKEOFF</b>\n\n"
-                    f"👨‍✈️ Captain: <b>{pilot_name}</b>\n"
-                    f"✈️ Aircraft: <b>{aircraft_name}</b>\n"
-                    f"🗺 Route: <b>⏳ Загружаю маршрут...</b>\n\n"
-                    f"✈️ <i>Желаем попутного ветра и мягкой посадки!</i>"
-                ),
+                "text": _dep_placeholder,
                 "parse_mode": "HTML",
                 "disable_web_page_preview": True,
             },
@@ -588,6 +595,7 @@ def handle_completed(data: Dict):
                     f"{flight_link}"
                 )
                 tg_send(final_msg)
+                discord_send_flights(final_msg)
                 if _is_valid_icao(cached_dep) and _is_valid_icao(cached_arr) and report_id:
                     db_update_flight_route(report_id, cached_fno, cached_dep, cached_arr)
                     logger.info(f"[Completed] БД обновлена из кэша для flight_id={report_id}")
@@ -623,16 +631,21 @@ def handle_completed(data: Dict):
                     ).start()
             else:
                 logger.warning(f"[Completed] Не удалось отправить: {r.text}")
+            # В Discord шлём сразу — без редактирования (маршрут появится когда FSA ответит)
+            discord_send_flights(msg_text)
     else:
         tg_send(msg_text)
+        discord_send_flights(msg_text)
 
     if rate < -600:
-        tg_send(
+        _hard_msg = (
             f"⚠️ <b>HARD LANDING ALERT</b>\n\n"
             f"👨‍✈️ Pilot: <b>{user.get('name', 'Unknown')}</b>\n"
             f"📊 Landing Rate: <b>{rate} fpm</b>\n"
             f"✈️ Aircraft inspection recommended."
         )
+        tg_send(_hard_msg)
+        discord_send_flights(_hard_msg)
 
     # ─── Проверка ивента «Тихий Вжух» ──────────────────────────
     if operation_is_active() and _is_valid_icao(dep) and _is_valid_icao(arr):
@@ -653,12 +666,14 @@ def handle_completed(data: Dict):
                 if new_ferry:
                     op_pilot = db_op_get_pilot(pilot_name)
                     logger.info(f"[Operation] Автостарт перегона #{new_ferry} для '{pilot_name}'")
-                    tg_send(
+                    _ferry_msg = (
                         f"✈️ <b>НОВЫЙ ПЕРЕГОН #{new_ferry} — «{OPERATION_NAME}»</b>\n\n"
                         f"👨‍✈️ <b>{pilot_name}</b> начинает новый перегон!\n"
                         f"✈️ Самолёт: <b>{aircraft_name_op}</b>\n"
                         f"🗺 Маршрут: VTBS → SBGL"
                     )
+                    tg_send(_ferry_msg)
+                    discord_send_event(_ferry_msg)
 
             if op_pilot and op_pilot["status"] == "active":
                 report_url_op = (
@@ -673,13 +688,15 @@ def handle_completed(data: Dict):
                 else:
                     allowed, legs_today = db_op_check_daily_limit(pilot_name)
                     if not allowed:
-                        tg_send(
+                        _limit_msg = (
                             f"⏳ <b>ЛИМИТ ЛЕГОВ — ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
                             f"👨‍✈️ <b>{pilot_name}</b>\n"
                             f"✈️ Leg {leg_num}: {dep} → {arr}\n\n"
                             f"❌ Сегодня уже выполнено <b>2 лега</b>.\n"
                             f"🕛 Счётчик сбросится в <b>00:00 UTC (03:00 МСК)</b>"
                         )
+                        tg_send(_limit_msg)
+                        discord_send_event(_limit_msg)
                         logger.info(f"[Operation] {pilot_name} leg={leg_num} — дневной лимит")
                     else:
                         aircraft_icao_type = (
@@ -696,7 +713,7 @@ def handle_completed(data: Dict):
                                 0, report_id or "", report_url_op,
                             )
                             db_op_reset_pilot(pilot_name)
-                            tg_send(
+                            _crash_msg = (
                                 f"💥 <b>КРУШЕНИЕ — ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
                                 f"👨‍✈️ <b>{pilot_name}</b>\n"
                                 f"✈️ Leg {leg_num}: {dep} → {arr}\n"
@@ -704,18 +721,22 @@ def handle_completed(data: Dict):
                                 f"⚠️ Борт утерян. Весь прогресс сброшен.\n"
                                 f"Пилот начинает с Leg 1."
                             )
+                            tg_send(_crash_msg)
+                            discord_send_event(_crash_msg)
                         elif rate <= -OPERATION_FAIL_RATE:
                             db_op_add_leg(
                                 pilot_name, leg_num, dep, arr, rate,
                                 0, report_id or "", report_url_op,
                             )
-                            tg_send(
+                            _fail_msg = (
                                 f"🔴 <b>ЭТАП ПРОВАЛЕН — ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
                                 f"👨‍✈️ <b>{pilot_name}</b>\n"
                                 f"✈️ Leg {leg_num}: {dep} → {arr}\n"
                                 f"📊 Посадка: <b>{rate} fpm</b> — слишком жёстко!\n\n"
                                 f"❌ Очки не начислены. Повторите Leg {leg_num}."
                             )
+                            tg_send(_fail_msg)
+                            discord_send_event(_fail_msg)
                         else:
                             earned, coeff, net_bonus = op_calc_points(
                                 leg_pts, aircraft_icao_type, on_network
@@ -743,7 +764,7 @@ def handle_completed(data: Dict):
                             ferry_num  = op_pilot.get("ferry_num", 1)
 
                             if is_finished:
-                                tg_send(
+                                _finish_msg = (
                                     f"🏁 <b>ФИНИШ! ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
                                     f"👨‍✈️ <b>{pilot_name}</b> завершил перегон #{ferry_num}!\n"
                                     f"✈️ Последний этап: {dep} → {arr}\n"
@@ -753,6 +774,8 @@ def handle_completed(data: Dict):
                                     f"✈️ Готов к следующему перегону — "
                                     f"/operation_admin add {pilot_name} | самолёт"
                                 )
+                                tg_send(_finish_msg)
+                                discord_send_event(_finish_msg)
                             else:
                                 next_info = next(
                                     (
@@ -769,7 +792,7 @@ def handle_completed(data: Dict):
                                     if legs_after >= 2 else
                                     f"\n✅ Сегодня можно выполнить ещё <b>1 лег</b>"
                                 )
-                                tg_send(
+                                _leg_msg = (
                                     f"✅ <b>LEG {leg_num} ВЫПОЛНЕН — «{OPERATION_NAME}»</b>\n\n"
                                     f"👨‍✈️ <b>{pilot_name}</b>\n"
                                     f"✈️ {dep} → {arr}\n"
@@ -778,6 +801,8 @@ def handle_completed(data: Dict):
                                     f"➡️ Следующий: Leg {next_leg} {next_info}"
                                     f"{limit_str}"
                                 )
+                                tg_send(_leg_msg)
+                                discord_send_event(_leg_msg)
                         logger.info(
                             f"[Operation] {pilot_name} leg={leg_num} rate={rate} "
                             f"network={on_network}"
