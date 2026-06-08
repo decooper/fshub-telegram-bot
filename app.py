@@ -498,6 +498,29 @@ def handle_completed(data: Dict):
     dep = plan.get("icao_dep") or plan.get("departure", "????")
     arr = plan.get("icao_arr") or plan.get("arrival", "????")
 
+    # ── Фолбэк из кэша вылета если FSHub не передал маршрут ───
+    # Это позволяет засчитать лег ивента даже без плана в RLM Client,
+    # если пилот летел через FSAirlines и кэш был заполнен при вылете.
+    pilot_name_early = (
+        (d.get("arrival") or {}).get("user") or d.get("user") or {}
+    ).get("name", "")
+    if pilot_name_early and (not _is_valid_icao(dep) or not _is_valid_icao(arr)):
+        with _departure_cache_lock:
+            _cache_entry = _departure_cache.get(pilot_name_early)
+        if _cache_entry and (time.time() - _cache_entry.get("ts", 0)) < 86400:
+            _cached_dep = _cache_entry.get("dep", "????")
+            _cached_arr = _cache_entry.get("arr", "????")
+            _cached_fno = _cache_entry.get("flight_no", "N/A")
+            if _is_valid_icao(_cached_dep) and _is_valid_icao(_cached_arr):
+                logger.info(
+                    f"[Completed] Маршрут из кэша вылета для '{pilot_name_early}': "
+                    f"{_cached_dep}→{_cached_arr} (FSHub дал: {dep}→{arr})"
+                )
+                dep       = _cached_dep
+                arr       = _cached_arr
+                flight_no = _cached_fno if flight_no in ("N/A", "", "None") else flight_no
+    # ──────────────────────────────────────────────────────────
+
     rate           = int(arrival.get("landing_rate", 0))
     rating, emoji  = landing_rating(rate)
 
