@@ -856,7 +856,7 @@ def db_contest_recent_months(n: int = 4) -> List[str]:
 # ═══════════════════════════════════════════════════════════════
 
 OPERATION_NAME       = "Тихий Вжух"
-OPERATION_START      = "2026-06-10"
+OPERATION_START      = "2026-06-08"
 OPERATION_END        = "2026-08-31"
 OPERATION_HARD_CRASH = 1200
 OPERATION_FAIL_RATE  = 600
