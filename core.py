@@ -57,12 +57,14 @@ FSA_ENRICH_ARRIVAL_DELAY   = 180
 # Три отдельных вебхука для разных каналов Discord.
 # Если переменная не задана — отправка в этот канал молча пропускается.
 #
-# DISCORD_WEBHOOK_FLIGHTS  → канал с вылетами и посадками (реал-тайм)
-# DISCORD_WEBHOOK_EVENT    → канал операции «Тихий Вжух» (реал-тайм)
-# DISCORD_WEBHOOK_URL      → канал плановых задач по расписанию (worker.py)
-DISCORD_WEBHOOK_FLIGHTS = os.environ.get("DISCORD_WEBHOOK_FLIGHTS", "")
-DISCORD_WEBHOOK_EVENT   = os.environ.get("DISCORD_WEBHOOK_EVENT",   "")
-DISCORD_WEBHOOK_URL     = os.environ.get("DISCORD_WEBHOOK_URL",     "")
+# DISCORD_WEBHOOK_FLIGHTS      → канал вылетов и посадок (реал-тайм)
+# DISCORD_WEBHOOK_EVENT        → канал операции «Тихий Вжух» (реал-тайм)
+# DISCORD_WEBHOOK_SCREENSHOTS  → канал скриншотов рейсов (реал-тайм)
+# DISCORD_WEBHOOK_URL          → канал плановых задач по расписанию (worker.py)
+DISCORD_WEBHOOK_FLIGHTS     = os.environ.get("DISCORD_WEBHOOK_FLIGHTS",     "")
+DISCORD_WEBHOOK_EVENT       = os.environ.get("DISCORD_WEBHOOK_EVENT",       "")
+DISCORD_WEBHOOK_SCREENSHOTS = os.environ.get("DISCORD_WEBHOOK_SCREENSHOTS", "")
+DISCORD_WEBHOOK_URL         = os.environ.get("DISCORD_WEBHOOK_URL",         "")
 
 # ═══════════════════════════════════════════════════════════════
 # LOGGING
@@ -104,16 +106,35 @@ session.mount("http://", _adapter)
 # DISCORD
 # ═══════════════════════════════════════════════════════════════
 
-# Скомпилированные паттерны для конвертации Telegram HTML → Discord Markdown
+# Паттерны для конвертации Telegram HTML → plain text для description в embed
 _RE_DC_BOLD = re.compile(r"<b>(.*?)</b>",              re.DOTALL)
 _RE_DC_ITAL = re.compile(r"<i>(.*?)</i>",              re.DOTALL)
 _RE_DC_CODE = re.compile(r"<code>(.*?)</code>",        re.DOTALL)
 _RE_DC_LINK = re.compile(r'<a href="(.*?)">(.*?)</a>', re.DOTALL)
 _RE_DC_TAGS = re.compile(r"<[^>]+>")
 
+# Паттерны для разбора структурированных сообщений бота в поля embed
+# Каждый паттерн ищет "👨‍✈️ Captain: <b>Имя</b>" → ("Captain", "Имя")
+_RE_FIELD = re.compile(
+    r"(?:👨‍✈️|🆔|🗺|📍|✈️|📊|📏|⛽|🏔|⭐|➡️|🕛|✅)\s*"
+    r"(?:<b>)?([^:<\n]+?)(?:</b>)?:\s*<b>(.*?)</b>",
+    re.DOTALL,
+)
+_RE_LINK_HREF = re.compile(r"<a href='(.*?)'>.*?</a>")
+
+
+def _strip_html(text: str) -> str:
+    """Убирает HTML-теги, оставляет читаемый текст."""
+    text = _RE_DC_BOLD.sub(r"\1", text)
+    text = _RE_DC_ITAL.sub(r"\1", text)
+    text = _RE_DC_CODE.sub(r"`\1`", text)
+    text = _RE_DC_LINK.sub(r"\2", text)
+    text = _RE_DC_TAGS.sub("", text)
+    return text.strip()
+
 
 def _tg_to_discord(text: str) -> str:
-    """Конвертирует Telegram HTML-разметку в Discord Markdown."""
+    """Конвертирует Telegram HTML → Discord Markdown (для plain-text сообщений)."""
     text = _RE_DC_BOLD.sub(r"**\1**", text)
     text = _RE_DC_ITAL.sub(r"*\1*",   text)
     text = _RE_DC_CODE.sub(r"`\1`",   text)
@@ -122,28 +143,39 @@ def _tg_to_discord(text: str) -> str:
     return text.strip()
 
 
-def discord_send(text: str, webhook_url: str = "") -> bool:
-    """
-    Отправляет сообщение в Discord через Webhook (с retry).
+# ── Цвета embed по типу события ───────────────────────────────
+# Discord принимает цвет как целое число (decimal RGB)
+_DC_COLOR_DEPARTURE  = 0x5865F2  # синий — вылет
+_DC_COLOR_BUTTER     = 0xFEE75C  # жёлтый — butter landing (-50…0 fpm)
+_DC_COLOR_SMOOTH     = 0x23A55A  # зелёный — smooth (-350…-50 fpm)
+_DC_COLOR_STABLE     = 0x57F287  # светло-зелёный — stable (-500…-350 fpm)
+_DC_COLOR_FIRM       = 0xF0A332  # оранжевый — firm (-600…-500 fpm)
+_DC_COLOR_HARD       = 0xED4245  # красный — hard/unsafe (< -600 fpm)
+_DC_COLOR_EVENT_OK   = 0xFEE75C  # жёлтый — лег засчитан
+_DC_COLOR_EVENT_FAIL = 0xED4245  # красный — провал / крушение
+_DC_COLOR_EVENT_WARN = 0xF0A332  # оранжевый — лимит / предупреждение
+_DC_COLOR_EVENT_WIN  = 0x23A55A  # зелёный — финиш
+_DC_COLOR_SCHEDULE   = 0x5865F2  # синий — плановые задачи
+_DC_COLOR_SCREENSHOT = 0x2B2D31  # тёмный — скриншот
 
-    webhook_url — конкретный вебхук для отправки.
-    Если не передан — используется DISCORD_WEBHOOK_URL (плановые задачи).
-    Если вебхук не задан — молча возвращает False без ошибок в лог.
-    """
-    url = webhook_url or DISCORD_WEBHOOK_URL
-    if not url:
+_DC_FOOTER = "VA UP!"
+
+
+def _landing_color(rate: int) -> int:
+    """Возвращает цвет embed по скорости снижения."""
+    if rate >= -50:   return _DC_COLOR_BUTTER
+    if rate >= -350:  return _DC_COLOR_SMOOTH
+    if rate >= -500:  return _DC_COLOR_STABLE
+    if rate >= -600:  return _DC_COLOR_FIRM
+    return _DC_COLOR_HARD
+
+
+def _dc_post(webhook_url: str, payload: dict) -> bool:
+    """Низкоуровневая отправка в Discord Webhook. Возвращает True при успехе."""
+    if not webhook_url:
         return False
-
-    clean = _tg_to_discord(text)
-    if len(clean) > 2000:
-        clean = clean[:1997] + "..."
-
     try:
-        r = session.post(
-            url,
-            json={"content": clean},
-            timeout=10,
-        )
+        r = session.post(webhook_url, json=payload, timeout=10)
         if r.status_code in (200, 204):
             return True
         logger.warning(f"Discord webhook failed ({r.status_code}): {r.text[:200]}")
@@ -153,13 +185,189 @@ def discord_send(text: str, webhook_url: str = "") -> bool:
         return False
 
 
+def discord_send(text: str, webhook_url: str = "") -> bool:
+    """
+    Отправляет plain-text сообщение (для плановых задач worker.py).
+    Конвертирует Telegram HTML → Discord Markdown.
+    """
+    url = webhook_url or DISCORD_WEBHOOK_URL
+    if not url:
+        return False
+    clean = _tg_to_discord(text)
+    if len(clean) > 2000:
+        clean = clean[:1997] + "..."
+    return _dc_post(url, {"content": clean})
+
+
+def discord_embed(
+    webhook_url: str,
+    title: str,
+    color: int,
+    fields: list,
+    description: str = "",
+    url: str = "",
+    footer: str = _DC_FOOTER,
+) -> bool:
+    """
+    Отправляет красивую embed-карточку в Discord.
+
+    fields — список dict {"name": str, "value": str, "inline": bool}
+    """
+    if not webhook_url:
+        return False
+
+    embed: dict = {
+        "title":  title,
+        "color":  color,
+        "fields": fields,
+    }
+    if description:
+        embed["description"] = description
+    if url:
+        embed["url"] = url
+    if footer:
+        embed["footer"] = {"text": footer}
+
+    return _dc_post(webhook_url, {"embeds": [embed]})
+
+
+# ── Публичные функции отправки ─────────────────────────────────
+
+def discord_send_departure(
+    pilot: str, flight_no: str, dep: str, arr: str,
+    aircraft: str, is_loading: bool = False,
+) -> bool:
+    """Embed для вылета в канал FLIGHTS."""
+    route = "⏳ Загружаю маршрут..." if is_loading else f"{dep} → {arr}"
+    fields = [
+        {"name": "Пилот",    "value": pilot,     "inline": True},
+        {"name": "Рейс",     "value": flight_no or "N/A", "inline": True},
+        {"name": "Маршрут",  "value": route,     "inline": False},
+        {"name": "Самолёт",  "value": aircraft,  "inline": True},
+    ]
+    return discord_embed(
+        DISCORD_WEBHOOK_FLIGHTS,
+        title="🛫  ВЫЛЕТ ПОДТВЕРЖДЁН — CLEARED FOR TAKEOFF",
+        color=_DC_COLOR_DEPARTURE,
+        fields=fields,
+        footer=f"{_DC_FOOTER} • Желаем попутного ветра!",
+    )
+
+
+def discord_send_landing(
+    pilot: str, flight_no: str, dep: str, arr: str,
+    aircraft: str, airport: str, rate: int, rating: str,
+    distance_nm=None, fuel_burnt=None, max_alt=None,
+    report_url: str = "",
+    is_loading: bool = False,
+) -> bool:
+    """Embed для посадки в канал FLIGHTS."""
+    route = "⏳ Загружаю маршрут..." if is_loading else f"{dep} → {arr}"
+    fields = [
+        {"name": "Пилот",    "value": pilot,          "inline": True},
+        {"name": "Рейс",     "value": flight_no or "N/A", "inline": True},
+        {"name": "Маршрут",  "value": route,          "inline": False},
+        {"name": "Аэропорт", "value": airport,        "inline": True},
+        {"name": "Самолёт",  "value": aircraft,       "inline": True},
+        {"name": "Посадка",  "value": f"**{rate} fpm** — {rating}", "inline": True},
+    ]
+    if distance_nm:
+        fields.append({"name": "Дальность", "value": f"{distance_nm} nm", "inline": True})
+    if fuel_burnt:
+        fields.append({"name": "Топливо",   "value": f"{fuel_burnt} kg",  "inline": True})
+    if max_alt:
+        fields.append({"name": "Макс. высота", "value": f"{max_alt:,} ft", "inline": True})
+    if report_url:
+        fields.append({"name": "\u200b", "value": f"[📋 Открыть отчёт]({report_url})", "inline": False})
+
+    return discord_embed(
+        DISCORD_WEBHOOK_FLIGHTS,
+        title="🛬  ПОСАДКА ВЫПОЛНЕНА — TOUCHDOWN",
+        color=_landing_color(rate),
+        fields=fields,
+    )
+
+
+def discord_send_hard_landing(pilot: str, rate: int) -> bool:
+    """Embed Hard Landing Alert в канал FLIGHTS."""
+    return discord_embed(
+        DISCORD_WEBHOOK_FLIGHTS,
+        title="⚠️  HARD LANDING ALERT",
+        color=_DC_COLOR_HARD,
+        fields=[
+            {"name": "Пилот",   "value": pilot,          "inline": True},
+            {"name": "Посадка", "value": f"{rate} fpm",  "inline": True},
+            {"name": "Статус",  "value": "Aircraft inspection recommended", "inline": False},
+        ],
+    )
+
+
+def discord_send_operation(
+    title: str, color: int,
+    fields: list, footer_extra: str = "",
+) -> bool:
+    """Универсальный embed для канала EVENT (операция «Тихий Вжух»)."""
+    footer = f"{_DC_FOOTER} • Операция «Тихий Вжух»"
+    if footer_extra:
+        footer += f" • {footer_extra}"
+    return discord_embed(
+        DISCORD_WEBHOOK_EVENT,
+        title=title,
+        color=color,
+        fields=fields,
+        footer=footer,
+    )
+
+
+def discord_send_screenshots(
+    screenshots: list,
+    pilot: str = "",
+    flight_no: str = "",
+) -> None:
+    """
+    Отправляет скриншоты рейса в канал DISCORD_WEBHOOK_SCREENSHOTS.
+    Каждый скриншот — отдельный embed с полноразмерной картинкой.
+    До 3 скриншотов.
+    """
+    if not DISCORD_WEBHOOK_SCREENSHOTS:
+        return
+
+    caption = f"📸  Скриншоты рейса"
+    if pilot:
+        caption += f" — {pilot}"
+    if flight_no and flight_no != "N/A":
+        caption += f" ({flight_no})"
+
+    for i, scr in enumerate(screenshots[:3], 1):
+        img_url = scr.get("screenshot_url") or scr.get("url", "")
+        if not img_url:
+            continue
+
+        embed = {
+            "title": f"{caption} #{i}",
+            "color": _DC_COLOR_SCREENSHOT,
+            "image": {"url": img_url},
+            "footer": {"text": _DC_FOOTER},
+        }
+        _dc_post(DISCORD_WEBHOOK_SCREENSHOTS, {"embeds": [embed]})
+        time.sleep(0.5)  # небольшая пауза чтобы не флудить
+
+
 def discord_send_flights(text: str) -> bool:
-    """Отправляет в канал вылетов/посадок."""
+    """
+    Резервная функция: plain-text → FLIGHTS.
+    Используется в worker.py для плановых задач.
+    Для реал-тайма используй discord_send_departure / discord_send_landing.
+    """
     return discord_send(text, DISCORD_WEBHOOK_FLIGHTS)
 
 
 def discord_send_event(text: str) -> bool:
-    """Отправляет в канал операции «Тихий Вжух»."""
+    """
+    Резервная функция: plain-text → EVENT.
+    Используется в worker.py для плановых задач.
+    Для реал-тайма используй discord_send_operation.
+    """
     return discord_send(text, DISCORD_WEBHOOK_EVENT)
 
 # ═══════════════════════════════════════════════════════════════
