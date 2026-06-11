@@ -1747,11 +1747,11 @@ def fmt_operation() -> str:
     for i, p in enumerate(pilots, 1):
         prefix    = medals.get(i, f"{i}.")
         status    = "✅" if p["status"] == "finished" else ("💀" if p["status"] == "lost" else "🛫")
-        leg_str   = f"Leg {p['current_leg']}/{total_legs}"
         pts_str   = f"{p['total_points']:,} очк."
         legs_done = max(0, p["current_leg"] - 1)
         if p["status"] == "finished":
             legs_done = total_legs
+        leg_str   = f"{legs_done}/{total_legs} легов"
         bar        = "█" * legs_done + "░" * (total_legs - legs_done)
         aircraft   = f" ({p['aircraft']})" if p.get("aircraft") else ""
         ferry_str  = f" • Перегон #{p['ferry_num']}" if p.get("ferry_num", 1) > 1 else ""
