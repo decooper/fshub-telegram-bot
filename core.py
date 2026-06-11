@@ -856,7 +856,7 @@ def db_contest_recent_months(n: int = 4) -> List[str]:
 # ═══════════════════════════════════════════════════════════════
 
 OPERATION_NAME       = "Тихий Вжух"
-OPERATION_START      = "2026-06-08"
+OPERATION_START      = "2026-06-10"
 OPERATION_END        = "2026-08-31"
 OPERATION_HARD_CRASH = 1200
 OPERATION_FAIL_RATE  = 600
@@ -1718,7 +1718,7 @@ def fmt_operation() -> str:
             f"   {bar} {pts_str} | {leg_str}"
         )
 
-    footer = f"\n<i>Макс. очков: {max_pts:,} | Активен до {OPERATION_END}</i>"
+    footer = f"\n<i>Активен до {OPERATION_END}</i>"
     return header + "\n\n".join(lines) + footer
 
 
