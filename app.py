@@ -71,6 +71,7 @@ from core import (
     fsa_get_pilot_id, fsa_get_pilot_status, fsa_get_recent_report,
     fsa_refresh_pilot_cache, fsa_refresh_pilot_cache2,
     _departure_cache, _departure_cache_lock,
+    db_departure_cache_set, db_departure_cache_get, db_departure_cache_delete,
     # helpers
     _is_plan_empty, _is_valid_icao, _aggregate,
     # formatters
@@ -325,14 +326,16 @@ def _enrich_departure_from_fsa(
     logger.info(f"[Enrich] FSAirlines: {dep}→{arr} flight={flt_no}")
 
     if _is_valid_icao(dep) and _is_valid_icao(arr):
-        # Сохраняем в кэш только FSAirlines маршрут — from_fsa: True
+        # Сохраняем в БД — переживёт рестарт сервиса
+        db_departure_cache_set(pilot_name, dep, arr, flt_no)
+        # Обновляем in-memory кэш для быстрого доступа в текущей сессии
         with _departure_cache_lock:
             _departure_cache[pilot_name] = {
-                "dep":       dep,
-                "arr":       arr,
+                "dep":      dep,
+                "arr":      arr,
                 "flight_no": flt_no,
-                "ts":        time.time(),
-                "from_fsa":  True,
+                "ts":       time.time(),
+                "from_fsa": True,
             }
         tg_edit_message(
             chat_id_str, message_id,
@@ -787,6 +790,10 @@ def handle_completed(data: Dict):
     with _departure_cache_lock:
         cache_entry = _departure_cache.get(pilot_name)
 
+    # Если in-memory кэш пуст (после рестарта) — читаем из БД
+    if not cache_entry:
+        cache_entry = db_departure_cache_get(pilot_name)
+
     if (
         cache_entry
         and cache_entry.get("from_fsa")
@@ -957,10 +964,40 @@ def handle_completed(data: Dict):
             logger.info(
                 f"[Operation] Маршрут {dep}→{arr} не совпадает с легами ивента"
             )
-    elif operation_is_active() and route_from != "fsa_cache":
+    elif operation_is_active() and route_from == "fshub":
+        # Маршрут из FSHub — проверяем совпадение с легом.
+        # Если совпадает — передаём параметры в тред, FSAirlines подтвердит через отчёт.
+        # Это защита от потери кэша при рестарте сервиса.
+        leg_key = (dep.upper(), arr.upper())
+        if leg_key in OPERATION_LEG_MAP:
+            leg_num, leg_pts = OPERATION_LEG_MAP[leg_key]
+            op_pilot = db_op_get_pilot(pilot_name)
+
+            if not op_pilot:
+                db_op_register_pilot(pilot_name, aircraft_name)
+                op_pilot = db_op_get_pilot(pilot_name)
+                logger.info(f"[Operation] Авторегистрация пилота '{pilot_name}' (fshub route)")
+
+            if op_pilot and op_pilot["status"] == "active":
+                if leg_num != op_pilot["current_leg"]:
+                    logger.info(
+                        f"[Operation] {pilot_name} Leg {leg_num} пропущен — "
+                        f"ожидается Leg {op_pilot['current_leg']}"
+                    )
+                else:
+                    op_leg_num = leg_num
+                    op_leg_pts = leg_pts
+                    logger.info(
+                        f"[Operation] {pilot_name} Leg {leg_num} (fshub route) — "
+                        f"FSAirlines подтвердит через отчёт"
+                    )
+        else:
+            logger.info(
+                f"[Operation] {pilot_name} — маршрут {dep}→{arr} не совпадает с легами ивента"
+            )
+    elif operation_is_active() and route_from == "none":
         logger.info(
-            f"[Operation] {pilot_name} — маршрут не из FSAirlines ({route_from}), "
-            f"лег ивента не засчитывается"
+            f"[Operation] {pilot_name} — маршрут неизвестен, лег не засчитывается"
         )
 
     # ── 6. Тред FSAirlines: simrate + редактирование сообщения ─
@@ -985,9 +1022,10 @@ def handle_completed(data: Dict):
             daemon=True,
         ).start()
 
-    # Очищаем кэш вылета после посадки
+    # Очищаем кэш вылета после посадки — и в памяти и в БД
     with _departure_cache_lock:
         _departure_cache.pop(pilot_name, None)
+    db_departure_cache_delete(pilot_name)
 
     # ── 7. Конкурс Мастер Посадки ──────────────────────────────
     if is_contest_landing(rate):
