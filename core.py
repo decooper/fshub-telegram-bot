@@ -598,6 +598,18 @@ def _init_db():
         )
         """
     )
+    db_execute(
+        """
+        CREATE TABLE IF NOT EXISTS departure_cache (
+            pilot_name  TEXT PRIMARY KEY,
+            dep         TEXT,
+            arr         TEXT,
+            flight_no   TEXT DEFAULT 'N/A',
+            from_fsa    BOOLEAN DEFAULT TRUE,
+            updated_at  TIMESTAMPTZ DEFAULT NOW()
+        )
+        """
+    )
     logger.info("Database tables ready")
 
 
@@ -1269,6 +1281,58 @@ _fsa_pilot_cache_lock = threading.Lock()
 _fsa_pilot_cache_ts: float = 0
 
 # Кэш данных вылета: pilot_name → {dep, arr, flight_no, ts}
+def db_departure_cache_set(pilot_name: str, dep: str, arr: str, flight_no: str) -> None:
+    """Сохраняет кэш вылета в БД — переживает рестарт сервиса."""
+    db_execute(
+        """
+        INSERT INTO departure_cache (pilot_name, dep, arr, flight_no, from_fsa, updated_at)
+        VALUES (%s, %s, %s, %s, TRUE, NOW())
+        ON CONFLICT (pilot_name) DO UPDATE SET
+            dep        = EXCLUDED.dep,
+            arr        = EXCLUDED.arr,
+            flight_no  = EXCLUDED.flight_no,
+            from_fsa   = EXCLUDED.from_fsa,
+            updated_at = NOW()
+        """,
+        (pilot_name, dep, arr, flight_no),
+    )
+
+
+def db_departure_cache_get(pilot_name: str) -> Optional[Dict]:
+    """
+    Возвращает кэш вылета из БД.
+    Актуален если не старше 24 часов и from_fsa=True.
+    """
+    row = db_execute(
+        """
+        SELECT dep, arr, flight_no, from_fsa, updated_at
+        FROM departure_cache
+        WHERE pilot_name = %s
+          AND from_fsa = TRUE
+          AND updated_at >= NOW() - INTERVAL '24 hours'
+        """,
+        (pilot_name,), fetch="one",
+    )
+    if not row:
+        return None
+    return {
+        "dep":       row["dep"],
+        "arr":       row["arr"],
+        "flight_no": row["flight_no"],
+        "from_fsa":  row["from_fsa"],
+    }
+
+
+def db_departure_cache_delete(pilot_name: str) -> None:
+    """Удаляет кэш вылета после посадки."""
+    db_execute(
+        "DELETE FROM departure_cache WHERE pilot_name = %s",
+        (pilot_name,),
+    )
+
+
+# Оставляем in-memory объекты для обратной совместимости с импортами в app.py
+# (app.py импортирует _departure_cache и _departure_cache_lock)
 _departure_cache: Dict[str, Dict] = {}
 _departure_cache_lock = threading.Lock()
 
