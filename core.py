@@ -901,14 +901,51 @@ OPERATION_MAX_POINTS   = sum(pts for _, _, _, pts in OPERATION_LEGS)  # 13360
 
 
 def op_get_aircraft_coeff(aircraft_icao: str) -> float:
+    """
+    Возвращает коэффициент ВС по ICAO-типу или полному названию.
+    FSHub может передавать как ICAO ('B727'), так и полное название ('Boeing 727-200').
+    """
     if not aircraft_icao:
         return 1.0
     key = aircraft_icao.upper().strip()
+
+    # Прямое совпадение ('B727', 'A320' и т.д.)
     if key in OPERATION_AIRCRAFT_COEFF:
         return OPERATION_AIRCRAFT_COEFF[key]
+
+    # Частичное совпадение — ICAO-код содержится в строке ('B727' in 'B727-200')
     for icao_key, coeff in OPERATION_AIRCRAFT_COEFF.items():
         if icao_key in key:
             return coeff
+
+    # Расширенный поиск по числовой модели для полных названий
+    # Например 'Boeing 727-200' → ищем '727'
+    # ВАЖНО: более специфичные паттерны идут раньше общих
+    MODEL_PATTERNS = [
+        ("727",    2.0),   # Boeing 727
+        ("ATR",    2.5),   # ATR-42/72
+        ("CRJ",    1.5),   # CRJ-700/900
+        ("MD-11",  1.1),   # MD-11
+        ("MD11",   1.1),   # MD11
+        ("MAX",    1.3),   # B737 MAX (до 737!)
+        ("B38M",   1.3),   # B737 MAX ICAO
+        ("738",    1.0),   # B737-800 ICAO (до 737!)
+        ("737-8",  1.0),   # Boeing 737-800 полное название
+        ("736",    1.1),   # B737-600 ICAO
+        ("737-6",  1.1),   # Boeing 737-600 полное название
+        ("737",    1.1),   # B737 прочие
+        ("310",    1.3),   # A310
+        ("318",    1.3),   # A318
+        ("319",    1.3),   # A319
+        ("320",    1.1),   # A320
+        ("321",    1.0),   # A321
+        ("330",    1.0),   # A330
+        ("773",    1.0),   # B777-300
+    ]
+    for pattern, coeff in MODEL_PATTERNS:
+        if pattern in key:
+            return coeff
+
     return 1.0
 
 
