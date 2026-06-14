@@ -1284,40 +1284,59 @@ _fsa_pilot_cache_lock = threading.Lock()
 _fsa_pilot_cache_ts: float = 0
 
 # Кэш данных вылета: pilot_name → {dep, arr, flight_no, ts}
-def db_departure_cache_set(pilot_name: str, dep: str, arr: str, flight_no: str) -> None:
+def db_departure_cache_set(
+    pilot_name: str, dep: str, arr: str,
+    flight_no: str, fshub_flight_id: str = ""
+) -> None:
     """Сохраняет кэш вылета в БД — переживает рестарт сервиса."""
     db_execute(
         """
-        INSERT INTO departure_cache (pilot_name, dep, arr, flight_no, from_fsa, updated_at)
-        VALUES (%s, %s, %s, %s, TRUE, NOW())
+        INSERT INTO departure_cache
+            (pilot_name, dep, arr, flight_no, from_fsa, fshub_flight_id, updated_at)
+        VALUES (%s, %s, %s, %s, TRUE, %s, NOW())
         ON CONFLICT (pilot_name) DO UPDATE SET
-            dep        = EXCLUDED.dep,
-            arr        = EXCLUDED.arr,
-            flight_no  = EXCLUDED.flight_no,
-            from_fsa   = EXCLUDED.from_fsa,
-            updated_at = NOW()
+            dep             = EXCLUDED.dep,
+            arr             = EXCLUDED.arr,
+            flight_no       = EXCLUDED.flight_no,
+            from_fsa        = EXCLUDED.from_fsa,
+            fshub_flight_id = EXCLUDED.fshub_flight_id,
+            updated_at      = NOW()
         """,
-        (pilot_name, dep, arr, flight_no),
+        (pilot_name, dep, arr, flight_no, fshub_flight_id),
     )
 
 
-def db_departure_cache_get(pilot_name: str) -> Optional[Dict]:
+def db_departure_cache_get(
+    pilot_name: str, fshub_flight_id: str = ""
+) -> Optional[Dict]:
     """
     Возвращает кэш вылета из БД.
-    Актуален если не старше 24 часов и from_fsa=True.
+    Актуален если не старше 6 часов и from_fsa=True.
+    Если fshub_flight_id передан — проверяем совпадение с кэшем.
     """
     row = db_execute(
         """
-        SELECT dep, arr, flight_no, from_fsa, updated_at
+        SELECT dep, arr, flight_no, from_fsa, fshub_flight_id, updated_at
         FROM departure_cache
         WHERE pilot_name = %s
           AND from_fsa = TRUE
-          AND updated_at >= NOW() - INTERVAL '24 hours'
+          AND updated_at >= NOW() - INTERVAL '6 hours'
         """,
         (pilot_name,), fetch="one",
     )
     if not row:
         return None
+
+    # Если передан flight_id — проверяем что кэш от этого же рейса
+    # Защита от смешивания ивентового рейса с обычным
+    if fshub_flight_id and row["fshub_flight_id"]:
+        if row["fshub_flight_id"] != fshub_flight_id:
+            logger.info(
+                f"[Cache] Кэш вылета для '{pilot_name}' от другого рейса "
+                f"(кэш: {row['fshub_flight_id']}, текущий: {fshub_flight_id}) — игнорируем"
+            )
+            return None
+
     return {
         "dep":       row["dep"],
         "arr":       row["arr"],
