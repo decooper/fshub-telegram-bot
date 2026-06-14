@@ -282,6 +282,7 @@ def _enrich_departure_from_fsa(
     pilot_name: str,
     aircraft_name: str,
     delay: int = 90,
+    fshub_flight_id: str = "",
 ) -> None:
     time.sleep(delay)
     logger.info(f"[Enrich] Запрос FSAirlines для пилота '{pilot_name}' (delay={delay}s)")
@@ -326,16 +327,17 @@ def _enrich_departure_from_fsa(
     logger.info(f"[Enrich] FSAirlines: {dep}→{arr} flight={flt_no}")
 
     if _is_valid_icao(dep) and _is_valid_icao(arr):
-        # Сохраняем в БД — переживёт рестарт сервиса
-        db_departure_cache_set(pilot_name, dep, arr, flt_no)
+        # Сохраняем в БД с привязкой к flight_id — защита от смешивания рейсов
+        db_departure_cache_set(pilot_name, dep, arr, flt_no, fshub_flight_id)
         # Обновляем in-memory кэш для быстрого доступа в текущей сессии
         with _departure_cache_lock:
             _departure_cache[pilot_name] = {
-                "dep":      dep,
-                "arr":      arr,
-                "flight_no": flt_no,
-                "ts":       time.time(),
-                "from_fsa": True,
+                "dep":              dep,
+                "arr":              arr,
+                "flight_no":        flt_no,
+                "fshub_flight_id":  fshub_flight_id,
+                "ts":               time.time(),
+                "from_fsa":         True,
             }
         tg_edit_message(
             chat_id_str, message_id,
@@ -735,6 +737,7 @@ def handle_departure(data: Dict):
                 target=_enrich_departure_from_fsa,
                 args=(message_id, CHAT_ID, pilot_name, aircraft_name,
                       FSA_ENRICH_DEPARTURE_DELAY),
+                kwargs={"fshub_flight_id": flight_id},
                 daemon=True,
             ).start()
     else:
@@ -789,10 +792,18 @@ def handle_completed(data: Dict):
 
     with _departure_cache_lock:
         cache_entry = _departure_cache.get(pilot_name)
+        # Проверяем что in-memory кэш от этого же рейса
+        if cache_entry and report_id:
+            if cache_entry.get("fshub_flight_id") and \
+               cache_entry["fshub_flight_id"] != report_id:
+                logger.info(
+                    f"[Cache] In-memory кэш для '{pilot_name}' от другого рейса — игнорируем"
+                )
+                cache_entry = None
 
-    # Если in-memory кэш пуст (после рестарта) — читаем из БД
+    # Если in-memory кэш пуст или не совпал — читаем из БД с проверкой flight_id
     if not cache_entry:
-        cache_entry = db_departure_cache_get(pilot_name)
+        cache_entry = db_departure_cache_get(pilot_name, fshub_flight_id=report_id)
 
     if (
         cache_entry
