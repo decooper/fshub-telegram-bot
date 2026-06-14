@@ -909,6 +909,7 @@ OPERATION_AIRCRAFT_COEFF: Dict[str, float] = {
     "B738":  1.0,
     "B38M":  1.3,  # B737 MAX 8
     "B39M":  1.3,  # B737 MAX 9
+    "B772":  1.0,  # Boeing 777-200ER
     "B773":  1.0,
     "CRJ7":  1.5,
     "MD11":  1.1,
@@ -958,6 +959,8 @@ def op_get_aircraft_coeff(aircraft_icao: str) -> float:
         ("321",    1.0),   # A321
         ("330",    1.0),   # A330
         ("773",    1.0),   # B777-300
+        ("772",    1.0),   # B777-200
+        ("777",    1.0),   # Boeing 777 любой
     ]
     for pattern, coeff in MODEL_PATTERNS:
         if pattern in key:
