@@ -647,6 +647,109 @@ def _enrich_completed_from_fsa(
     )
 
 
+# ═══════════════════════════════════════════════════════════════
+# FSHUB EVENT HANDLERS
+# ═══════════════════════════════════════════════════════════════
+
+def handle_departure(data: Dict):
+    """
+    flight.departed — приходит при вылете.
+    1. Дедуплицирует событие.
+    2. Отправляет в Telegram сообщение о вылете (с message_id для
+       последующего редактирования из _enrich_departure_from_fsa).
+    3. Всегда запускает обогащение из FSAirlines через 90с — оно кладёт
+       канонический маршрут в кэш, привязанный к fshub_flight_id
+       (защита от смешивания рейсов).
+    4. Дублирует в Discord.
+    """
+    d         = data.get("_data") or {}
+    flight_id = str(d.get("id", ""))
+
+    if flight_id and is_duplicate_event(flight_id, "departure"):
+        logger.info(f"Пропуск дублирующего departure для рейса {flight_id}")
+        return
+
+    user     = d.get("user")     or {}
+    plan     = d.get("plan")     or {}
+    aircraft = d.get("aircraft") or {}
+
+    pilot_name    = user.get("name",      "Unknown")
+    aircraft_name = aircraft.get("icao_name", "N/A")
+    flight_no     = plan.get("callsign") or plan.get("flight_no") or "N/A"
+
+    # Маршрут из FSHub-плана (если есть) — иначе ждём FSAirlines
+    plan_empty = _is_plan_empty(plan)
+    if plan_empty:
+        dep = arr = "????"
+        route_display = "⏳ Загружаю маршрут..."
+        logger.info(
+            f"[Departure] FSHub план для '{pilot_name}': пустой — "
+            f"запускаю обогащение из FSAirlines через {FSA_ENRICH_DEPARTURE_DELAY}с"
+        )
+    else:
+        dep = plan.get("icao_dep") or plan.get("departure", "????")
+        arr = plan.get("icao_arr") or plan.get("arrival",   "????")
+        route_display = f"{dep} → {arr}"
+        logger.info(
+            f"[Departure] FSHub план для '{pilot_name}': есть ({dep}→{arr}) — "
+            f"запускаю обогащение из FSAirlines через {FSA_ENRICH_DEPARTURE_DELAY}с"
+        )
+
+    msg_text = (
+        f"🛫 <b>ВЫЛЕТ ПОДТВЕРЖДЁН — CLEARED FOR TAKEOFF</b>\n\n"
+        f"👨‍✈️ Captain: <b>{pilot_name}</b>\n"
+        f"🆔 Flight: <b>{flight_no}</b>\n"
+        f"🗺 Route: <b>{route_display}</b>\n"
+        f"✈️ Aircraft: <b>{aircraft_name}</b>\n\n"
+        f"✈️ <i>Желаем попутного ветра и мягкой посадки!</i>"
+    )
+
+    # Telegram — сохраняем message_id для редактирования обогащением
+    tg_message_id = None
+    try:
+        tg_resp = session.post(
+            f"{TG_BASE}/sendMessage",
+            json={
+                "chat_id": CHAT_ID,
+                "text": msg_text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=20,
+        )
+        if tg_resp.status_code == 200:
+            tg_message_id = tg_resp.json().get("result", {}).get("message_id")
+        else:
+            logger.warning(f"[Departure] Telegram send failed: {tg_resp.text}")
+    except Exception as e:
+        logger.exception(f"[Departure] Telegram send error: {e}")
+
+    # Discord — сигнатуру сверить с core.py; завёрнуто, чтобы не уронить обработчик
+    try:
+        discord_send_departure(
+            pilot=pilot_name,
+            flight_no=flight_no,
+            dep=dep,
+            arr=arr,
+            aircraft=aircraft_name,
+            is_loading=plan_empty,
+        )
+    except Exception as e:
+        logger.warning(f"[Departure] discord_send_departure пропущен: {e}")
+
+    # Обогащение FSAirlines: кладёт канонический маршрут в кэш по fshub_flight_id
+    if tg_message_id:
+        threading.Thread(
+            target=_enrich_departure_from_fsa,
+            args=(
+                tg_message_id, CHAT_ID, pilot_name, aircraft_name,
+                FSA_ENRICH_DEPARTURE_DELAY,
+            ),
+            kwargs={"fshub_flight_id": flight_id},
+            daemon=True,
+        ).start()
+
+
 def handle_completed(data: Dict):
     """
     СХЕМА:
