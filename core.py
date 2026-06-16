@@ -17,6 +17,7 @@ import json
 import time
 import logging
 import threading
+import unicodedata
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urlencode, urlunparse, parse_qs
@@ -601,15 +602,26 @@ def _init_db():
     db_execute(
         """
         CREATE TABLE IF NOT EXISTS departure_cache (
-            pilot_name  TEXT PRIMARY KEY,
-            dep         TEXT,
-            arr         TEXT,
-            flight_no   TEXT DEFAULT 'N/A',
-            from_fsa    BOOLEAN DEFAULT TRUE,
-            updated_at  TIMESTAMPTZ DEFAULT NOW()
+            pilot_name      TEXT PRIMARY KEY,
+            dep             TEXT,
+            arr             TEXT,
+            flight_no       TEXT DEFAULT 'N/A',
+            from_fsa        BOOLEAN DEFAULT TRUE,
+            fshub_flight_id TEXT,
+            updated_at      TIMESTAMPTZ DEFAULT NOW()
         )
         """
     )
+    # Миграция: добавить fshub_flight_id если таблица создана старой схемой.
+    # Без этой колонки db_departure_cache_set/get падают на UndefinedColumn
+    # и кэш вылета не работает.
+    try:
+        db_execute(
+            "ALTER TABLE departure_cache ADD COLUMN IF NOT EXISTS fshub_flight_id TEXT"
+        )
+    except Exception:
+        pass
+
     logger.info("Database tables ready")
 
 
@@ -1359,6 +1371,22 @@ _departure_cache: Dict[str, Dict] = {}
 _departure_cache_lock = threading.Lock()
 
 
+def _norm_name(name: str) -> str:
+    """
+    Нормализует имя для сопоставления FSHub↔FSAirlines:
+      - снимает диакритику (Vahvijäinen → Vahvijainen)
+      - приводит к нижнему регистру
+      - схлопывает любые пробелы (двойные, неразрывные, хвостовые)
+    На обычных латинских именах в одном регистре поведение не меняется,
+    но закрывает класс скрытых сбоев из-за невидимых пробелов.
+    """
+    if not name:
+        return ""
+    nfkd = unicodedata.normalize("NFKD", name)
+    stripped = "".join(c for c in nfkd if not unicodedata.combining(c))
+    return " ".join(stripped.lower().split())
+
+
 def fsa_refresh_pilot_cache() -> None:
     global _fsa_pilot_cache_ts
     data = fsa_call("getPilotList")
@@ -1367,7 +1395,7 @@ def fsa_refresh_pilot_cache() -> None:
     with _fsa_pilot_cache_lock:
         _fsa_pilot_cache.clear()
         for p in data:
-            full_name = f"{p.get('name', '')} {p.get('surname', '')}".strip()
+            full_name = _norm_name(f"{p.get('name', '')} {p.get('surname', '')}")
             if full_name and p.get("id"):
                 _fsa_pilot_cache[full_name] = int(p["id"])
         _fsa_pilot_cache_ts = time.time()
@@ -1382,7 +1410,7 @@ def fsa_refresh_pilot_cache2() -> None:
         return
     with _fsa_pilot_cache_lock:
         for p in data:
-            full_name = f"{p.get('name', '')} {p.get('surname', '')}".strip()
+            full_name = _norm_name(f"{p.get('name', '')} {p.get('surname', '')}")
             if full_name and p.get("id") and full_name not in _fsa_pilot_cache:
                 _fsa_pilot_cache[full_name] = int(p["id"])
     logger.info(f"FSA2 pilot cache merged: total {len(_fsa_pilot_cache)} pilots")
@@ -1394,7 +1422,7 @@ def fsa_get_pilot_id(name: str) -> Optional[int]:
         if FSA_KEY2 and FSA_VA_ID2:
             fsa_refresh_pilot_cache2()
     with _fsa_pilot_cache_lock:
-        return _fsa_pilot_cache.get(name)
+        return _fsa_pilot_cache.get(_norm_name(name))
 
 
 def fsa_get_pilot_status(pilot_id: int) -> Optional[Dict]:
