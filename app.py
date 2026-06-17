@@ -505,6 +505,17 @@ def _enrich_completed_from_fsa(
     if not op_pilot or op_pilot["status"] != "active":
         return
 
+    # Защита от устаревшего лега: за время поллинга FSAirlines (до ~1ч)
+    # current_leg мог уйти вперёд (засчитан другой лег / админ-правка).
+    # Тогда этот результат уже неактуален — ничего не записываем и не сбрасываем,
+    # чтобы устаревшее «крушение» не обнулило прогресс улетевшего дальше пилота.
+    if op_leg_num != op_pilot["current_leg"]:
+        logger.info(
+            f"[Operation] {pilot_name} Leg {op_leg_num} устарел "
+            f"(сейчас current_leg={op_pilot['current_leg']}) — пропуск засчёта"
+        )
+        return
+
     allowed, legs_today = db_op_check_daily_limit(pilot_name)
     if not allowed:
         tg_send(
@@ -798,18 +809,15 @@ def handle_completed(data: Dict):
 
     with _departure_cache_lock:
         cache_entry = _departure_cache.get(pilot_name)
-        # Проверяем что in-memory кэш от этого же рейса
-        if cache_entry and report_id:
-            if cache_entry.get("fshub_flight_id") and \
-               cache_entry["fshub_flight_id"] != report_id:
-                logger.info(
-                    f"[Cache] In-memory кэш для '{pilot_name}' от другого рейса — игнорируем"
-                )
-                cache_entry = None
+        # Свежесть: in-memory кэш не старше 18 ч. ID рейса НЕ сверяем —
+        # departure-id (flight.departed) и report-id (flight.completed) из
+        # разных пространств и никогда не совпадают (см. db_departure_cache_get).
+        if cache_entry and (time.time() - cache_entry.get("ts", 0)) > 64800:
+            cache_entry = None
 
-    # Если in-memory кэш пуст или не совпал — читаем из БД с проверкой flight_id
+    # Если in-memory кэш пуст — читаем из БД
     if not cache_entry:
-        cache_entry = db_departure_cache_get(pilot_name, fshub_flight_id=report_id)
+        cache_entry = db_departure_cache_get(pilot_name)
 
     if (
         cache_entry
