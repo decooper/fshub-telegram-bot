@@ -756,6 +756,7 @@ def db_top_landings(limit: int = 10) -> List:
         """
         SELECT * FROM flights
         WHERE DATE_TRUNC('month', created_at) = DATE_TRUNC('month', NOW())
+          AND landing_rate < 0
         ORDER BY ABS(landing_rate) ASC LIMIT %s
         """,
         (limit,), fetch="all",
@@ -927,7 +928,7 @@ OPERATION_AIRCRAFT_COEFF: Dict[str, float] = {
     "MD11":  1.1,
 }
 OPERATION_VATSIM_BONUS = 50
-OPERATION_MAX_POINTS   = sum(pts for _, _, _, pts in OPERATION_LEGS)  # 13360
+OPERATION_MAX_POINTS   = sum(pts for _, _, _, pts in OPERATION_LEGS)  # 13520
 
 
 def op_get_aircraft_coeff(aircraft_icao: str) -> float:
@@ -1318,37 +1319,33 @@ def db_departure_cache_set(
     )
 
 
-def db_departure_cache_get(
-    pilot_name: str, fshub_flight_id: str = ""
-) -> Optional[Dict]:
+def db_departure_cache_get(pilot_name: str) -> Optional[Dict]:
     """
-    Возвращает кэш вылета из БД.
-    Актуален если не старше 6 часов и from_fsa=True.
-    Если fshub_flight_id передан — проверяем совпадение с кэшем.
+    Возвращает кэш вылета из БД для пилота.
+
+    Идентичность рейса НЕ проверяется по fshub_flight_id: id события вылета
+    (flight.departed) и id отчёта посадки (flight.completed) лежат в разных
+    пространствах и никогда не совпадают. Корректность обеспечивается иначе:
+    кэш удаляется при посадке (db_departure_cache_delete) и перезаписывается
+    при новом вылете (ON CONFLICT DO UPDATE), поэтому всегда соответствует
+    последнему незавершённому вылету пилота. Один пилот не летит два рейса
+    одновременно, так что коллизия невозможна.
+
+    Актуальным считается кэш не старше 18 часов и from_fsa=TRUE
+    (хватает даже на самый длинный лег в реальном времени).
     """
     row = db_execute(
         """
-        SELECT dep, arr, flight_no, from_fsa, fshub_flight_id, updated_at
+        SELECT dep, arr, flight_no, from_fsa, updated_at
         FROM departure_cache
         WHERE pilot_name = %s
           AND from_fsa = TRUE
-          AND updated_at >= NOW() - INTERVAL '6 hours'
+          AND updated_at >= NOW() - INTERVAL '18 hours'
         """,
         (pilot_name,), fetch="one",
     )
     if not row:
         return None
-
-    # Если передан flight_id — проверяем что кэш от этого же рейса
-    # Защита от смешивания ивентового рейса с обычным
-    if fshub_flight_id and row["fshub_flight_id"]:
-        if row["fshub_flight_id"] != fshub_flight_id:
-            logger.info(
-                f"[Cache] Кэш вылета для '{pilot_name}' от другого рейса "
-                f"(кэш: {row['fshub_flight_id']}, текущий: {fshub_flight_id}) — игнорируем"
-            )
-            return None
-
     return {
         "dep":       row["dep"],
         "arr":       row["arr"],
@@ -1787,6 +1784,7 @@ def fmt_va_info() -> str:
 def _fmt_contest_block(m: str) -> str:
     entries = db_contest_month(m)
     limit   = CONTEST_MONTHLY_LIMIT
+    slots   = CONTEST_MONTHLY_LIMIT // CONTEST_POINTS_PER_LANDING
     earned  = min(len(entries) * CONTEST_POINTS_PER_LANDING, limit)
     remain  = limit - earned
     label   = _month_label(m)
@@ -1796,7 +1794,7 @@ def _fmt_contest_block(m: str) -> str:
 
     lines = []
     for i, e in enumerate(entries, 1):
-        in_limit = i <= limit
+        in_limit = i <= slots
         pts_str  = f"⭐ +{CONTEST_POINTS_PER_LANDING} баллов" if in_limit else "— (лимит исчерпан)"
         lines.append(
             f"  {i}. <b>{e['pilot']}</b> "
