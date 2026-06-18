@@ -73,7 +73,7 @@ from core import (
     _departure_cache, _departure_cache_lock,
     db_departure_cache_set, db_departure_cache_get, db_departure_cache_delete,
     # helpers
-    _is_plan_empty, _is_valid_icao, _aggregate,
+    _is_plan_empty, _is_valid_icao, _aggregate, _now_local,
     # formatters
     MONTH_NAMES,
     fmt_stats, fmt_last, fmt_top_landings, fmt_top_pilots,
@@ -1507,11 +1507,29 @@ def health():
 def _verify_fshub_signature(payload: bytes, signature_header: str) -> bool:
     """
     Проверяет HMAC-SHA256 подпись FSHub.
-    Если WEBHOOK_SECRET не задан — пропускаем проверку (совместимость).
+
+    Поведение:
+      • WEBHOOK_SECRET задан + подпись валидна  → пропускаем
+      • WEBHOOK_SECRET задан + подписи нет/невалидна → ОТКЛОНЯЕМ (403)
+      • WEBHOOK_SECRET НЕ задан → пропускаем (fail-open, совместимость)
+
+    ВНИМАНИЕ: при пустом WEBHOOK_SECRET вебхук не аутентифицирован —
+    кто угодно может слать поддельные события (фейковые посадки, очки ивента).
+    Чтобы закрыть это, задайте WEBHOOK_SECRET в окружении Render. Предупреждение
+    об открытом режиме выводится один раз при старте (см. startup-блок).
+
+    Важно: включать секрет можно только если FSHub реально подписывает запросы
+    заголовком X-FSHub-Signature, иначе все события начнут отклоняться. После
+    включения убедитесь по логам, что нет всплеска 'invalid signature'.
     """
     if not WEBHOOK_SECRET:
         return True
     if not signature_header:
+        logger.warning(
+            "FSHub webhook: WEBHOOK_SECRET задан, но запрос пришёл без подписи "
+            "(X-FSHub-Signature) — отклоняю. Если FSHub не подписывает запросы, "
+            "уберите WEBHOOK_SECRET."
+        )
         return False
     try:
         expected = hmac.new(
@@ -1671,7 +1689,7 @@ def api_stats():
         avg_all   = round(sum(rates_all)   / len(rates_all))   if rates_all   else 0
         pilot_counts = Counter(f["pilot"] for f in flights_month)
         top_pilots   = [{"pilot": n, "flights": c} for n, c in pilot_counts.most_common(5)]
-        now = datetime.now()
+        now = _now_local()
         resp = jsonify({
             "ok": True,
             "month": {
@@ -1691,7 +1709,7 @@ def api_stats():
 @app.route("/api/contest")
 def api_contest():
     try:
-        now     = datetime.now()
+        now     = _now_local()
         month   = now.strftime("%Y-%m")
         entries = db_contest_month(month)
         slots   = CONTEST_MONTHLY_LIMIT // CONTEST_POINTS_PER_LANDING
@@ -1738,6 +1756,14 @@ try:
 except Exception as e:
     logger.exception(f"Startup failed: {e}")
     sys.exit(1)
+
+if not WEBHOOK_SECRET:
+    logger.warning(
+        "⚠️  WEBHOOK_SECRET не задан — эндпоинт /webhook НЕ аутентифицирован: "
+        "любой может слать поддельные события FSHub (фейковые посадки, очки ивента). "
+        "Задайте WEBHOOK_SECRET в окружении Render, предварительно убедившись, "
+        "что FSHub подписывает запросы заголовком X-FSHub-Signature."
+    )
 
 logger.info(f"Сервис запущен на порту {os.environ.get('PORT', 10000)} — VA UP! готова к полётам")
 
