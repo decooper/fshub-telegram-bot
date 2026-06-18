@@ -18,7 +18,7 @@ import time
 import logging
 import threading
 import unicodedata
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urlencode, urlunparse, parse_qs
 from logging.handlers import RotatingFileHandler
@@ -53,6 +53,18 @@ TG_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 FSA_ENRICH_DEPARTURE_DELAY = 90
 FSA_ENRICH_ARRIVAL_DELAY   = 180
+
+# ── Локальная таймзона для «календарного месяца» статистики ────
+# МСК = UTC+3 круглый год (без перехода на летнее время с 2014).
+# Фиксированный offset надёжнее ZoneInfo: не зависит от наличия tzdata
+# в контейнере. Используется ТОЛЬКО для месяца рейсов/конкурса/статистики;
+# экономика и лимит легов ивента намеренно остаются на UTC.
+LOCAL_TZ = timezone(timedelta(hours=3))
+
+
+def _now_local() -> datetime:
+    """Текущее время в МСК (для границ календарного месяца статистики)."""
+    return datetime.now(LOCAL_TZ)
 
 # ── Discord Webhooks ───────────────────────────────────────────
 # Три отдельных вебхука для разных каналов Discord.
@@ -744,7 +756,8 @@ def db_flights_this_month() -> List:
     return db_execute(
         """
         SELECT * FROM flights
-        WHERE DATE_TRUNC('month', created_at) = DATE_TRUNC('month', NOW())
+        WHERE DATE_TRUNC('month', created_at AT TIME ZONE 'Europe/Moscow')
+            = DATE_TRUNC('month', NOW() AT TIME ZONE 'Europe/Moscow')
         ORDER BY id DESC
         """,
         fetch="all",
@@ -755,7 +768,8 @@ def db_top_landings(limit: int = 10) -> List:
     return db_execute(
         """
         SELECT * FROM flights
-        WHERE DATE_TRUNC('month', created_at) = DATE_TRUNC('month', NOW())
+        WHERE DATE_TRUNC('month', created_at AT TIME ZONE 'Europe/Moscow')
+            = DATE_TRUNC('month', NOW() AT TIME ZONE 'Europe/Moscow')
           AND landing_rate < 0
         ORDER BY ABS(landing_rate) ASC LIMIT %s
         """,
@@ -837,7 +851,7 @@ def db_contest_add(
     departure: str, arrival: str, aircraft: str,
     landing_rate: int, report_url: str,
 ):
-    month = datetime.now().strftime("%Y-%m")
+    month = _now_local().strftime("%Y-%m")
     db_execute(
         """
         INSERT INTO contest_entries
@@ -852,7 +866,7 @@ def db_contest_add(
 
 
 def db_contest_month(month: Optional[str] = None) -> List:
-    m = month or datetime.now().strftime("%Y-%m")
+    m = month or _now_local().strftime("%Y-%m")
     return db_execute(
         """
         SELECT * FROM contest_entries
@@ -1572,7 +1586,7 @@ def _month_label(m: str) -> str:
 
 
 def fmt_stats() -> str:
-    now = datetime.now()
+    now = _now_local()
     month_label = f"{MONTH_NAMES[now.month]} {now.year}"
     flights = db_flights_this_month()
     if not flights:
@@ -1619,7 +1633,7 @@ def fmt_last(limit: int = 5) -> str:
 
 
 def fmt_top_landings(limit: int = 10) -> str:
-    now = datetime.now()
+    now = _now_local()
     month_label = f"{MONTH_NAMES[now.month]} {now.year}"
     rows = db_top_landings(limit)
     if not rows:
@@ -1822,7 +1836,7 @@ def fmt_contest(month: Optional[str] = None) -> str:
     if month:
         return header + _fmt_contest_block(month) + footer
 
-    current = datetime.now().strftime("%Y-%m")
+    current = _now_local().strftime("%Y-%m")
     recent  = db_contest_recent_months(n=4)
 
     if current not in recent:
@@ -1881,7 +1895,7 @@ def fmt_operation_digest() -> str:
     pilots   = db_op_all_pilots()
     active   = [p for p in pilots if p["status"] == "active"]
     finished = [p for p in pilots if p["status"] == "finished"]
-    now      = datetime.now()
+    now      = _now_local()
 
     msg = (
         f"✈️ <b>ОПЕРАЦИЯ «{OPERATION_NAME}» — ДАЙДЖЕСТ</b>\n"
