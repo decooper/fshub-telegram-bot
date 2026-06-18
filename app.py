@@ -73,7 +73,7 @@ from core import (
     _departure_cache, _departure_cache_lock,
     db_departure_cache_set, db_departure_cache_get, db_departure_cache_delete,
     # helpers
-    _is_plan_empty, _is_valid_icao, _aggregate, _now_local,
+    _is_plan_empty, _is_valid_icao, _aggregate,
     # formatters
     MONTH_NAMES,
     fmt_stats, fmt_last, fmt_top_landings, fmt_top_pilots,
@@ -85,6 +85,13 @@ from core import (
     snapshot_daily_economy,
     # landing rating
     landing_rating,
+)
+
+# ── Маршруты / челлендж дня (модуль routes_pool.py) ──
+from routes_pool import (
+    fmt_route, fmt_daily_challenge, fmt_challenge_leaders,
+    post_daily_challenge, record_challenge_if_match,
+    init_challenge_db, challenge_bp,
 )
 
 if not BOT_TOKEN or not CHAT_ID:
@@ -203,6 +210,10 @@ def tg_send_menu(chat_id) -> bool:
                             {"text": "🎯 Мастер Посадки",   "callback_data": "cmd_contest"},
                         ],
                         [
+                            {"text": "🗺 Челлендж дня",      "callback_data": "cmd_challenge"},
+                            {"text": "🏆 Лидеры челленджа",  "callback_data": "cmd_challenge_top"},
+                        ],
+                        [
                             {"text": "✈️ Операция «Тихий Вжух»", "callback_data": "cmd_operation"},
                         ],
                     ]
@@ -231,6 +242,8 @@ MENU_CALLBACKS: Dict[str, callable] = {
     "cmd_va":          fmt_va_info,
     "cmd_contest":     fmt_contest,
     "cmd_operation":   fmt_operation,
+    "cmd_challenge":     fmt_daily_challenge,
+    "cmd_challenge_top": fmt_challenge_leaders,
 }
 
 
@@ -503,17 +516,6 @@ def _enrich_completed_from_fsa(
 
     op_pilot = db_op_get_pilot(pilot_name)
     if not op_pilot or op_pilot["status"] != "active":
-        return
-
-    # Защита от устаревшего лега: за время поллинга FSAirlines (до ~1ч)
-    # current_leg мог уйти вперёд (засчитан другой лег / админ-правка).
-    # Тогда этот результат уже неактуален — ничего не записываем и не сбрасываем,
-    # чтобы устаревшее «крушение» не обнулило прогресс улетевшего дальше пилота.
-    if op_leg_num != op_pilot["current_leg"]:
-        logger.info(
-            f"[Operation] {pilot_name} Leg {op_leg_num} устарел "
-            f"(сейчас current_leg={op_pilot['current_leg']}) — пропуск засчёта"
-        )
         return
 
     allowed, legs_today = db_op_check_daily_limit(pilot_name)
@@ -809,15 +811,18 @@ def handle_completed(data: Dict):
 
     with _departure_cache_lock:
         cache_entry = _departure_cache.get(pilot_name)
-        # Свежесть: in-memory кэш не старше 18 ч. ID рейса НЕ сверяем —
-        # departure-id (flight.departed) и report-id (flight.completed) из
-        # разных пространств и никогда не совпадают (см. db_departure_cache_get).
-        if cache_entry and (time.time() - cache_entry.get("ts", 0)) > 64800:
-            cache_entry = None
+        # Проверяем что in-memory кэш от этого же рейса
+        if cache_entry and report_id:
+            if cache_entry.get("fshub_flight_id") and \
+               cache_entry["fshub_flight_id"] != report_id:
+                logger.info(
+                    f"[Cache] In-memory кэш для '{pilot_name}' от другого рейса — игнорируем"
+                )
+                cache_entry = None
 
-    # Если in-memory кэш пуст — читаем из БД
+    # Если in-memory кэш пуст или не совпал — читаем из БД с проверкой flight_id
     if not cache_entry:
-        cache_entry = db_departure_cache_get(pilot_name)
+        cache_entry = db_departure_cache_get(pilot_name, fshub_flight_id=report_id)
 
     if (
         cache_entry
@@ -862,6 +867,9 @@ def handle_completed(data: Dict):
         landing_rate=rate,
         profit=None,
     )
+
+    # ── 3b. Зачёт челленджа дня (если маршрут совпал) ──────────
+    record_challenge_if_match(pilot_name, dep, arr)
 
     # ── 4. Сообщение о посадке ─────────────────────────────────
     flight_link = (
@@ -1149,6 +1157,9 @@ COMMANDS = {
     "/live":        fmt_active_flights,
     "/va":          fmt_va_info,
     "/operation":   fmt_operation,
+    "/route":          fmt_route,
+    "/challenge":      fmt_daily_challenge,
+    "/challenge_top":  fmt_challenge_leaders,
 }
 
 # Скомпилированный паттерн для валидации YYYY-MM (один раз на уровне модуля)
@@ -1409,12 +1420,22 @@ def init_scheduler():
         "cron", hour=21, minute=0,
         id="daily_stats",
     )
+    scheduler.add_job(
+        post_daily_challenge,
+        "cron", hour=6, minute=30,        # 09:30 МСК
+        id="daily_challenge",
+    )
 
     # ─── Еженедельные задачи ────────────────────────────────────
     scheduler.add_job(
         lambda: tg_send(fmt_top_landings()),
         "cron", day_of_week="sun", hour=12, minute=0,
         id="weekly_landing_ranking",
+    )
+    scheduler.add_job(
+        lambda: tg_send(fmt_challenge_leaders()),
+        "cron", day_of_week="sun", hour=12, minute=30,
+        id="weekly_challenge_leaders",
     )
     scheduler.add_job(
         lambda: tg_send(fmt_operation_digest()) if operation_is_active() else None,
@@ -1507,29 +1528,11 @@ def health():
 def _verify_fshub_signature(payload: bytes, signature_header: str) -> bool:
     """
     Проверяет HMAC-SHA256 подпись FSHub.
-
-    Поведение:
-      • WEBHOOK_SECRET задан + подпись валидна  → пропускаем
-      • WEBHOOK_SECRET задан + подписи нет/невалидна → ОТКЛОНЯЕМ (403)
-      • WEBHOOK_SECRET НЕ задан → пропускаем (fail-open, совместимость)
-
-    ВНИМАНИЕ: при пустом WEBHOOK_SECRET вебхук не аутентифицирован —
-    кто угодно может слать поддельные события (фейковые посадки, очки ивента).
-    Чтобы закрыть это, задайте WEBHOOK_SECRET в окружении Render. Предупреждение
-    об открытом режиме выводится один раз при старте (см. startup-блок).
-
-    Важно: включать секрет можно только если FSHub реально подписывает запросы
-    заголовком X-FSHub-Signature, иначе все события начнут отклоняться. После
-    включения убедитесь по логам, что нет всплеска 'invalid signature'.
+    Если WEBHOOK_SECRET не задан — пропускаем проверку (совместимость).
     """
     if not WEBHOOK_SECRET:
         return True
     if not signature_header:
-        logger.warning(
-            "FSHub webhook: WEBHOOK_SECRET задан, но запрос пришёл без подписи "
-            "(X-FSHub-Signature) — отклоняю. Если FSHub не подписывает запросы, "
-            "уберите WEBHOOK_SECRET."
-        )
         return False
     try:
         expected = hmac.new(
@@ -1689,7 +1692,7 @@ def api_stats():
         avg_all   = round(sum(rates_all)   / len(rates_all))   if rates_all   else 0
         pilot_counts = Counter(f["pilot"] for f in flights_month)
         top_pilots   = [{"pilot": n, "flights": c} for n, c in pilot_counts.most_common(5)]
-        now = _now_local()
+        now = datetime.now()
         resp = jsonify({
             "ok": True,
             "month": {
@@ -1709,7 +1712,7 @@ def api_stats():
 @app.route("/api/contest")
 def api_contest():
     try:
-        now     = _now_local()
+        now     = datetime.now()
         month   = now.strftime("%Y-%m")
         entries = db_contest_month(month)
         slots   = CONTEST_MONTHLY_LIMIT // CONTEST_POINTS_PER_LANDING
@@ -1751,19 +1754,13 @@ def api_contest():
 try:
     _create_pool()
     _init_db()
+    init_challenge_db()
+    app.register_blueprint(challenge_bp)
     tg_setup_webhook()
     init_scheduler()
 except Exception as e:
     logger.exception(f"Startup failed: {e}")
     sys.exit(1)
-
-if not WEBHOOK_SECRET:
-    logger.warning(
-        "⚠️  WEBHOOK_SECRET не задан — эндпоинт /webhook НЕ аутентифицирован: "
-        "любой может слать поддельные события FSHub (фейковые посадки, очки ивента). "
-        "Задайте WEBHOOK_SECRET в окружении Render, предварительно убедившись, "
-        "что FSHub подписывает запросы заголовком X-FSHub-Signature."
-    )
 
 logger.info(f"Сервис запущен на порту {os.environ.get('PORT', 10000)} — VA UP! готова к полётам")
 
