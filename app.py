@@ -811,18 +811,12 @@ def handle_completed(data: Dict):
 
     with _departure_cache_lock:
         cache_entry = _departure_cache.get(pilot_name)
-        # Проверяем что in-memory кэш от этого же рейса
-        if cache_entry and report_id:
-            if cache_entry.get("fshub_flight_id") and \
-               cache_entry["fshub_flight_id"] != report_id:
-                logger.info(
-                    f"[Cache] In-memory кэш для '{pilot_name}' от другого рейса — игнорируем"
-                )
-                cache_entry = None
 
-    # Если in-memory кэш пуст или не совпал — читаем из БД с проверкой flight_id
+    # Если in-memory кэш пуст — читаем из БД.
+    # Ревизия 3.1: сверка по пилоту + свежести, БЕЗ fshub_flight_id
+    # (id вылета и id отчёта — из разных пространств, никогда не совпадают).
     if not cache_entry:
-        cache_entry = db_departure_cache_get(pilot_name, fshub_flight_id=report_id)
+        cache_entry = db_departure_cache_get(pilot_name)
 
     if (
         cache_entry
