@@ -383,6 +383,13 @@ def post_challenge_results():
         logger.warning(f"[Challenge] Discord итоги месяца failed: {e}")
 
 
+# ═══════════════════════════════════════════════════════════════
+# API ДЛЯ САЙТА (Flask Blueprint)
+# ═══════════════════════════════════════════════════════════════
+
+challenge_bp = Blueprint("challenge", __name__)
+
+
 def _cors(resp):
     resp.headers["Access-Control-Allow-Origin"]  = SITE_ORIGIN
     resp.headers["Access-Control-Allow-Methods"] = "GET"
