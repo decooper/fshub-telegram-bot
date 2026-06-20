@@ -91,7 +91,7 @@ from core import (
 from routes_pool import (
     fmt_route, fmt_daily_challenge, fmt_challenge_leaders,
     post_daily_challenge, record_challenge_if_match,
-    init_challenge_db, challenge_bp,
+    init_challenge_db, challenge_bp, post_challenge_results,
 )
 
 if not BOT_TOKEN or not CHAT_ID:
@@ -1416,8 +1416,13 @@ def init_scheduler():
     )
     scheduler.add_job(
         post_daily_challenge,
-        "cron", hour=6, minute=30,        # 09:30 МСК
+        "cron", hour=0, minute=0,         # 00:00 UTC
         id="daily_challenge",
+    )
+    scheduler.add_job(
+        post_challenge_results,
+        "cron", day=1, hour=0, minute=1,  # 1-го числа 00:01 UTC — итоги прошлого месяца
+        id="monthly_challenge_results",
     )
 
     # ─── Еженедельные задачи ────────────────────────────────────
