@@ -196,8 +196,12 @@ def fmt_daily_challenge():
     for pk in picks:
         r = pk["route"]
         lines.append(f"{pk['label']} · <b>+{pk['points']}</b> очков")
-        lines.append(f"<b>{r.flight_no}</b> · {A.place(r.dep)} → {A.place(r.arr)}")
-        lines.append(f"⏱ ~{_fmt_dur(pk['duration'])}")
+        lines.append(f"<b>{r.flight_no}</b> · {A.place_full(r.dep)} → {A.place_full(r.arr)}")
+        hl = A.highlight(r.arr)
+        if hl:
+            lines.append(f"⏱ ~{_fmt_dur(pk['duration'])} · 📍 <i>{hl}</i>")
+        else:
+            lines.append(f"⏱ ~{_fmt_dur(pk['duration'])}")
         lines.append("")
     lines.append("━━━━━━━━━━━━━━")
     lines.append("🏅 Лидеры месяца: /challenge_top")
