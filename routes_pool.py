@@ -4,7 +4,7 @@ routes_pool.py — пул маршрутов компании + ежедневн
 Челлендж дня = 3 рейса разной длительности:
   🟢 Короткий 1–2 ч  → 40 очков
   🟡 Средний  3–5 ч  → 60 очков
-  🔴 Длинный  5 ч+   → 100 очков
+  🔴 Дальний  5 ч+   → 100 очков
 Можно выполнить любой или все три (40+60+100). Очки идут в месячный зачёт.
 
 Зависит от core.py (db_execute, tg_send, discord_send, logger) — без side effects.
@@ -19,11 +19,10 @@ from collections import namedtuple
 
 from flask import Blueprint, jsonify, request
 
-from core import db_execute, tg_send, discord_send, logger
+from core import db_execute, tg_send, discord_send, logger, MONTH_NAMES
 
 # ─── Константы ──────────────────────────────────────────────────
 ROUTES_FILE         = os.path.join(os.path.dirname(__file__), "routes.txt")
-LOCAL_TZ            = timezone(timedelta(hours=3))   # МСК
 ANNOUNCE_COMPLETION = True
 SITE_ORIGIN         = "https://va-up.ru"
 
@@ -34,7 +33,7 @@ SANE_MIN, SANE_MAX = 40, 960   # 40 мин .. 16 ч
 CHALLENGE_TIERS = [
     ("short",  "🟢 Короткий", 60,  120,  40),
     ("medium", "🟡 Средний",  180, 299,  60),
-    ("long",   "🔴 Длинный",  300, 960, 100),
+    ("long",   "🔴 Дальний",  300, 960, 100),
 ]
 _TIER_LABEL  = {k: lbl for k, lbl, *_ in CHALLENGE_TIERS}
 _TIER_POINTS = {k: pts for k, *_, pts in CHALLENGE_TIERS}
@@ -117,20 +116,20 @@ def _tier_pools():
 
 
 # ═══════════════════════════════════════════════════════════════
-# ВРЕМЯ (МСК)
+# ВРЕМЯ (UTC — как лимит легов ивента)
 # ═══════════════════════════════════════════════════════════════
 
-def _now_msk():
-    return datetime.now(LOCAL_TZ)
+def _now_utc():
+    return datetime.now(timezone.utc)
 
-def _today_msk():
-    return _now_msk().date()
+def _today_utc():
+    return _now_utc().date()
 
-def _month_msk():
-    return _now_msk().strftime("%Y-%m")
+def _month_utc():
+    return _now_utc().strftime("%Y-%m")
 
 def _date_seed():
-    return int(_today_msk().strftime("%Y%m%d"))
+    return int(_today_utc().strftime("%Y%m%d"))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -162,7 +161,7 @@ def daily_challenge():
     """
     Возвращает список пиков на сегодня:
       [{tier, label, points, duration, route}, ...]
-    Детерминировано по дате (МСК) — стабильно при рестартах.
+    Детерминировано по дате (UTC) — стабильно при рестартах.
     """
     pools = _tier_pools()
     rng = random.Random(_date_seed())
@@ -186,11 +185,11 @@ def fmt_daily_challenge():
     picks = daily_challenge()
     if not picks:
         return "Маршруты не загружены."
-    today = _now_msk().strftime("%d.%m.%Y")
+    today = _now_utc().strftime("%d.%m.%Y")
     lines = [
         f"🎯 <b>ЧЕЛЛЕНДЖ ДНЯ</b> · {today}",
         "━━━━━━━━━━━━━━",
-        "Лети любой — длиннее рейс, больше очков. Можно все три 👇",
+        "Чем дальше рейс — тем больше очков. Можно все три 👇",
         "",
     ]
     for pk in picks:
@@ -199,9 +198,7 @@ def fmt_daily_challenge():
         lines.append(f"<b>{r.flight_no}</b> · {r.dep} → {r.arr}")
         lines.append(f"⏱ ~{_fmt_dur(pk['duration'])} · 💰 {r.price} v$")
         lines.append("")
-    total = sum(pk["points"] for pk in picks)
     lines.append("━━━━━━━━━━━━━━")
-    lines.append(f"🏆 Все три за день = <b>+{total}</b> очков")
     lines.append("🏅 Лидеры месяца: /challenge_top")
     return "\n".join(lines)
 
@@ -253,7 +250,7 @@ def init_challenge_db():
 def record_challenge_if_match(pilot_name, dep, arr):
     """
     Вызывается из handle_completed. Если маршрут совпал с одним из 3 рейсов дня —
-    пилоту начисляются очки этого тира (раз в сутки на каждый тир по МСК).
+    пилоту начисляются очки этого тира (раз в сутки на каждый тир по UTC).
     Совпадение строго по направлению DEP→ARR.
     """
     try:
@@ -276,7 +273,7 @@ def record_challenge_if_match(pilot_name, dep, arr):
             ON CONFLICT (pilot, day, tier) DO NOTHING
             RETURNING id
             """,
-            (pilot_name, _today_msk(), match["tier"], dep, arr, match["points"]),
+            (pilot_name, _today_utc(), match["tier"], dep, arr, match["points"]),
             fetch="one",
         )
         if row:
@@ -296,7 +293,7 @@ def record_challenge_if_match(pilot_name, dep, arr):
 
 def challenge_leaders(month=None, limit=20):
     """Лидеры месяца: [{pilot, completed, points}], сорт по очкам."""
-    month = month or _month_msk()
+    month = month or _month_utc()
     rows = db_execute(
         """
         SELECT pilot,
@@ -319,24 +316,71 @@ def challenge_leaders(month=None, limit=20):
 
 
 def fmt_challenge_leaders(month=None):
-    month   = month or _month_msk()
+    month   = month or _month_utc()
     leaders = challenge_leaders(month)
     if not leaders:
         return (f"🏆 <b>Челлендж — лидеры {month}</b>\n\n"
                 "В этом месяце ещё никто не выполнял челлендж.")
     medals = ["🥇", "🥈", "🥉"]
-    lines  = [f"🏆 <b>Челлендж — лидеры {month} (МСК)</b>\n"]
+    lines  = [f"🏆 <b>Челлендж — лидеры {month} (UTC)</b>\n"]
     for i, l in enumerate(leaders):
         mark = medals[i] if i < 3 else f"{i + 1}."
-        lines.append(f"{mark} <b>{l['pilot']}</b> — {l['points']} очк. ({l['completed']} вып.)")
+        lines.append(f"{mark} <b>{l['pilot']}</b> — {l['points']} очк. ({l['completed']} рей.)")
     return "\n".join(lines)
 
 
-# ═══════════════════════════════════════════════════════════════
-# API ДЛЯ САЙТА (Flask Blueprint)
-# ═══════════════════════════════════════════════════════════════
+def _month_label(m: str) -> str:
+    """'2026-06' → 'Июнь 2026'."""
+    try:
+        y, mo = m.split("-")
+        return f"{MONTH_NAMES[int(mo)]} {y}"
+    except Exception:
+        return m
 
-challenge_bp = Blueprint("challenge", __name__)
+
+def _prev_month_utc() -> str:
+    """Предыдущий календарный месяц (UTC) в формате YYYY-MM."""
+    first = _now_utc().replace(day=1)
+    return (first - timedelta(days=1)).strftime("%Y-%m")
+
+
+def fmt_challenge_results(month=None) -> str:
+    """Итоги челленджа за месяц: 3 призёра + остальные участники."""
+    month   = month or _prev_month_utc()
+    leaders = challenge_leaders(month, limit=100)
+    label   = _month_label(month)
+    if not leaders:
+        return (f"🏁 <b>ИТОГИ ЧЕЛЛЕНДЖА — {label}</b>\n"
+                "━━━━━━━━━━━━━━\n"
+                "В этом месяце челлендж никто не выполнял.\n\n"
+                "🆕 Новый цикл стартовал — /challenge")
+    medals = ["🥇", "🥈", "🥉"]
+    lines  = [f"🏁 <b>ИТОГИ ЧЕЛЛЕНДЖА — {label}</b>", "━━━━━━━━━━━━━━"]
+    top = leaders[:3]
+    for i, l in enumerate(top):
+        lines.append(
+            f"{medals[i]} <b>{l['pilot']}</b> — "
+            f"{l['points']} очк. ({l['completed']} рей.)"
+        )
+    rest = leaders[3:]
+    if rest:
+        lines.append("")
+        lines.append("✈️ <b>Также участвовали:</b>")
+        for l in rest:
+            lines.append(f"• {l['pilot']} — {l['points']} очк.")
+    lines.append("━━━━━━━━━━━━━━")
+    lines.append("🎉 Поздравляем призёров! 🆕 Новый цикл стартовал — /challenge")
+    return "\n".join(lines)
+
+
+def post_challenge_results():
+    """Публикует итоги прошедшего месяца (вызывается 1-го числа в 00:01 UTC)."""
+    text = fmt_challenge_results()
+    tg_send(text)
+    try:
+        discord_send(text)
+    except Exception as e:
+        logger.warning(f"[Challenge] Discord итоги месяца failed: {e}")
 
 
 def _cors(resp):
@@ -364,7 +408,7 @@ def api_challenge():
             })
         resp = jsonify({
             "ok":     True,
-            "date":   _today_msk().isoformat(),
+            "date":   _today_utc().isoformat(),
             "routes": routes,
         })
         return _cors(resp)
@@ -376,7 +420,7 @@ def api_challenge():
 @challenge_bp.route("/api/challenge/leaders")
 def api_challenge_leaders():
     try:
-        month   = request.args.get("month") or _month_msk()
+        month   = request.args.get("month") or _month_utc()
         leaders = challenge_leaders(month)
         result  = [{"rank": i + 1, **l} for i, l in enumerate(leaders)]
         resp = jsonify({
