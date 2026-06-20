@@ -187,19 +187,22 @@ def fmt_daily_challenge():
     if not picks:
         return "Маршруты не загружены."
     today = _now_msk().strftime("%d.%m.%Y")
-    lines = [f"🎯 <b>ЧЕЛЛЕНДЖ ДНЯ</b> — {today}", ""]
+    lines = [
+        f"🎯 <b>ЧЕЛЛЕНДЖ ДНЯ</b> · {today}",
+        "━━━━━━━━━━━━━━",
+        "Лети любой — длиннее рейс, больше очков. Можно все три 👇",
+        "",
+    ]
     for pk in picks:
         r = pk["route"]
-        tier = pk["label"].split()[1]            # "Короткий" без эмодзи
-        emoji = pk["label"].split()[0]
-        lines.append(
-            f"{emoji} <b>{tier}</b> ~{_fmt_dur(pk['duration'])} · <b>+{pk['points']}</b>"
-        )
-        lines.append(f"   <code>{r.dep} → {r.arr}</code>  {r.flight_no}")
+        lines.append(f"{pk['label']} · <b>+{pk['points']}</b> очков")
+        lines.append(f"<b>{r.flight_no}</b> · {r.dep} → {r.arr}")
+        lines.append(f"⏱ ~{_fmt_dur(pk['duration'])} · 💰 {r.price} v$")
         lines.append("")
     total = sum(pk["points"] for pk in picks)
-    lines.append(f"Лети любой или все три (<b>+{total}</b>).")
-    lines.append("🏆 Таблица лидеров: /challenge_top")
+    lines.append("━━━━━━━━━━━━━━")
+    lines.append(f"🏆 Все три за день = <b>+{total}</b> очков")
+    lines.append("🏅 Лидеры месяца: /challenge_top")
     return "\n".join(lines)
 
 
