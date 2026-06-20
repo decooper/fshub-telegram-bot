@@ -92,6 +92,7 @@ from routes_pool import (
     fmt_route, fmt_daily_challenge, fmt_challenge_leaders,
     post_daily_challenge, record_challenge_if_match,
     init_challenge_db, challenge_bp, post_challenge_results,
+    send_daily_challenge,
 )
 
 if not BOT_TOKEN or not CHAT_ID:
@@ -242,7 +243,6 @@ MENU_CALLBACKS: Dict[str, callable] = {
     "cmd_va":          fmt_va_info,
     "cmd_contest":     fmt_contest,
     "cmd_operation":   fmt_operation,
-    "cmd_challenge":     fmt_daily_challenge,
     "cmd_challenge_top": fmt_challenge_leaders,
 }
 
@@ -270,6 +270,15 @@ def handle_callback_query(cq: Dict) -> None:
             "✈️ Введите ICAO-код аэропорта:\n<i>Например: UHWW, UUEE, EGLL</i>",
             chat_id,
         )
+        return
+
+    if data == "cmd_challenge":
+        tg_answer_callback(cq_id)
+        try:
+            send_daily_challenge(chat_id)
+        except Exception as e:
+            logger.exception(f"cmd_challenge failed: {e}")
+            tg_send("⚠️ Ошибка при выполнении команды.", chat_id)
         return
 
     if data in MENU_CALLBACKS:
@@ -1152,7 +1161,6 @@ COMMANDS = {
     "/va":          fmt_va_info,
     "/operation":   fmt_operation,
     "/route":          fmt_route,
-    "/challenge":      fmt_daily_challenge,
     "/challenge_top":  fmt_challenge_leaders,
 }
 
@@ -1301,6 +1309,11 @@ def handle_tg_command(message: Dict):
                 "/operation_admin list",
                 chat_id,
             )
+        return
+
+    # ─── /challenge (с инлайн-кнопками) ─────────────────────────
+    if base_cmd == "/challenge":
+        send_daily_challenge(chat_id)
         return
 
     # ─── /contest [YYYY-MM] ─────────────────────────────────────
