@@ -1305,6 +1305,91 @@ def handle_tg_command(message: Dict):
             db_op_reset_pilot(pilot)
             tg_send(f"✅ Прогресс <b>{pilot}</b> сброшен.", chat_id)
 
+        elif sub == "fsa":
+            rest  = text.split(None, 2)[2] if len(text.split(None, 2)) > 2 else ""
+            pilot = rest.strip()
+            if not pilot:
+                tg_send("Использование: /operation_admin fsa Имя Фамилия", chat_id)
+                return
+
+            pilot_id = fsa_get_pilot_id(pilot)
+            if not pilot_id:
+                tg_send(
+                    f"❌ Пилот <b>{pilot}</b> не найден в FSAirlines "
+                    f"(ни UP!, ни Профсоюз).",
+                    chat_id,
+                )
+                return
+
+            report = fsa_get_recent_report(pilot_id, "")   # "" → самый свежий отчёт
+            if not report:
+                tg_send(
+                    f"⚠️ У <b>{pilot}</b> (FSA id {pilot_id}) нет доступных отчётов.",
+                    chat_id,
+                )
+                return
+
+            dep = (report.get("dep") or "????").upper()
+            arr = (report.get("arr") or "????").upper()
+            try:
+                simrate = int(report.get("simrate", 1) or 1)
+            except (ValueError, TypeError):
+                simrate = 1
+            try:
+                rate = int(report.get("landing_rate"))
+            except (ValueError, TypeError):
+                rate = None
+            flight_no = report.get("flight_no") or "N/A"
+            ts        = report.get("ts") or "—"
+
+            # Сверка с легами ивента
+            leg_info = "🔸 маршрут не входит в леги ивента"
+            leg_key  = (dep, arr)
+            if leg_key in OPERATION_LEG_MAP:
+                leg_num, leg_pts = OPERATION_LEG_MAP[leg_key]
+                p = db_op_get_pilot(pilot)
+                if not p:
+                    leg_info = (
+                        f"🔹 это <b>Leg {leg_num}</b> ({leg_pts} очк.), "
+                        f"но пилот не зарегистрирован в ивенте"
+                    )
+                elif leg_num == p["current_leg"]:
+                    leg_info = (
+                        f"✅ это <b>Leg {leg_num}</b> ({leg_pts} очк.) — "
+                        f"совпадает с текущим легом пилота"
+                    )
+                else:
+                    leg_info = (
+                        f"⚠️ это <b>Leg {leg_num}</b> ({leg_pts} очк.), "
+                        f"но пилот сейчас на Leg {p['current_leg']}"
+                    )
+
+            # Вердикты
+            if rate is None:
+                land_verdict = "нет данных о посадке"
+            elif rate <= -OPERATION_HARD_CRASH:
+                land_verdict = f"💥 крушение ({rate} fpm) — сброс прогресса"
+            elif rate <= -OPERATION_FAIL_RATE:
+                land_verdict = f"🔴 провал ({rate} fpm) — 0 очков"
+            else:
+                land_verdict = f"🟢 успешно ({rate} fpm)"
+            sim_verdict = (
+                f"❌ x{simrate} (> 4 — лег не засчитывается)"
+                if simrate > 4 else f"✅ x{simrate}"
+            )
+
+            tg_send(
+                f"🔎 <b>FSA — {pilot}</b> (id {pilot_id})\n\n"
+                f"🗺 Маршрут: <b>{dep} → {arr}</b>\n"
+                f"🆔 Рейс: <b>{flight_no}</b>\n"
+                f"🛬 Посадка: {land_verdict}\n"
+                f"⏩ Ускорение: {sim_verdict}\n"
+                f"🕐 Время отчёта: {ts}\n\n"
+                f"{leg_info}\n\n"
+                f"<i>Засчёт вручную: /operation_admin leg / set</i>",
+                chat_id,
+            )
+
         elif sub == "list":
             pilots = db_op_all_pilots()
             if not pilots:
@@ -1324,6 +1409,7 @@ def handle_tg_command(message: Dict):
                 "/operation_admin set Имя Фамилия | +500\n"
                 "/operation_admin leg Имя Фамилия | 3\n"
                 "/operation_admin reset Имя Фамилия\n"
+                "/operation_admin fsa Имя Фамилия\n"
                 "/operation_admin list",
                 chat_id,
             )
