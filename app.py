@@ -763,6 +763,30 @@ def handle_departure(data: Dict):
         ).start()
 
 
+def _flight_on_network(d: Dict):
+    """
+    Был ли РЕЙС выполнен в сети VATSIM/IVAO — по флагу самого полёта FSHub
+    (на сайте отображается как «Flags: VATSIM»), а НЕ по профилю пилота.
+
+    Точное имя ключа в вебхуке не задокументировано в нашей копии FsHub API,
+    поэтому разбираем несколько вероятных форм и логируем сырое значение —
+    по первому реальному онлайн-рейсу зафиксируем точный ключ.
+    Возвращает (on_network: bool, raw_value) для лога.
+    """
+    raw = d.get("flags")
+    if raw is None:
+        raw = d.get("flag") or d.get("network") or d.get("networks")
+    if isinstance(raw, (list, tuple)):
+        text = " ".join(str(x) for x in raw)
+    elif isinstance(raw, dict):
+        text = " ".join(f"{k}={v}" for k, v in raw.items())
+    else:
+        text = str(raw or "")
+    t = text.lower()
+    on = ("vatsim" in t) or ("ivao" in t)
+    return on, raw
+
+
 def handle_completed(data: Dict):
     """
     СХЕМА:
@@ -935,8 +959,10 @@ def handle_completed(data: Dict):
     op_leg_pts       = None
     op_report_url    = f"https://fshub.io/flight/{report_id}/report" if report_id else ""
     op_aircraft_icao = (d.get("aircraft") or {}).get("icao") or aircraft_name
-    user_handles     = user.get("handles") or {}
-    op_on_network    = bool(user_handles.get("vatsim") or user_handles.get("ivao"))
+    op_on_network, _net_raw = _flight_on_network(d)
+    logger.info(
+        f"[Operation] {pilot_name} flags_raw={_net_raw!r} on_network={op_on_network}"
+    )
 
     if operation_is_active() and route_from == "fsa_cache":
         # Маршрут из FSAirlines — проверяем совпадение с легом ивента
