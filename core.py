@@ -1798,6 +1798,7 @@ def fmt_va_info() -> str:
 def _fmt_contest_block(m: str) -> str:
     entries = db_contest_month(m)
     limit   = CONTEST_MONTHLY_LIMIT
+    slots   = CONTEST_MONTHLY_LIMIT // CONTEST_POINTS_PER_LANDING
     earned  = min(len(entries) * CONTEST_POINTS_PER_LANDING, limit)
     remain  = limit - earned
     label   = _month_label(m)
