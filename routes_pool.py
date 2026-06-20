@@ -19,7 +19,10 @@ from collections import namedtuple
 
 from flask import Blueprint, jsonify, request
 
-from core import db_execute, tg_send, discord_send, logger, MONTH_NAMES
+from core import (
+    db_execute, tg_send, discord_send, logger, MONTH_NAMES,
+    session, TG_BASE, CHAT_ID,
+)
 
 # ─── Константы ──────────────────────────────────────────────────
 ROUTES_FILE         = os.path.join(os.path.dirname(__file__), "routes.txt")
@@ -203,11 +206,46 @@ def fmt_daily_challenge():
     return "\n".join(lines)
 
 
-def post_daily_challenge():
-    text = fmt_daily_challenge()
-    tg_send(text)
+def challenge_keyboard():
+    """Инлайн-кнопки: METAR каждого аэропорта прилёта + лидеры месяца."""
+    picks = daily_challenge()
+    metar_row = [
+        {"text": f"🛬 {pk['route'].arr}",
+         "url":  f"https://metar-taf.com/{pk['route'].arr}"}
+        for pk in picks
+    ]
+    rows = []
+    if metar_row:
+        rows.append(metar_row)
+    rows.append([{"text": "🏆 Лидеры месяца", "callback_data": "cmd_challenge_top"}])
+    return {"inline_keyboard": rows}
+
+
+def send_daily_challenge(chat_id=None):
+    """Отправляет челлендж дня с инлайн-кнопками. chat_id=None → в канал."""
+    text   = fmt_daily_challenge()
+    target = str(chat_id) if chat_id else CHAT_ID
     try:
-        discord_send(text)
+        session.post(
+            f"{TG_BASE}/sendMessage",
+            json={
+                "chat_id": target,
+                "text": text[:4096],
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+                "reply_markup": challenge_keyboard(),
+            },
+            timeout=20,
+        )
+    except Exception as e:
+        logger.exception(f"[Challenge] send_daily_challenge error: {e}")
+
+
+def post_daily_challenge():
+    """Плановая публикация челленджа дня (00:00 UTC) — в канал + Discord."""
+    send_daily_challenge()
+    try:
+        discord_send(fmt_daily_challenge())
     except Exception as e:
         logger.warning(f"[Challenge] Discord post failed: {e}")
 
