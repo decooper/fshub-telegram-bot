@@ -23,6 +23,7 @@ from core import (
     db_execute, tg_send, discord_send, logger, MONTH_NAMES,
     session, TG_BASE, CHAT_ID,
 )
+import airports as A
 
 # ─── Константы ──────────────────────────────────────────────────
 ROUTES_FILE         = os.path.join(os.path.dirname(__file__), "routes.txt")
@@ -197,9 +198,13 @@ def fmt_daily_challenge():
     ]
     for pk in picks:
         r = pk["route"]
+        intl = " 🌍" if A.is_international(r.dep, r.arr) else ""
         lines.append(f"{pk['label']} · <b>+{pk['points']}</b> очков")
-        lines.append(f"<b>{r.flight_no}</b> · {r.dep} → {r.arr}")
-        lines.append(f"⏱ ~{_fmt_dur(pk['duration'])} · 💰 {r.price} v$")
+        lines.append(f"<b>{r.flight_no}</b> · {A.place(r.dep)} → {A.place(r.arr)}{intl}")
+        lines.append(f"⏱ ~{_fmt_dur(pk['duration'])}")
+        note = A.note(r.arr) or A.note(r.dep)
+        if note:
+            lines.append(f"<i>{note}</i>")
         lines.append("")
     lines.append("━━━━━━━━━━━━━━")
     lines.append("🏅 Лидеры месяца: /challenge_top")
