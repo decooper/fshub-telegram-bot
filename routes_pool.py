@@ -19,10 +19,7 @@ from collections import namedtuple
 
 from flask import Blueprint, jsonify, request
 
-from core import (
-    db_execute, tg_send, discord_send, logger, MONTH_NAMES,
-    session, TG_BASE, CHAT_ID,
-)
+from core import db_execute, tg_send, discord_send, logger, MONTH_NAMES
 import airports as A
 
 # ─── Константы ──────────────────────────────────────────────────
@@ -198,59 +195,21 @@ def fmt_daily_challenge():
     ]
     for pk in picks:
         r = pk["route"]
-        intl = " 🌍" if A.is_international(r.dep, r.arr) else ""
         lines.append(f"{pk['label']} · <b>+{pk['points']}</b> очков")
-        lines.append(f"<b>{r.flight_no}</b> · {A.place(r.dep)} → {A.place(r.arr)}{intl}")
+        lines.append(f"<b>{r.flight_no}</b> · {A.place(r.dep)} → {A.place(r.arr)}")
         lines.append(f"⏱ ~{_fmt_dur(pk['duration'])}")
-        note = A.note(r.arr) or A.note(r.dep)
-        if note:
-            lines.append(f"<i>{note}</i>")
         lines.append("")
     lines.append("━━━━━━━━━━━━━━")
     lines.append("🏅 Лидеры месяца: /challenge_top")
     return "\n".join(lines)
 
 
-def challenge_keyboard():
-    """Инлайн-кнопки: METAR каждого аэропорта прилёта + лидеры месяца."""
-    picks = daily_challenge()
-    metar_row = [
-        {"text": f"🛬 {pk['route'].arr}",
-         "url":  f"https://metar-taf.com/{pk['route'].arr}"}
-        for pk in picks
-    ]
-    rows = []
-    if metar_row:
-        rows.append(metar_row)
-    rows.append([{"text": "🏆 Лидеры месяца", "callback_data": "cmd_challenge_top"}])
-    return {"inline_keyboard": rows}
-
-
-def send_daily_challenge(chat_id=None):
-    """Отправляет челлендж дня с инлайн-кнопками. chat_id=None → в канал."""
-    text   = fmt_daily_challenge()
-    target = str(chat_id) if chat_id else CHAT_ID
-    try:
-        session.post(
-            f"{TG_BASE}/sendMessage",
-            json={
-                "chat_id": target,
-                "text": text[:4096],
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-                "reply_markup": challenge_keyboard(),
-            },
-            timeout=20,
-        )
-    except Exception as e:
-        logger.exception(f"[Challenge] send_daily_challenge error: {e}")
-
-
 def post_daily_challenge():
     """Плановая публикация челленджа дня (00:00 UTC) — в канал + Discord."""
-    send_daily_challenge()
+    text = fmt_daily_challenge()
+    tg_send(text)
     try:
-        discord_send(fmt_daily_challenge())
+        discord_send(text)
     except Exception as e:
         logger.warning(f"[Challenge] Discord post failed: {e}")
 
