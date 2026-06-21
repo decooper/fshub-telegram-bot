@@ -1321,72 +1321,70 @@ def handle_tg_command(message: Dict):
                 )
                 return
 
-            report = fsa_get_recent_report(pilot_id, "")   # "" → самый свежий отчёт
-            if not report:
+            # Активный план рейса (текущая бронь, пока пилот летит) —
+            # тот же источник, что и обогащение вылета. НЕ закрытый отчёт.
+            status = fsa_get_pilot_status(pilot_id)
+            if not status:
                 tg_send(
-                    f"⚠️ У <b>{pilot}</b> (FSA id {pilot_id}) нет доступных отчётов.",
+                    f"⚠️ У <b>{pilot}</b> (FSA id {pilot_id}) нет активного плана "
+                    f"в FSAirlines (RLM Client не активирован?).",
                     chat_id,
                 )
                 return
 
-            dep = (report.get("dep") or "????").upper()
-            arr = (report.get("arr") or "????").upper()
-            try:
-                simrate = int(report.get("simrate", 1) or 1)
-            except (ValueError, TypeError):
-                simrate = 1
-            try:
-                rate = int(report.get("landing_rate"))
-            except (ValueError, TypeError):
-                rate = None
-            flight_no = report.get("flight_no") or "N/A"
-            ts        = report.get("ts") or "—"
+            dep = (status.get("departure") or "????").upper()
+            arr = (status.get("arrival") or "????").upper()
 
-            # Сверка с легами ивента
-            leg_info = "🔸 маршрут не входит в леги ивента"
-            leg_key  = (dep, arr)
-            if leg_key in OPERATION_LEG_MAP:
-                leg_num, leg_pts = OPERATION_LEG_MAP[leg_key]
-                p = db_op_get_pilot(pilot)
-                if not p:
-                    leg_info = (
-                        f"🔹 это <b>Leg {leg_num}</b> ({leg_pts} очк.), "
-                        f"но пилот не зарегистрирован в ивенте"
-                    )
-                elif leg_num == p["current_leg"]:
-                    leg_info = (
-                        f"✅ это <b>Leg {leg_num}</b> ({leg_pts} очк.) — "
-                        f"совпадает с текущим легом пилота"
-                    )
-                else:
-                    leg_info = (
-                        f"⚠️ это <b>Leg {leg_num}</b> ({leg_pts} очк.), "
-                        f"но пилот сейчас на Leg {p['current_leg']}"
-                    )
+            if not (_is_valid_icao(dep) and _is_valid_icao(arr)):
+                tg_send(
+                    f"⚠️ <b>{pilot}</b>: маршрут из FSA некорректен "
+                    f"(<code>{dep} → {arr}</code>) — в кэш не записан.",
+                    chat_id,
+                )
+                return
 
-            # Вердикты
-            if rate is None:
-                land_verdict = "нет данных о посадке"
-            elif rate <= -OPERATION_HARD_CRASH:
-                land_verdict = f"💥 крушение ({rate} fpm) — сброс прогресса"
-            elif rate <= -OPERATION_FAIL_RATE:
-                land_verdict = f"🔴 провал ({rate} fpm) — 0 очков"
-            else:
-                land_verdict = f"🟢 успешно ({rate} fpm)"
-            sim_verdict = (
-                f"❌ x{simrate} (> 4 — лег не засчитывается)"
-                if simrate > 4 else f"✅ x{simrate}"
+            # Номер рейса из активных рейсов
+            flt_no = "N/A"
+            for f in fsa_active_flights():
+                if str(f.get("user_id")) == str(pilot_id):
+                    flt_no = f.get("number", "N/A")
+                    break
+
+            # Состояние рейса в FSA (In Hangar = забронирован, ещё не вылетел)
+            fstate = str(status.get("flightstate") or "—")
+            not_airborne = fstate.strip().lower() in ("in hangar", "")
+            warn = ""
+            if not_airborne:
+                warn = (
+                    f"\n⚠️ <b>Внимание:</b> состояние «{fstate}» — пилот ещё "
+                    f"не вылетел. Маршрут записан, но убедись, что это "
+                    f"актуальный рейс."
+                )
+
+            # Запись в кэш вылета (БД + in-memory) — как при обычном вылете.
+            # fshub_flight_id пустой: на посадке сверка идёт по пилоту+свежести.
+            db_departure_cache_set(pilot, dep, arr, flt_no, "")
+            with _departure_cache_lock:
+                _departure_cache[pilot] = {
+                    "dep":             dep,
+                    "arr":             arr,
+                    "flight_no":       flt_no,
+                    "fshub_flight_id": "",
+                    "ts":              time.time(),
+                    "from_fsa":        True,
+                }
+            logger.info(
+                f"[Admin] departure_cache засеян вручную: {pilot} "
+                f"{dep}→{arr} flightstate={fstate}"
             )
 
             tg_send(
-                f"🔎 <b>FSA — {pilot}</b> (id {pilot_id})\n\n"
+                f"✅ <b>{pilot}</b> — маршрут записан в кэш\n\n"
+                f"🆔 Рейс: <b>{flt_no}</b>\n"
                 f"🗺 Маршрут: <b>{dep} → {arr}</b>\n"
-                f"🆔 Рейс: <b>{flight_no}</b>\n"
-                f"🛬 Посадка: {land_verdict}\n"
-                f"⏩ Ускорение: {sim_verdict}\n"
-                f"🕐 Время отчёта: {ts}\n\n"
-                f"{leg_info}\n\n"
-                f"<i>Засчёт вручную: /operation_admin leg / set</i>",
+                f"📡 Состояние: <b>{fstate}</b>{warn}\n\n"
+                f"<i>На посадке рейс обработается штатно "
+                f"(лег ивента / челлендж / обычный рейс).</i>",
                 chat_id,
             )
 
@@ -1409,7 +1407,8 @@ def handle_tg_command(message: Dict):
                 "/operation_admin set Имя Фамилия | +500\n"
                 "/operation_admin leg Имя Фамилия | 3\n"
                 "/operation_admin reset Имя Фамилия\n"
-                "/operation_admin fsa Имя Фамилия\n"
+                "/operation_admin fsa Имя Фамилия — подтянуть маршрут из FSA в кэш "
+                "(если бот не загрузил его при вылете; работает, пока пилот летит)\n"
                 "/operation_admin list",
                 chat_id,
             )
