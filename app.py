@@ -635,6 +635,21 @@ def _enrich_completed_from_fsa(
                 if legs_after >= 2 else
                 f"\n✅ Сегодня можно выполнить ещё <b>1 лег</b>"
             )
+
+            # Спец-уведомление при прибытии на остров Пасхи (Leg 10: NTGJ → SCIP)
+            easter_note = ""
+            if op_leg_num == 10:
+                easter_note = (
+                    f"\n\n━━━━━━━━━━━━━━\n"
+                    f"📡 <b>ОСТРОВ ПАСХИ — обязательная процедура</b>\n"
+                    f"Океанический переход завершён. По регламенту Профсоюза "
+                    f"на острове производится <b>смена регистрационных номеров</b> борта.\n\n"
+                    f"✉️ Направьте телеграмму о завершении перехода в Офис Профсоюза: "
+                    f"@ArtturElz\n"
+                    f"⛔ <b>До получения подтверждения дальнейший полёт запрещён.</b>\n"
+                    f"✅ Только после разрешения выполняется этап <b>SCIP → SCFA</b>."
+                )
+
             tg_send(
                 f"✅ <b>LEG {op_leg_num} ВЫПОЛНЕН — «{OPERATION_NAME}»</b>\n\n"
                 f"👨‍✈️ <b>{pilot_name}</b>\n"
@@ -643,6 +658,7 @@ def _enrich_completed_from_fsa(
                 f"⭐ Очки: {detail_str} | Итого: <b>{new_points:,}</b>\n"
                 f"➡️ Следующий: Leg {next_leg} {next_info}"
                 f"{limit_str}"
+                f"{easter_note}"
             )
             discord_send_operation(
                 title=f"✅  LEG {op_leg_num} ВЫПОЛНЕН — «{OPERATION_NAME}»",
