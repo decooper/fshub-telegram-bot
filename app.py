@@ -606,8 +606,11 @@ def _enrich_completed_from_fsa(
                 f"✈️ Последний этап: {route_dep} → {route_arr}\n"
                 f"📊 Посадка: <b>{rate} fpm</b>{simrate_str}\n"
                 f"⭐ Очки: {detail_str} | Итого: <b>{new_points:,}</b>\n\n"
-                f"🎉 Борт успешно перегнан в SBGL!\n"
-                f"✈️ Готов к следующему перегону — /operation_admin add {pilot_name} | самолёт"
+                f"🎉 Борт успешно перегнан в SBGL!\n\n"
+                f"🔄 <b>Это не конец — можно идти на новый перегон!</b>\n"
+                f"✈️ Просто вылетайте по первому этапу <b>VTBS → VVPQ</b> — "
+                f"перегон #{ferry_num + 1} начнётся автоматически, а очки "
+                f"продолжат накапливаться."
             )
             discord_send_operation(
                 title=f"🏁  ФИНИШ! — «{OPERATION_NAME}»", color=0x23A55A,
