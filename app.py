@@ -87,13 +87,6 @@ from core import (
     landing_rating,
 )
 
-# ── Маршруты / челлендж дня (модуль routes_pool.py) ──
-from routes_pool import (
-    fmt_route, fmt_daily_challenge, fmt_challenge_leaders,
-    post_daily_challenge, record_challenge_if_match,
-    init_challenge_db, challenge_bp, post_challenge_results,
-)
-
 if not BOT_TOKEN or not CHAT_ID:
     print("❌ TG_BOT_TOKEN or TG_CHAT_ID missing")
     sys.exit(1)
@@ -210,10 +203,6 @@ def tg_send_menu(chat_id) -> bool:
                             {"text": "🎯 Мастер Посадки",   "callback_data": "cmd_contest"},
                         ],
                         [
-                            {"text": "🗺 Челлендж дня",      "callback_data": "cmd_challenge"},
-                            {"text": "🏆 Лидеры челленджа",  "callback_data": "cmd_challenge_top"},
-                        ],
-                        [
                             {"text": "✈️ Операция «Тихий Вжух»", "callback_data": "cmd_operation"},
                         ],
                     ]
@@ -242,8 +231,6 @@ MENU_CALLBACKS: Dict[str, callable] = {
     "cmd_va":          fmt_va_info,
     "cmd_contest":     fmt_contest,
     "cmd_operation":   fmt_operation,
-    "cmd_challenge":     fmt_daily_challenge,
-    "cmd_challenge_top": fmt_challenge_leaders,
 }
 
 
@@ -455,7 +442,10 @@ def _enrich_completed_from_fsa(
                 f"[Enrich] Попытка {attempt}/{POLL_MAX_ATTEMPTS} — "
                 f"запрос simrate FSAirlines для '{pilot_name}'"
             )
-            report = fsa_get_recent_report(pilot_id, arrival_time)
+            report = fsa_get_recent_report(
+                pilot_id, arrival_time,
+                exp_dep=route_dep, exp_arr=route_arr,
+            )
             if report:
                 logger.info(
                     f"[Enrich] Отчёт найден за попытку {attempt}: "
@@ -606,11 +596,8 @@ def _enrich_completed_from_fsa(
                 f"✈️ Последний этап: {route_dep} → {route_arr}\n"
                 f"📊 Посадка: <b>{rate} fpm</b>{simrate_str}\n"
                 f"⭐ Очки: {detail_str} | Итого: <b>{new_points:,}</b>\n\n"
-                f"🎉 Борт успешно перегнан в SBGL!\n\n"
-                f"🔄 <b>Это не конец — можно идти на новый перегон!</b>\n"
-                f"✈️ Просто вылетайте по первому этапу <b>VTBS → VVPQ</b> — "
-                f"перегон #{ferry_num + 1} начнётся автоматически, а очки "
-                f"продолжат накапливаться."
+                f"🎉 Борт успешно перегнан в SBGL!\n"
+                f"✈️ Готов к следующему перегону — /operation_admin add {pilot_name} | самолёт"
             )
             discord_send_operation(
                 title=f"🏁  ФИНИШ! — «{OPERATION_NAME}»", color=0x23A55A,
@@ -635,21 +622,6 @@ def _enrich_completed_from_fsa(
                 if legs_after >= 2 else
                 f"\n✅ Сегодня можно выполнить ещё <b>1 лег</b>"
             )
-
-            # Спец-уведомление при прибытии на остров Пасхи (Leg 10: NTGJ → SCIP)
-            easter_note = ""
-            if op_leg_num == 10:
-                easter_note = (
-                    f"\n\n━━━━━━━━━━━━━━\n"
-                    f"📡 <b>ОСТРОВ ПАСХИ — обязательная процедура</b>\n"
-                    f"Океанический переход завершён. По регламенту Профсоюза "
-                    f"на острове производится <b>смена регистрационных номеров</b> борта.\n\n"
-                    f"✉️ Направьте телеграмму о завершении перехода в Офис Профсоюза: "
-                    f"@ArtturElz\n"
-                    f"⛔ <b>До получения подтверждения дальнейший полёт запрещён.</b>\n"
-                    f"✅ Только после разрешения выполняется этап <b>SCIP → SCFA</b>."
-                )
-
             tg_send(
                 f"✅ <b>LEG {op_leg_num} ВЫПОЛНЕН — «{OPERATION_NAME}»</b>\n\n"
                 f"👨‍✈️ <b>{pilot_name}</b>\n"
@@ -658,7 +630,6 @@ def _enrich_completed_from_fsa(
                 f"⭐ Очки: {detail_str} | Итого: <b>{new_points:,}</b>\n"
                 f"➡️ Следующий: Leg {next_leg} {next_info}"
                 f"{limit_str}"
-                f"{easter_note}"
             )
             discord_send_operation(
                 title=f"✅  LEG {op_leg_num} ВЫПОЛНЕН — «{OPERATION_NAME}»",
@@ -782,28 +753,50 @@ def handle_departure(data: Dict):
         ).start()
 
 
-def _flight_on_network(d: Dict):
+def _detect_on_network(d: Dict, arrival: Dict, user: Dict) -> tuple:
     """
-    Был ли РЕЙС выполнен в сети VATSIM/IVAO — по флагу самого полёта FSHub
-    (на сайте отображается как «Flags: VATSIM»), а НЕ по профилю пилота.
+    Определяет, выполнен ли рейс в онлайн-сети (VATSIM/IVAO).
 
-    Точное имя ключа в вебхуке не задокументировано в нашей копии FsHub API,
-    поэтому разбираем несколько вероятных форм и логируем сырое значение —
-    по первому реальному онлайн-рейсу зафиксируем точный ключ.
-    Возвращает (on_network: bool, raw_value) для лога.
+    Источники по приоритету:
+      1) Флаги самого РЕЙСА из вебхука FsHub (поле flags) — это и есть
+         «Flags: VATSIM» со страницы отчёта. Может прийти строкой ("VATSIM"),
+         списком (["VATSIM"]) или словарём ({"vatsim": true}).
+      2) Резерв — привязка VATSIM/IVAO ID в профиле пилота (user.handles).
+         Слабый признак (аккаунт привязан, но рейс мог быть оффлайн),
+         поэтому используется только если флага рейса нет.
+
+    Возвращает (on_network: bool, flags_raw: str) — flags_raw пишем в лог,
+    чтобы видеть, что реально прислал FsHub.
     """
-    raw = d.get("flags")
-    if raw is None:
-        raw = d.get("flag") or d.get("network") or d.get("networks")
-    if isinstance(raw, (list, tuple)):
-        text = " ".join(str(x) for x in raw)
-    elif isinstance(raw, dict):
-        text = " ".join(f"{k}={v}" for k, v in raw.items())
-    else:
-        text = str(raw or "")
-    t = text.lower()
-    on = ("vatsim" in t) or ("ivao" in t)
-    return on, raw
+    flags_raw = (
+        d.get("flags")
+        or arrival.get("flags")
+        or (d.get("flight") or {}).get("flags")
+    )
+
+    def _has_net(value) -> bool:
+        if not value:
+            return False
+        if isinstance(value, dict):
+            for k, v in value.items():
+                if str(k).lower() in ("vatsim", "ivao") and v:
+                    return True
+                if isinstance(v, str) and v.upper() in ("VATSIM", "IVAO"):
+                    return True
+            return False
+        if isinstance(value, (list, tuple, set)):
+            return any(_has_net(x) for x in value)
+        text = str(value).upper()
+        return "VATSIM" in text or "IVAO" in text
+
+    if _has_net(flags_raw):
+        return True, str(flags_raw)
+
+    handles = user.get("handles") or {}
+    if handles.get("vatsim") or handles.get("ivao"):
+        return True, f"handles({flags_raw})"
+
+    return False, str(flags_raw)
 
 
 def handle_completed(data: Dict):
@@ -854,12 +847,18 @@ def handle_completed(data: Dict):
 
     with _departure_cache_lock:
         cache_entry = _departure_cache.get(pilot_name)
+        # Проверяем что in-memory кэш от этого же рейса
+        if cache_entry and report_id:
+            if cache_entry.get("fshub_flight_id") and \
+               cache_entry["fshub_flight_id"] != report_id:
+                logger.info(
+                    f"[Cache] In-memory кэш для '{pilot_name}' от другого рейса — игнорируем"
+                )
+                cache_entry = None
 
-    # Если in-memory кэш пуст — читаем из БД.
-    # Ревизия 3.1: сверка по пилоту + свежести, БЕЗ fshub_flight_id
-    # (id вылета и id отчёта — из разных пространств, никогда не совпадают).
+    # Если in-memory кэш пуст или не совпал — читаем из БД с проверкой flight_id
     if not cache_entry:
-        cache_entry = db_departure_cache_get(pilot_name)
+        cache_entry = db_departure_cache_get(pilot_name, fshub_flight_id=report_id)
 
     if (
         cache_entry
@@ -904,9 +903,6 @@ def handle_completed(data: Dict):
         landing_rate=rate,
         profit=None,
     )
-
-    # ── 3b. Зачёт челленджа дня (если маршрут совпал) ──────────
-    record_challenge_if_match(pilot_name, dep, arr)
 
     # ── 4. Сообщение о посадке ─────────────────────────────────
     flight_link = (
@@ -978,9 +974,9 @@ def handle_completed(data: Dict):
     op_leg_pts       = None
     op_report_url    = f"https://fshub.io/flight/{report_id}/report" if report_id else ""
     op_aircraft_icao = (d.get("aircraft") or {}).get("icao") or aircraft_name
-    op_on_network, _net_raw = _flight_on_network(d)
+    op_on_network, _flags_raw = _detect_on_network(d, arrival, user)
     logger.info(
-        f"[Operation] {pilot_name} flags_raw={_net_raw!r} on_network={op_on_network}"
+        f"[Operation] {pilot_name} flags_raw={_flags_raw} on_network={op_on_network}"
     )
 
     if operation_is_active() and route_from == "fsa_cache":
@@ -1196,9 +1192,6 @@ COMMANDS = {
     "/live":        fmt_active_flights,
     "/va":          fmt_va_info,
     "/operation":   fmt_operation,
-    "/route":          fmt_route,
-    "/challenge":      fmt_daily_challenge,
-    "/challenge_top":  fmt_challenge_leaders,
 }
 
 # Скомпилированный паттерн для валидации YYYY-MM (один раз на уровне модуля)
@@ -1324,89 +1317,6 @@ def handle_tg_command(message: Dict):
             db_op_reset_pilot(pilot)
             tg_send(f"✅ Прогресс <b>{pilot}</b> сброшен.", chat_id)
 
-        elif sub == "fsa":
-            rest  = text.split(None, 2)[2] if len(text.split(None, 2)) > 2 else ""
-            pilot = rest.strip()
-            if not pilot:
-                tg_send("Использование: /operation_admin fsa Имя Фамилия", chat_id)
-                return
-
-            pilot_id = fsa_get_pilot_id(pilot)
-            if not pilot_id:
-                tg_send(
-                    f"❌ Пилот <b>{pilot}</b> не найден в FSAirlines "
-                    f"(ни UP!, ни Профсоюз).",
-                    chat_id,
-                )
-                return
-
-            # Активный план рейса (текущая бронь, пока пилот летит) —
-            # тот же источник, что и обогащение вылета. НЕ закрытый отчёт.
-            status = fsa_get_pilot_status(pilot_id)
-            if not status:
-                tg_send(
-                    f"⚠️ У <b>{pilot}</b> (FSA id {pilot_id}) нет активного плана "
-                    f"в FSAirlines (RLM Client не активирован?).",
-                    chat_id,
-                )
-                return
-
-            dep = (status.get("departure") or "????").upper()
-            arr = (status.get("arrival") or "????").upper()
-
-            if not (_is_valid_icao(dep) and _is_valid_icao(arr)):
-                tg_send(
-                    f"⚠️ <b>{pilot}</b>: маршрут из FSA некорректен "
-                    f"(<code>{dep} → {arr}</code>) — в кэш не записан.",
-                    chat_id,
-                )
-                return
-
-            # Номер рейса из активных рейсов
-            flt_no = "N/A"
-            for f in fsa_active_flights():
-                if str(f.get("user_id")) == str(pilot_id):
-                    flt_no = f.get("number", "N/A")
-                    break
-
-            # Состояние рейса в FSA (In Hangar = забронирован, ещё не вылетел)
-            fstate = str(status.get("flightstate") or "—")
-            not_airborne = fstate.strip().lower() in ("in hangar", "")
-            warn = ""
-            if not_airborne:
-                warn = (
-                    f"\n⚠️ <b>Внимание:</b> состояние «{fstate}» — пилот ещё "
-                    f"не вылетел. Маршрут записан, но убедись, что это "
-                    f"актуальный рейс."
-                )
-
-            # Запись в кэш вылета (БД + in-memory) — как при обычном вылете.
-            # fshub_flight_id пустой: на посадке сверка идёт по пилоту+свежести.
-            db_departure_cache_set(pilot, dep, arr, flt_no, "")
-            with _departure_cache_lock:
-                _departure_cache[pilot] = {
-                    "dep":             dep,
-                    "arr":             arr,
-                    "flight_no":       flt_no,
-                    "fshub_flight_id": "",
-                    "ts":              time.time(),
-                    "from_fsa":        True,
-                }
-            logger.info(
-                f"[Admin] departure_cache засеян вручную: {pilot} "
-                f"{dep}→{arr} flightstate={fstate}"
-            )
-
-            tg_send(
-                f"✅ <b>{pilot}</b> — маршрут записан в кэш\n\n"
-                f"🆔 Рейс: <b>{flt_no}</b>\n"
-                f"🗺 Маршрут: <b>{dep} → {arr}</b>\n"
-                f"📡 Состояние: <b>{fstate}</b>{warn}\n\n"
-                f"<i>На посадке рейс обработается штатно "
-                f"(лег ивента / челлендж / обычный рейс).</i>",
-                chat_id,
-            )
-
         elif sub == "list":
             pilots = db_op_all_pilots()
             if not pilots:
@@ -1426,8 +1336,6 @@ def handle_tg_command(message: Dict):
                 "/operation_admin set Имя Фамилия | +500\n"
                 "/operation_admin leg Имя Фамилия | 3\n"
                 "/operation_admin reset Имя Фамилия\n"
-                "/operation_admin fsa Имя Фамилия — подтянуть маршрут из FSA в кэш "
-                "(если бот не загрузил его при вылете; работает, пока пилот летит)\n"
                 "/operation_admin list",
                 chat_id,
             )
@@ -1544,27 +1452,12 @@ def init_scheduler():
         "cron", hour=21, minute=0,
         id="daily_stats",
     )
-    scheduler.add_job(
-        post_daily_challenge,
-        "cron", hour=0, minute=0,         # 00:00 UTC
-        id="daily_challenge",
-    )
-    scheduler.add_job(
-        post_challenge_results,
-        "cron", day=1, hour=0, minute=1,  # 1-го числа 00:01 UTC — итоги прошлого месяца
-        id="monthly_challenge_results",
-    )
 
     # ─── Еженедельные задачи ────────────────────────────────────
     scheduler.add_job(
         lambda: tg_send(fmt_top_landings()),
         "cron", day_of_week="sun", hour=12, minute=0,
         id="weekly_landing_ranking",
-    )
-    scheduler.add_job(
-        lambda: tg_send(fmt_challenge_leaders()),
-        "cron", day_of_week="sun", hour=12, minute=30,
-        id="weekly_challenge_leaders",
     )
     scheduler.add_job(
         lambda: tg_send(fmt_operation_digest()) if operation_is_active() else None,
@@ -1883,8 +1776,6 @@ def api_contest():
 try:
     _create_pool()
     _init_db()
-    init_challenge_db()
-    app.register_blueprint(challenge_bp)
     tg_setup_webhook()
     init_scheduler()
 except Exception as e:
