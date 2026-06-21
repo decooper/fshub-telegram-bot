@@ -744,3 +744,4 @@ def place(icao: str) -> str:
 
 def is_international(dep: str, arr: str) -> bool:
     return country_iso(dep) != _RU or country_iso(arr) != _RU
+
