@@ -939,6 +939,7 @@ OPERATION_AIRCRAFT_COEFF: Dict[str, float] = {
     "B772":  1.0,  # Boeing 777-200ER
     "B773":  1.0,
     "CRJ7":  1.5,
+    "F28":   1.8,   # Fokker F28 Fellowship (ICAO F28)
     "MD11":  1.1,
 }
 OPERATION_VATSIM_BONUS = 50
@@ -970,6 +971,9 @@ def op_get_aircraft_coeff(aircraft_icao: str) -> float:
         ("727",    2.0),   # Boeing 727
         ("ATR",    2.5),   # ATR-42/72
         ("CRJ",    1.5),   # CRJ-700/900
+        ("F28",    1.8),   # Fokker F28 ICAO
+        ("FOKKER", 1.8),   # Fokker F28 полное название
+        ("F-28",   1.8),   # Fokker F-28 с дефисом
         ("MD-11",  1.1),   # MD-11
         ("MD11",   1.1),   # MD11
         ("MAX",    1.3),   # B737 MAX (до 737!)
