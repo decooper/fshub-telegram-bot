@@ -1310,27 +1310,50 @@ def handle_tg_command(message: Dict):
         elif sub == "leg":
             rest = text.split(None, 2)[2] if len(text.split(None, 2)) > 2 else ""
             if "|" not in rest:
-                tg_send("Использование: /operation_admin leg Имя Фамилия | 3", chat_id)
+                tg_send(
+                    "Использование: /operation_admin leg Имя Фамилия | 3\n\n"
+                    "Число — это <b>сколько легов уже завершено</b> "
+                    "(бар прогресса станет N/13). Пилот будет лететь следующий, N+1.",
+                    chat_id,
+                )
                 return
             pilot_part, leg_part = rest.split("|", 1)
             pilot = pilot_part.strip()
             try:
-                leg = int(leg_part.strip())
+                done = int(leg_part.strip())
             except ValueError:
-                tg_send("Номер лега должен быть числом.", chat_id)
+                tg_send("Число завершённых легов должно быть числом.", chat_id)
                 return
-            if not 1 <= leg <= len(OPERATION_LEGS) + 1:
-                tg_send(f"Номер лега: 1–{len(OPERATION_LEGS)}.", chat_id)
+            if not 0 <= done <= len(OPERATION_LEGS):
+                tg_send(f"Завершённых легов: 0–{len(OPERATION_LEGS)}.", chat_id)
                 return
             p = db_op_get_pilot(pilot)
             if not p:
                 tg_send(f"Пилот <b>{pilot}</b> не найден.", chat_id)
                 return
+
+            new_current_leg = done + 1   # current_leg = номер ПРЕДСТОЯЩЕГО лега
+            is_finished      = done >= len(OPERATION_LEGS)
+            new_status       = "finished" if is_finished else "active"
+
             db_execute(
-                "UPDATE operation_pilots SET current_leg = %s WHERE pilot_name = %s",
-                (leg, pilot),
+                "UPDATE operation_pilots SET current_leg = %s, status = %s "
+                "WHERE pilot_name = %s",
+                (new_current_leg, new_status, pilot),
             )
-            tg_send(f"✅ <b>{pilot}</b>: текущий лег установлен на <b>{leg}</b>.", chat_id)
+
+            if is_finished:
+                tg_send(
+                    f"✅ <b>{pilot}</b>: завершено <b>{done}/{len(OPERATION_LEGS)}</b> "
+                    f"легов — перегон помечен как <b>finished</b>.",
+                    chat_id,
+                )
+            else:
+                tg_send(
+                    f"✅ <b>{pilot}</b>: завершено <b>{done}/{len(OPERATION_LEGS)}</b> "
+                    f"легов. Следующий — <b>Leg {new_current_leg}</b>.",
+                    chat_id,
+                )
 
         elif sub == "reset":
             rest  = text.split(None, 2)[2] if len(text.split(None, 2)) > 2 else ""
@@ -1445,7 +1468,8 @@ def handle_tg_command(message: Dict):
                 "📋 <b>Команды администратора:</b>\n\n"
                 "/operation_admin add Имя Фамилия | B738\n"
                 "/operation_admin set Имя Фамилия | +500\n"
-                "/operation_admin leg Имя Фамилия | 3\n"
+                "/operation_admin leg Имя Фамилия | 3 — указать, сколько легов "
+                "ЗАВЕРШЕНО (бар станет 3/13, далее полетит Leg 4)\n"
                 "/operation_admin reset Имя Фамилия\n"
                 "/operation_admin fsa Имя Фамилия — подтянуть маршрут из FSA в кэш "
                 "(если бот не загрузил его при вылете; работает, пока пилот летит)\n"
