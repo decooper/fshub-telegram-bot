@@ -457,13 +457,26 @@ def _enrich_completed_from_fsa(
             )
             report = fsa_get_recent_report(pilot_id, arrival_time)
             if report:
-                logger.info(
-                    f"[Enrich] Отчёт найден за попытку {attempt}: "
-                    f"FSA={report.get('dep')}→{report.get('arr')} "
-                    f"simrate={report.get('simrate')} "
-                    f"(маршрут ивента из кэша: {route_dep}→{route_arr})"
-                )
-                break
+                rep_dep = (report.get("dep") or "").upper()
+                rep_arr = (report.get("arr") or "").upper()
+                if rep_dep != route_dep.upper() or rep_arr != route_arr.upper():
+                    # Отчёт FSA не про этот рейс (например, ещё не сгенерирован
+                    # и вернулся отчёт по предыдущему полёту пилота) — это НЕ
+                    # найденный отчёт, а промах; продолжаем ждать нужный.
+                    logger.warning(
+                        f"[Enrich] Отчёт FSA не совпадает с ожидаемым легом: "
+                        f"получен {rep_dep}→{rep_arr}, ожидался {route_dep}→{route_arr} "
+                        f"— игнорирую, жду дальше"
+                    )
+                    report = None
+                else:
+                    logger.info(
+                        f"[Enrich] Отчёт найден за попытку {attempt}: "
+                        f"FSA={report.get('dep')}→{report.get('arr')} "
+                        f"simrate={report.get('simrate')} "
+                        f"(маршрут ивента из кэша: {route_dep}→{route_arr})"
+                    )
+                    break
             if attempt < POLL_MAX_ATTEMPTS:
                 logger.info(f"[Enrich] Следующая попытка через {POLL_INTERVAL // 60} мин")
                 time.sleep(POLL_INTERVAL)
