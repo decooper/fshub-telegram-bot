@@ -1858,6 +1858,19 @@ def fmt_contest(month: Optional[str] = None) -> str:
     return header + "\n\n".join(blocks) + footer
 
 
+def _ferry_label(ferry_num: int) -> str:
+    """
+    Наглядная подпись перегона. Для первого — пусто (не загромождаем).
+    Для второго и далее — явно показываем, сколько уже завершено:
+    'Перегон #2 (завершено: 1)', 'Перегон #3 (завершено: 2)' и т.д.
+    Безличная форма «завершено: N» — не требует согласования числительных.
+    """
+    n = ferry_num or 1
+    if n <= 1:
+        return ""
+    return f" • Перегон #{n} (завершено: {n - 1})"
+
+
 def fmt_operation() -> str:
     pilots     = db_op_all_pilots()
     total_legs = len(OPERATION_LEGS)
@@ -1884,7 +1897,7 @@ def fmt_operation() -> str:
         leg_str   = f"{legs_done}/{total_legs} легов"
         bar        = "█" * legs_done + "░" * (total_legs - legs_done)
         aircraft   = f" ({p['aircraft']})" if p.get("aircraft") else ""
-        ferry_str  = f" • Перегон #{p['ferry_num']}" if p.get("ferry_num", 1) > 1 else ""
+        ferry_str  = _ferry_label(p.get("ferry_num", 1))
         lines.append(
             f"{prefix} {status} <b>{p['pilot_name']}</b>{aircraft}{ferry_str}\n"
             f"   {bar} {pts_str} | {leg_str}"
@@ -1909,7 +1922,7 @@ def fmt_operation_digest() -> str:
     if finished:
         msg += f"🏁 <b>Финишировали ({len(finished)}):</b>\n"
         for p in finished:
-            ferry_str = f" • Перегон #{p['ferry_num']}" if p.get("ferry_num", 1) > 1 else ""
+            ferry_str = _ferry_label(p.get("ferry_num", 1))
             msg += f"  ✅ {p['pilot_name']}{ferry_str} — {p['total_points']:,} очк.\n"
         msg += "\n"
     if active:
@@ -1919,7 +1932,7 @@ def fmt_operation_digest() -> str:
                 (f"Leg {n}: {dep}→{arr}" for n, dep, arr, _ in OPERATION_LEGS if n == p["current_leg"]),
                 "завершён"
             )
-            ferry_str = f" • Перегон #{p['ferry_num']}" if p.get("ferry_num", 1) > 1 else ""
+            ferry_str = _ferry_label(p.get("ferry_num", 1))
             msg += f"  • {p['pilot_name']}{ferry_str} | {next_leg} | {p['total_points']:,} очк.\n"
     if not pilots:
         msg += "Участников пока нет."
