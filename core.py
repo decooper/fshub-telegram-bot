@@ -1858,17 +1858,24 @@ def fmt_contest(month: Optional[str] = None) -> str:
     return header + "\n\n".join(blocks) + footer
 
 
-def _ferry_label(ferry_num: int) -> str:
+def _ferry_info(ferry_num: int, status: str = "active") -> tuple:
     """
-    Наглядная подпись перегона. Для первого — пусто (не загромождаем).
-    Для второго и далее — явно показываем, сколько уже завершено:
-    'Перегон #2 (завершено: 1)', 'Перегон #3 (завершено: 2)' и т.д.
-    Безличная форма «завершено: N» — не требует согласования числительных.
+    (done, label) для отображения прогресса по перегонам.
+
+    ferry_num — перегон, который пилот ТЕКУЩИЙ (active) либо ТОЛЬКО ЧТО
+    ЗАКОНЧИЛ (finished). Число завершённых считается по-разному:
+      - status == "finished": завершено = ferry_num (включая текущий)
+      - иначе (active/lost):  завершено = ferry_num - 1 (текущий в процессе)
+
+    label — короткая подпись 'Перегон #N/done' (пусто для самого первого
+    перегона, чтобы не загромождать обычный случай).
+    done возвращается всегда — по нему решаем, ставить ли ✅ пилоту,
+    который хоть раз перегнал (даже если сейчас снова в пути).
     """
-    n = ferry_num or 1
-    if n <= 1:
-        return ""
-    return f" • Перегон #{n} (завершено: {n - 1})"
+    n    = ferry_num or 1
+    done = n if status == "finished" else n - 1
+    label = f" • Перегон #{n}/{done}" if n > 1 else ""
+    return done, label
 
 
 def fmt_operation() -> str:
@@ -1889,7 +1896,15 @@ def fmt_operation() -> str:
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     for i, p in enumerate(pilots, 1):
         prefix    = medals.get(i, f"{i}.")
-        status    = "✅" if p["status"] == "finished" else ("💀" if p["status"] == "lost" else "🛫")
+        ferry_num = p.get("ferry_num", 1)
+        done, ferry_str = _ferry_info(ferry_num, p["status"])
+        if p["status"] == "lost":
+            status = "💀"
+        elif p["status"] == "finished" or done >= 1:
+            # ✅ — статус «хоть раз перегнал», даже если сейчас снова в пути
+            status = "✅"
+        else:
+            status = "🛫"
         pts_str   = f"{p['total_points']:,} очк."
         legs_done = max(0, p["current_leg"] - 1)
         if p["status"] == "finished":
@@ -1897,7 +1912,6 @@ def fmt_operation() -> str:
         leg_str   = f"{legs_done}/{total_legs} легов"
         bar        = "█" * legs_done + "░" * (total_legs - legs_done)
         aircraft   = f" ({p['aircraft']})" if p.get("aircraft") else ""
-        ferry_str  = _ferry_label(p.get("ferry_num", 1))
         lines.append(
             f"{prefix} {status} <b>{p['pilot_name']}</b>{aircraft}{ferry_str}\n"
             f"   {bar} {pts_str} | {leg_str}"
@@ -1922,7 +1936,7 @@ def fmt_operation_digest() -> str:
     if finished:
         msg += f"🏁 <b>Финишировали ({len(finished)}):</b>\n"
         for p in finished:
-            ferry_str = _ferry_label(p.get("ferry_num", 1))
+            _, ferry_str = _ferry_info(p.get("ferry_num", 1), "finished")
             msg += f"  ✅ {p['pilot_name']}{ferry_str} — {p['total_points']:,} очк.\n"
         msg += "\n"
     if active:
@@ -1932,8 +1946,9 @@ def fmt_operation_digest() -> str:
                 (f"Leg {n}: {dep}→{arr}" for n, dep, arr, _ in OPERATION_LEGS if n == p["current_leg"]),
                 "завершён"
             )
-            ferry_str = _ferry_label(p.get("ferry_num", 1))
-            msg += f"  • {p['pilot_name']}{ferry_str} | {next_leg} | {p['total_points']:,} очк.\n"
+            done, ferry_str = _ferry_info(p.get("ferry_num", 1), "active")
+            bullet = "✅" if done >= 1 else "•"   # хоть раз перегнал — ✅, даже в пути
+            msg += f"  {bullet} {p['pilot_name']}{ferry_str} | {next_leg} | {p['total_points']:,} очк.\n"
     if not pilots:
         msg += "Участников пока нет."
     return msg
