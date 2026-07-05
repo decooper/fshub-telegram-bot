@@ -1909,7 +1909,8 @@ def fmt_operation_digest() -> str:
     if finished:
         msg += f"🏁 <b>Финишировали ({len(finished)}):</b>\n"
         for p in finished:
-            msg += f"  ✅ {p['pilot_name']} — {p['total_points']:,} очк.\n"
+            ferry_str = f" • Перегон #{p['ferry_num']}" if p.get("ferry_num", 1) > 1 else ""
+            msg += f"  ✅ {p['pilot_name']}{ferry_str} — {p['total_points']:,} очк.\n"
         msg += "\n"
     if active:
         msg += f"🛫 <b>В пути ({len(active)}):</b>\n"
@@ -1918,7 +1919,8 @@ def fmt_operation_digest() -> str:
                 (f"Leg {n}: {dep}→{arr}" for n, dep, arr, _ in OPERATION_LEGS if n == p["current_leg"]),
                 "завершён"
             )
-            msg += f"  • {p['pilot_name']} | {next_leg} | {p['total_points']:,} очк.\n"
+            ferry_str = f" • Перегон #{p['ferry_num']}" if p.get("ferry_num", 1) > 1 else ""
+            msg += f"  • {p['pilot_name']}{ferry_str} | {next_leg} | {p['total_points']:,} очк.\n"
     if not pilots:
         msg += "Участников пока нет."
     return msg
