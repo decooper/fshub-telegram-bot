@@ -1464,6 +1464,13 @@ def handle_tg_command(message: Dict):
                 chat_id,
             )
 
+        elif sub == "digest":
+            if not operation_is_active():
+                tg_send("⚠️ Ивент сейчас не активен — дайджест не отправлен.", chat_id)
+                return
+            tg_send(fmt_operation_digest())
+            tg_send("✅ Дайджест отправлен вручную.", chat_id)
+
         elif sub == "list":
             pilots = db_op_all_pilots()
             if not pilots:
@@ -1486,6 +1493,7 @@ def handle_tg_command(message: Dict):
                 "/operation_admin reset Имя Фамилия\n"
                 "/operation_admin fsa Имя Фамилия — подтянуть маршрут из FSA в кэш "
                 "(если бот не загрузил его при вылете; работает, пока пилот летит)\n"
+                "/operation_admin digest — отправить дайджест ивента вручную\n"
                 "/operation_admin list",
                 chat_id,
             )
