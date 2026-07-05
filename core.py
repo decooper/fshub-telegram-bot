@@ -1867,14 +1867,15 @@ def _ferry_info(ferry_num: int, status: str = "active") -> tuple:
       - status == "finished": завершено = ferry_num (включая текущий)
       - иначе (active/lost):  завершено = ferry_num - 1 (текущий в процессе)
 
-    label — короткая подпись 'Перегон #N/done' (пусто для самого первого
-    перегона, чтобы не загромождать обычный случай).
+    label — короткая подпись 'Перегон #N/done', показывается ВСЕГДА
+    (включая обычный случай #1/1 или #1/0), чтобы прогресс был виден
+    единообразно у всех пилотов, а не только у тех, кто на 2+ перегоне.
     done возвращается всегда — по нему решаем, ставить ли ✅ пилоту,
     который хоть раз перегнал (даже если сейчас снова в пути).
     """
-    n    = ferry_num or 1
-    done = n if status == "finished" else n - 1
-    label = f" • Перегон #{n}/{done}" if n > 1 else ""
+    n     = ferry_num or 1
+    done  = n if status == "finished" else n - 1
+    label = f" • Перегон #{n}/{done}"
     return done, label
 
 
@@ -1948,13 +1949,10 @@ def fmt_operation_digest() -> str:
             )
             done, ferry_str = _ferry_info(p.get("ferry_num", 1), "active")
             bullet = "✅" if done >= 1 else "•"   # хоть раз перегнал — ✅, даже в пути
-            if ferry_str:
-                # с меткой перегона строка длинная — переносим на 2 строки,
-                # иначе Telegram рвёт её посередине на мобильных экранах
-                msg += f"  {bullet} {p['pilot_name']}{ferry_str}\n"
-                msg += f"     {next_leg} | {p['total_points']:,} очк.\n"
-            else:
-                msg += f"  {bullet} {p['pilot_name']} | {next_leg} | {p['total_points']:,} очк.\n"
+            # Метка перегона всегда есть -> всегда 2 строки, чтобы длинная
+            # строка не рвалась посередине на мобильных экранах Telegram.
+            msg += f"  {bullet} {p['pilot_name']}{ferry_str}\n"
+            msg += f"     {next_leg} | {p['total_points']:,} очк.\n"
     if not pilots:
         msg += "Участников пока нет."
     return msg
