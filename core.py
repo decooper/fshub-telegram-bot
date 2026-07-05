@@ -1948,7 +1948,13 @@ def fmt_operation_digest() -> str:
             )
             done, ferry_str = _ferry_info(p.get("ferry_num", 1), "active")
             bullet = "✅" if done >= 1 else "•"   # хоть раз перегнал — ✅, даже в пути
-            msg += f"  {bullet} {p['pilot_name']}{ferry_str} | {next_leg} | {p['total_points']:,} очк.\n"
+            if ferry_str:
+                # с меткой перегона строка длинная — переносим на 2 строки,
+                # иначе Telegram рвёт её посередине на мобильных экранах
+                msg += f"  {bullet} {p['pilot_name']}{ferry_str}\n"
+                msg += f"     {next_leg} | {p['total_points']:,} очк.\n"
+            else:
+                msg += f"  {bullet} {p['pilot_name']} | {next_leg} | {p['total_points']:,} очк.\n"
     if not pilots:
         msg += "Участников пока нет."
     return msg
