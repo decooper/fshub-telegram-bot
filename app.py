@@ -421,26 +421,109 @@ def _enrich_completed_from_fsa(
     Опрашивает FSAirlines ТОЛЬКО для получения simrate.
     Маршрут берётся из кэша вылета (cached_dep/arr) — не из FSAirlines отчёта.
     Это исключает подмену маршрута чужим или старым рейсом.
-    """
-    POLL_INTERVAL     = 300
-    POLL_MAX_ATTEMPTS = 12
 
+    Крушение и провал лега определяются ТОЛЬКО по landing_rate — simrate
+    (ускорение) на них никак не влияет (очки всё равно 0), поэтому эти два
+    случая обрабатываются СРАЗУ, без ожидания и опроса FSAirlines (который
+    может занимать до часа при недоступном/несовпадающем отчёте). Опрос FSA
+    нужен только для проверки успешной посадки на читерское ускорение.
+    """
     route_dep   = cached_dep or "????"
     route_arr   = cached_arr or "????"
     route_known = _is_valid_icao(route_dep) and _is_valid_icao(route_arr)
+    route_str   = f"{route_dep} → {route_arr}" if route_known else "не определён"
 
-    time.sleep(delay)
-
-    # Если нет лега ивента — FSAirlines не нужен
-    if op_leg_num is None:
-        route_str = f"{route_dep} → {route_arr}" if route_known else "не определён"
+    def _edit_now():
         _edit_landing_msg(
             message_id, chat_id_str, emoji, pilot_name, cached_flight_no,
             route_str, airport_name, aircraft_name, rate, rating, extras, flight_link,
         )
+
+    # Если нет лега ивента — FSAirlines не нужен вообще
+    if op_leg_num is None:
+        _edit_now()
         return
 
-    # Для ивента нужен simrate — опрашиваем FSAirlines
+    # ── Крушение / провал — решаем СРАЗУ по rate, не дожидаясь FSA ──────
+    if operation_is_active() and rate <= -OPERATION_FAIL_RATE:
+        _edit_now()
+
+        op_pilot = db_op_get_pilot(pilot_name)
+        if not op_pilot or op_pilot["status"] != "active":
+            return
+
+        allowed, legs_today = db_op_check_daily_limit(pilot_name)
+        if not allowed:
+            tg_send(
+                f"⏳ <b>ЛИМИТ ЛЕГОВ — ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
+                f"👨‍✈️ <b>{pilot_name}</b>\n"
+                f"✈️ Leg {op_leg_num}: {route_dep} → {route_arr}\n\n"
+                f"❌ Сегодня уже выполнено <b>2 лега</b>.\n"
+                f"🕛 Счётчик сбросится в <b>00:00 UTC (03:00 МСК)</b>"
+            )
+            discord_send_operation(
+                title=f"⏳  ЛИМИТ ЛЕГОВ — «{OPERATION_NAME}»",
+                color=0xF0A332,
+                fields=[
+                    {"name": "Пилот",  "value": pilot_name, "inline": True},
+                    {"name": "Лег",    "value": f"Leg {op_leg_num}: {route_dep} → {route_arr}", "inline": True},
+                    {"name": "Статус", "value": "Сегодня уже 2 лега. Сброс в 00:00 UTC (03:00 МСК)", "inline": False},
+                ],
+            )
+            logger.info(f"[Operation] {pilot_name} leg={op_leg_num} — дневной лимит")
+            return
+
+        if rate <= -OPERATION_HARD_CRASH:
+            db_op_add_leg(pilot_name, op_leg_num, route_dep, route_arr, rate,
+                          0, flight_id_for_db or "", op_report_url)
+            db_op_reset_pilot(pilot_name)
+            tg_send(
+                f"💥 <b>КРУШЕНИЕ — ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
+                f"👨‍✈️ <b>{pilot_name}</b>\n"
+                f"✈️ Leg {op_leg_num}: {route_dep} → {route_arr}\n"
+                f"📊 Посадка: <b>{rate} fpm</b>\n\n"
+                f"⚠️ Борт утерян. Весь прогресс сброшен.\nПилот начинает с Leg 1."
+            )
+            discord_send_operation(
+                title=f"💥  КРУШЕНИЕ — «{OPERATION_NAME}»", color=0xED4245,
+                fields=[
+                    {"name": "Пилот",   "value": pilot_name,    "inline": True},
+                    {"name": "Этап",    "value": f"Leg {op_leg_num}: {route_dep} → {route_arr}", "inline": True},
+                    {"name": "Посадка", "value": f"{rate} fpm", "inline": True},
+                    {"name": "Статус",  "value": "Борт утерян. Прогресс сброшен. Начинает с Leg 1.", "inline": False},
+                ],
+            )
+        else:
+            db_op_add_leg(pilot_name, op_leg_num, route_dep, route_arr, rate,
+                          0, flight_id_for_db or "", op_report_url)
+            tg_send(
+                f"🔴 <b>ЭТАП ПРОВАЛЕН — ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
+                f"👨‍✈️ <b>{pilot_name}</b>\n"
+                f"✈️ Leg {op_leg_num}: {route_dep} → {route_arr}\n"
+                f"📊 Посадка: <b>{rate} fpm</b> — слишком жёстко!\n\n"
+                f"❌ Очки не начислены. Повторите Leg {op_leg_num}."
+            )
+            discord_send_operation(
+                title=f"🔴  ЭТАП ПРОВАЛЕН — «{OPERATION_NAME}»", color=0xED4245,
+                fields=[
+                    {"name": "Пилот",   "value": pilot_name,    "inline": True},
+                    {"name": "Этап",    "value": f"Leg {op_leg_num}: {route_dep} → {route_arr}", "inline": True},
+                    {"name": "Посадка", "value": f"{rate} fpm — слишком жёстко!", "inline": True},
+                    {"name": "Статус",  "value": f"Очки не начислены. Повторите Leg {op_leg_num}.", "inline": False},
+                ],
+            )
+        logger.info(
+            f"[Operation] {pilot_name} leg={op_leg_num} rate={rate} — "
+            f"crash/fail обработан немедленно, без опроса FSA"
+        )
+        return
+
+    # ── Обычная посадка (rate в норме) — нужен simrate, опрашиваем FSAirlines ──
+    POLL_INTERVAL     = 300
+    POLL_MAX_ATTEMPTS = 12
+
+    time.sleep(delay)
+
     pilot_id = fsa_get_pilot_id(pilot_name)
     simrate  = 1
     attempt  = 0
@@ -496,11 +579,7 @@ def _enrich_completed_from_fsa(
             )
 
     # Редактируем сообщение с маршрутом из кэша вылета
-    route_str = f"{route_dep} → {route_arr}" if route_known else "не определён"
-    _edit_landing_msg(
-        message_id, chat_id_str, emoji, pilot_name, cached_flight_no,
-        route_str, airport_name, aircraft_name, rate, rating, extras, flight_link,
-    )
+    _edit_now()
 
     # Засчёт лега ивента
     MAX_SIMRATE = 4
@@ -552,139 +631,101 @@ def _enrich_completed_from_fsa(
         logger.info(f"[Operation] {pilot_name} leg={op_leg_num} — дневной лимит")
         return
 
-    if rate <= -OPERATION_HARD_CRASH:
-        db_op_add_leg(pilot_name, op_leg_num, route_dep, route_arr, rate,
-                      0, flight_id_for_db or "", op_report_url)
-        db_op_reset_pilot(pilot_name)
+    # rate тут гарантированно > -OPERATION_FAIL_RATE — crash/fail уже
+    # обработаны и вернули управление выше, до опроса FSA.
+    earned, coeff, net_bonus = op_calc_points(op_leg_pts, op_aircraft_icao, op_on_network)
+    next_leg    = op_leg_num + 1
+    is_finished = next_leg > len(OPERATION_LEGS)
+    new_points  = op_pilot["total_points"] + earned
+    new_status  = "finished" if is_finished else "active"
+
+    db_op_add_leg(pilot_name, op_leg_num, route_dep, route_arr, rate,
+                  earned, flight_id_for_db or "", op_report_url,
+                  base_points=op_leg_pts, coeff=coeff,
+                  net_bonus=net_bonus, on_network=op_on_network)
+    db_op_update_pilot(pilot_name,
+                       next_leg if not is_finished else op_leg_num,
+                       new_points, new_status)
+
+    coeff_str   = f"x{coeff}" if coeff != 1.0 else ""
+    bonus_str   = f" +{net_bonus} (VATSIM/IVAO)" if net_bonus else ""
+    detail_str  = f"{op_leg_pts}{coeff_str}{bonus_str} = <b>{earned}</b>"
+    ferry_num   = op_pilot.get("ferry_num", 1)
+    simrate_str = f" | ⏱ x{simrate}" if simrate > 1 else ""
+
+    if is_finished:
         tg_send(
-            f"💥 <b>КРУШЕНИЕ — ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
-            f"👨‍✈️ <b>{pilot_name}</b>\n"
-            f"✈️ Leg {op_leg_num}: {route_dep} → {route_arr}\n"
-            f"📊 Посадка: <b>{rate} fpm</b>\n\n"
-            f"⚠️ Борт утерян. Весь прогресс сброшен.\nПилот начинает с Leg 1."
+            f"🏁 <b>ФИНИШ! ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
+            f"👨‍✈️ <b>{pilot_name}</b> завершил перегон #{ferry_num}!\n"
+            f"✈️ Последний этап: {route_dep} → {route_arr}\n"
+            f"📊 Посадка: <b>{rate} fpm</b>{simrate_str}\n"
+            f"⭐ Очки: {detail_str} | Итого: <b>{new_points:,}</b>\n\n"
+            f"🎉 Борт успешно перегнан в SBGL!\n\n"
+            f"🔄 <b>Это не конец — можно идти на новый перегон!</b>\n"
+            f"✈️ Просто вылетайте по первому этапу <b>VTBS → VVPQ</b> — "
+            f"перегон #{ferry_num + 1} начнётся автоматически, а очки "
+            f"продолжат накапливаться."
         )
         discord_send_operation(
-            title=f"💥  КРУШЕНИЕ — «{OPERATION_NAME}»", color=0xED4245,
+            title=f"🏁  ФИНИШ! — «{OPERATION_NAME}»", color=0x23A55A,
             fields=[
-                {"name": "Пилот",   "value": pilot_name,    "inline": True},
-                {"name": "Этап",    "value": f"Leg {op_leg_num}: {route_dep} → {route_arr}", "inline": True},
-                {"name": "Посадка", "value": f"{rate} fpm", "inline": True},
-                {"name": "Статус",  "value": "Борт утерян. Прогресс сброшен. Начинает с Leg 1.", "inline": False},
+                {"name": "Пилот",   "value": pilot_name,              "inline": True},
+                {"name": "Перегон", "value": f"#{ferry_num}",          "inline": True},
+                {"name": "Этап",    "value": f"{route_dep} → {route_arr}", "inline": True},
+                {"name": "Посадка", "value": f"{rate} fpm",           "inline": True},
+                {"name": "Очки",    "value": detail_str,              "inline": True},
+                {"name": "Итого",   "value": f"{new_points:,}",       "inline": True},
             ],
-        )
-    elif rate <= -OPERATION_FAIL_RATE:
-        db_op_add_leg(pilot_name, op_leg_num, route_dep, route_arr, rate,
-                      0, flight_id_for_db or "", op_report_url)
-        tg_send(
-            f"🔴 <b>ЭТАП ПРОВАЛЕН — ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
-            f"👨‍✈️ <b>{pilot_name}</b>\n"
-            f"✈️ Leg {op_leg_num}: {route_dep} → {route_arr}\n"
-            f"📊 Посадка: <b>{rate} fpm</b> — слишком жёстко!\n\n"
-            f"❌ Очки не начислены. Повторите Leg {op_leg_num}."
-        )
-        discord_send_operation(
-            title=f"🔴  ЭТАП ПРОВАЛЕН — «{OPERATION_NAME}»", color=0xED4245,
-            fields=[
-                {"name": "Пилот",   "value": pilot_name,    "inline": True},
-                {"name": "Этап",    "value": f"Leg {op_leg_num}: {route_dep} → {route_arr}", "inline": True},
-                {"name": "Посадка", "value": f"{rate} fpm — слишком жёстко!", "inline": True},
-                {"name": "Статус",  "value": f"Очки не начислены. Повторите Leg {op_leg_num}.", "inline": False},
-            ],
+            footer_extra="Борт успешно перегнан в SBGL!",
         )
     else:
-        earned, coeff, net_bonus = op_calc_points(op_leg_pts, op_aircraft_icao, op_on_network)
-        next_leg    = op_leg_num + 1
-        is_finished = next_leg > len(OPERATION_LEGS)
-        new_points  = op_pilot["total_points"] + earned
-        new_status  = "finished" if is_finished else "active"
+        next_info  = next(
+            (f"{d2}→{a2}" for n2, d2, a2, _ in OPERATION_LEGS if n2 == next_leg), ""
+        )
+        legs_after = legs_today + 1
+        limit_str  = (
+            f"\n🕛 На сегодня лимит исчерпан. "
+            f"Следующий лег — после <b>00:00 UTC (03:00 МСК)</b>"
+            if legs_after >= 2 else
+            f"\n✅ Сегодня можно выполнить ещё <b>1 лег</b>"
+        )
 
-        db_op_add_leg(pilot_name, op_leg_num, route_dep, route_arr, rate,
-                      earned, flight_id_for_db or "", op_report_url,
-                      base_points=op_leg_pts, coeff=coeff,
-                      net_bonus=net_bonus, on_network=op_on_network)
-        db_op_update_pilot(pilot_name,
-                           next_leg if not is_finished else op_leg_num,
-                           new_points, new_status)
-
-        coeff_str   = f"x{coeff}" if coeff != 1.0 else ""
-        bonus_str   = f" +{net_bonus} (VATSIM/IVAO)" if net_bonus else ""
-        detail_str  = f"{op_leg_pts}{coeff_str}{bonus_str} = <b>{earned}</b>"
-        ferry_num   = op_pilot.get("ferry_num", 1)
-        simrate_str = f" | ⏱ x{simrate}" if simrate > 1 else ""
-
-        if is_finished:
-            tg_send(
-                f"🏁 <b>ФИНИШ! ОПЕРАЦИЯ «{OPERATION_NAME}»</b>\n\n"
-                f"👨‍✈️ <b>{pilot_name}</b> завершил перегон #{ferry_num}!\n"
-                f"✈️ Последний этап: {route_dep} → {route_arr}\n"
-                f"📊 Посадка: <b>{rate} fpm</b>{simrate_str}\n"
-                f"⭐ Очки: {detail_str} | Итого: <b>{new_points:,}</b>\n\n"
-                f"🎉 Борт успешно перегнан в SBGL!\n\n"
-                f"🔄 <b>Это не конец — можно идти на новый перегон!</b>\n"
-                f"✈️ Просто вылетайте по первому этапу <b>VTBS → VVPQ</b> — "
-                f"перегон #{ferry_num + 1} начнётся автоматически, а очки "
-                f"продолжат накапливаться."
-            )
-            discord_send_operation(
-                title=f"🏁  ФИНИШ! — «{OPERATION_NAME}»", color=0x23A55A,
-                fields=[
-                    {"name": "Пилот",   "value": pilot_name,              "inline": True},
-                    {"name": "Перегон", "value": f"#{ferry_num}",          "inline": True},
-                    {"name": "Этап",    "value": f"{route_dep} → {route_arr}", "inline": True},
-                    {"name": "Посадка", "value": f"{rate} fpm",           "inline": True},
-                    {"name": "Очки",    "value": detail_str,              "inline": True},
-                    {"name": "Итого",   "value": f"{new_points:,}",       "inline": True},
-                ],
-                footer_extra="Борт успешно перегнан в SBGL!",
-            )
-        else:
-            next_info  = next(
-                (f"{d2}→{a2}" for n2, d2, a2, _ in OPERATION_LEGS if n2 == next_leg), ""
-            )
-            legs_after = legs_today + 1
-            limit_str  = (
-                f"\n🕛 На сегодня лимит исчерпан. "
-                f"Следующий лег — после <b>00:00 UTC (03:00 МСК)</b>"
-                if legs_after >= 2 else
-                f"\n✅ Сегодня можно выполнить ещё <b>1 лег</b>"
+        # Спец-уведомление при прибытии на остров Пасхи (Leg 10: NTGJ → SCIP)
+        easter_note = ""
+        if op_leg_num == 10:
+            easter_note = (
+                f"\n\n━━━━━━━━━━━━━━\n"
+                f"📡 <b>ОСТРОВ ПАСХИ — обязательная процедура</b>\n"
+                f"Океанический переход завершён. По регламенту Профсоюза "
+                f"на острове производится <b>смена регистрационных номеров</b> борта.\n\n"
+                f"✉️ Направьте телеграмму о завершении перехода в Офис Профсоюза: "
+                f"@ArtturElz\n"
+                f"⛔ <b>До получения подтверждения дальнейший полёт запрещён.</b>\n"
+                f"✅ Только после разрешения выполняется этап <b>SCIP → SCFA</b>."
             )
 
-            # Спец-уведомление при прибытии на остров Пасхи (Leg 10: NTGJ → SCIP)
-            easter_note = ""
-            if op_leg_num == 10:
-                easter_note = (
-                    f"\n\n━━━━━━━━━━━━━━\n"
-                    f"📡 <b>ОСТРОВ ПАСХИ — обязательная процедура</b>\n"
-                    f"Океанический переход завершён. По регламенту Профсоюза "
-                    f"на острове производится <b>смена регистрационных номеров</b> борта.\n\n"
-                    f"✉️ Направьте телеграмму о завершении перехода в Офис Профсоюза: "
-                    f"@ArtturElz\n"
-                    f"⛔ <b>До получения подтверждения дальнейший полёт запрещён.</b>\n"
-                    f"✅ Только после разрешения выполняется этап <b>SCIP → SCFA</b>."
-                )
-
-            tg_send(
-                f"✅ <b>LEG {op_leg_num} ВЫПОЛНЕН — «{OPERATION_NAME}»</b>\n\n"
-                f"👨‍✈️ <b>{pilot_name}</b>\n"
-                f"✈️ {route_dep} → {route_arr}\n"
-                f"📊 Посадка: <b>{rate} fpm</b>{simrate_str}\n"
-                f"⭐ Очки: {detail_str} | Итого: <b>{new_points:,}</b>\n"
-                f"➡️ Следующий: Leg {next_leg} {next_info}"
-                f"{limit_str}"
-                f"{easter_note}"
-            )
-            discord_send_operation(
-                title=f"✅  LEG {op_leg_num} ВЫПОЛНЕН — «{OPERATION_NAME}»",
-                color=0xFEE75C,
-                fields=[
-                    {"name": "Пилот",     "value": pilot_name,              "inline": True},
-                    {"name": "Этап",      "value": f"{route_dep} → {route_arr}", "inline": True},
-                    {"name": "Посадка",   "value": f"{rate} fpm",           "inline": True},
-                    {"name": "Очки",      "value": detail_str,              "inline": True},
-                    {"name": "Итого",     "value": f"{new_points:,}",       "inline": True},
-                    {"name": "Следующий", "value": f"Leg {next_leg} {next_info}".strip(), "inline": True},
-                ],
-            )
+        tg_send(
+            f"✅ <b>LEG {op_leg_num} ВЫПОЛНЕН — «{OPERATION_NAME}»</b>\n\n"
+            f"👨‍✈️ <b>{pilot_name}</b>\n"
+            f"✈️ {route_dep} → {route_arr}\n"
+            f"📊 Посадка: <b>{rate} fpm</b>{simrate_str}\n"
+            f"⭐ Очки: {detail_str} | Итого: <b>{new_points:,}</b>\n"
+            f"➡️ Следующий: Leg {next_leg} {next_info}"
+            f"{limit_str}"
+            f"{easter_note}"
+        )
+        discord_send_operation(
+            title=f"✅  LEG {op_leg_num} ВЫПОЛНЕН — «{OPERATION_NAME}»",
+            color=0xFEE75C,
+            fields=[
+                {"name": "Пилот",     "value": pilot_name,              "inline": True},
+                {"name": "Этап",      "value": f"{route_dep} → {route_arr}", "inline": True},
+                {"name": "Посадка",   "value": f"{rate} fpm",           "inline": True},
+                {"name": "Очки",      "value": detail_str,              "inline": True},
+                {"name": "Итого",     "value": f"{new_points:,}",       "inline": True},
+                {"name": "Следующий", "value": f"Leg {next_leg} {next_info}".strip(), "inline": True},
+            ],
+        )
 
     logger.info(
         f"[Operation] {pilot_name} leg={op_leg_num} rate={rate} "
