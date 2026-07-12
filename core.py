@@ -154,6 +154,93 @@ def _tg_to_discord(text: str) -> str:
     return text.strip()
 
 
+# ═══════════════════════════════════════════════════════════════
+# ВКОНТАКТЕ
+# ═══════════════════════════════════════════════════════════════
+# Беседа сообщества UNICOM (VA UP!, group_id 230406784).
+# Принцип тот же, что у Discord: пустой VK_TOKEN / VK_PEER_ID →
+# отправка молча пропускается, деплой без ключей безопасен.
+
+import random
+
+VK_TOKEN   = os.environ.get("VK_TOKEN",   "")
+VK_PEER_ID = os.environ.get("VK_PEER_ID", "")
+VK_API_VER = "5.199"
+
+# ВК не поддерживает разметку вообще. Ссылку выводим как «текст: URL».
+_RE_VK_LINK_DQ = re.compile(r'<a href="(.*?)">(.*?)</a>', re.DOTALL)
+_RE_VK_LINK_SQ = re.compile(r"<a href='(.*?)'>(.*?)</a>", re.DOTALL)
+
+
+def _tg_to_vk(text: str) -> str:
+    """Telegram HTML → голый текст для ВК (разметки нет, ссылка = URL)."""
+    text = _RE_VK_LINK_DQ.sub(r"\2: \1", text)
+    text = _RE_VK_LINK_SQ.sub(r"\2: \1", text)
+    text = _RE_DC_BOLD.sub(r"\1", text)
+    text = _RE_DC_ITAL.sub(r"\1", text)
+    text = _RE_DC_CODE.sub(r"\1", text)
+    text = _RE_DC_TAGS.sub("", text)
+    return text.strip()
+
+
+def _vk_call(method: str, params: dict) -> bool:
+    """
+    Низкоуровневый вызов VK API.
+    ВНИМАНИЕ: ВК отдаёт ошибки с HTTP 200 — успех определяется
+    отсутствием ключа 'error' в JSON, а не статус-кодом.
+    """
+    if not VK_TOKEN:
+        return False
+    try:
+        p = dict(params)
+        p["access_token"] = VK_TOKEN
+        p["v"] = VK_API_VER
+        r = session.post(f"https://api.vk.com/method/{method}", data=p, timeout=15)
+        data = r.json()
+        if "error" in data:
+            err = data["error"]
+            logger.warning(
+                f"VK {method} failed: [{err.get('error_code')}] {err.get('error_msg')}"
+            )
+            return False
+        return True
+    except Exception as e:
+        logger.warning(f"VK {method} error: {e}")
+        return False
+
+
+def vk_send(text: str) -> bool:
+    """
+    Сообщение в беседу сообщества ВК.
+    random_id обязателен — с нулём ВК может отбросить сообщение как дубль.
+    """
+    if not VK_TOKEN or not VK_PEER_ID:
+        return False
+    try:
+        return _vk_call("messages.send", {
+            "peer_id":          VK_PEER_ID,
+            "message":          _tg_to_vk(text)[:4000],
+            "random_id":        random.getrandbits(31),
+            "dont_parse_links": 1,
+        })
+    except Exception as e:
+        logger.warning(f"vk_send пропущен: {e}")
+        return False
+
+
+def vk_send_if_channel(chat_id, text: str) -> None:
+    """
+    Зеркалит в ВК, только если адресат — общий канал (CHAT_ID).
+    Личка админа и диалог /runway в ВК не уходят.
+    Никогда не бросает исключение — не должна ронять обработку вебхука.
+    """
+    try:
+        if str(chat_id) == str(CHAT_ID):
+            vk_send(text)
+    except Exception as e:
+        logger.warning(f"vk mirror пропущен: {e}")
+
+
 # ── Цвета embed по типу события ───────────────────────────────
 # Discord принимает цвет как целое число (decimal RGB)
 _DC_COLOR_DEPARTURE  = 0x5865F2  # синий — вылет
@@ -1166,6 +1253,7 @@ def tg_send(text: str, chat_id=None) -> bool:
         if r.status_code != 200:
             logger.warning(f"Telegram send failed: {r.text}")
             return False
+        vk_send_if_channel(target, text)
         return True
     except Exception as e:
         logger.exception(f"Telegram send error: {e}")
@@ -1206,6 +1294,14 @@ def tg_setup_webhook():
 
 
 def tg_edit_message(chat_id, message_id: int, text: str) -> None:
+    """
+    Редактирует сообщение в Telegram.
+
+    В ВК редактирования сообщений нет, поэтому сюда же зеркалим ФИНАЛЬНУЮ
+    версию вылета/посадки: в Telegram она приходит как правка заглушки
+    «⏳ Загружаю маршрут...», а в ВК уходит единственным сообщением —
+    сразу с маршрутом, без промежуточного шума.
+    """
     try:
         session.post(
             f"{TG_BASE}/editMessageText",
@@ -1220,6 +1316,7 @@ def tg_edit_message(chat_id, message_id: int, text: str) -> None:
         )
     except Exception as e:
         logger.exception(f"editMessageText error: {e}")
+    vk_send_if_channel(chat_id, text)
 
 
 # ═══════════════════════════════════════════════════════════════
