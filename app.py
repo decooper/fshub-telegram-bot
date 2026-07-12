@@ -1759,21 +1759,6 @@ def home():
 @app.route("/health")
 def health():
     return jsonify({"ok": True}), 200
-@app.route("/vk_smoke")
-def vk_smoke():
-    """Временный эндпоинт: проверка доступности api.vk.com с Render."""
-    tok = os.environ.get("VK_TOKEN", "")
-    if not tok:
-        return jsonify({"ok": False, "err": "VK_TOKEN not set"}), 200
-    try:
-        r = session.get(
-            "https://api.vk.com/method/groups.getById",
-            params={"group_id": "va_up", "access_token": tok, "v": "5.199"},
-            timeout=10,
-        )
-        return jsonify({"ok": True, "status": r.status_code, "body": r.text[:400]}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "err": repr(e)}), 200
 
 def _verify_fshub_signature(payload: bytes, signature_header: str) -> bool:
     """
