@@ -77,6 +77,7 @@ from core import (
     # formatters
     MONTH_NAMES,
     fmt_stats, fmt_last, fmt_top_landings, fmt_top_pilots,
+    fmt_weekly_challenge,
     fmt_daily_economy, fmt_monthly_economy,
     fmt_active_flights, fmt_va_info,
     fmt_contest, fmt_operation, fmt_operation_digest,
@@ -1698,11 +1699,7 @@ def init_scheduler():
         id="saturday_inv",
     )
     scheduler.add_job(
-        lambda: tg_send(
-            "🏆 <b>ЕЖЕНЕДЕЛЬНЫЙ ВЫЗОВ ЭКИПАЖУ!</b>\n\n"
-            "🔹 Цель: 3 рейса за 7 дней\n"
-            "🔹 Бонус: лучшая посадка недели\n\nГотов принять вызов? 💪"
-        ),
+        lambda: tg_send(fmt_weekly_challenge()),
         "cron", day_of_week="mon", hour=8, minute=0,
         id="monday_challenge",
     )
