@@ -1513,6 +1513,18 @@ def handle_tg_command(message: Dict):
             tg_send(fmt_operation_digest())
             tg_send("✅ Дайджест отправлен вручную.", chat_id)
 
+        elif sub == "challenge":
+            tg_send(
+                "♻️ <b>Челлендж дня обновлён</b>\n\n"
+                "В утренней публикации тиры были определены неверно: дальность рейса "
+                "считалась по расписанию без учёта часовых поясов. Теперь считается "
+                "по расстоянию.\n\n"
+                "Актуальная тройка — ниже. Засчитывается именно она. "
+                "Если вы уже выполнили рейс из старой публикации — напишите, начислим вручную."
+            )
+            post_daily_challenge()
+            tg_send("✅ Челлендж дня переопубликован.", chat_id)
+
         elif sub == "list":
             pilots = db_op_all_pilots()
             if not pilots:
@@ -1536,6 +1548,8 @@ def handle_tg_command(message: Dict):
                 "/operation_admin fsa Имя Фамилия — подтянуть маршрут из FSA в кэш "
                 "(если бот не загрузил его при вылете; работает, пока пилот летит)\n"
                 "/operation_admin digest — отправить дайджест ивента вручную\n"
+                "/operation_admin challenge — переопубликовать челлендж дня "
+                "(пересчитывается по дальности)\n"
                 "/operation_admin list",
                 chat_id,
             )
