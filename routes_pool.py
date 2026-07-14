@@ -1,11 +1,16 @@
 """
 routes_pool.py — пул маршрутов компании + ежедневный челлендж.
 
-Челлендж дня = 3 рейса разной длительности:
-  🟢 Короткий 1–2 ч  → 40 очков
-  🟡 Средний  3–5 ч  → 60 очков
-  🔴 Дальний  5 ч+   → 100 очков
+Челлендж дня = 3 рейса разной ДАЛЬНОСТИ (великий круг, км):
+  🟢 Короткий   300–1200 км → 40 очков
+  🟡 Средний   1200–3000 км → 60 очков
+  🔴 Дальний   3000–9000 км → 100 очков
 Можно выполнить любой или все три (40+60+100). Очки идут в месячный зачёт.
+
+ВАЖНО: времена в routes.txt — МЕСТНЫЕ, а не Zulu. Вычитать их друг из друга
+нельзя: UHBB(UTC+9)→UUEE(UTC+3) 1050→1220 давало «1ч30м» вместо ~7ч20м, и рейс
+через полстраны попадал в «короткие». Поэтому и тир, и показываемое время
+считаются ТОЛЬКО от расстояния (airports_geo.py). См. route_duration() ниже.
 
 Зависит от core.py (db_execute, tg_send, discord_send, logger) — без side effects.
 routes.txt лежит рядом с этим файлом. Формат строки:
@@ -21,6 +26,7 @@ from flask import Blueprint, jsonify, request
 
 from core import db_execute, tg_send, discord_send, logger, MONTH_NAMES
 import airports as A
+import airports_geo as G
 
 # ─── Константы ──────────────────────────────────────────────────
 ROUTES_FILE         = os.path.join(os.path.dirname(__file__), "routes.txt")
@@ -30,11 +36,14 @@ SITE_ORIGIN         = "https://va-up.ru"
 # Санитарные границы реального рейса (мин): отсекаем мусор в расписании
 SANE_MIN, SANE_MAX = 40, 960   # 40 мин .. 16 ч
 
-# Тиры челленджа: (ключ, подпись, длит_от, длит_до, очки)
+# Тиры челленджа: (ключ, подпись, дист_от_км, дист_до_км, очки)
+# Границы подобраны по фактическому распределению пула:
+#   короткий 975 маршрутов, средний 1416, дальний 597.
+# Ниже 300 км — «прыжки» вроде RJOO→RJBE (26 км), выше 9000 км — нелетабельно за сессию.
 CHALLENGE_TIERS = [
-    ("short",  "🟢 Короткий", 60,  120,  40),
-    ("medium", "🟡 Средний",  180, 299,  60),
-    ("long",   "🔴 Дальний",  300, 960, 100),
+    ("short",  "🟢 Короткий",  300, 1200,  40),
+    ("medium", "🟡 Средний",  1200, 3000,  60),
+    ("long",   "🔴 Дальний",  3000, 9000, 100),
 ]
 _TIER_LABEL  = {k: lbl for k, lbl, *_ in CHALLENGE_TIERS}
 _TIER_POINTS = {k: pts for k, *_, pts in CHALLENGE_TIERS}
@@ -81,7 +90,12 @@ def base_routes():
 
 
 def route_duration(r) -> int:
-    """Длительность рейса в минутах из времён расписания (Zulu). 0 — если не разобрать."""
+    """
+    УСТАРЕЛО, НЕ ИСПОЛЬЗОВАТЬ ДЛЯ ТИРОВ И ПОКАЗА.
+    Наивная разница времён расписания. Времена в routes.txt — МЕСТНЫЕ, поэтому
+    результат врёт на величину разницы часовых поясов (UHBB→UUEE = «1ч30м»).
+    Оставлено только для обратной совместимости. Реальную оценку даёт route_eta().
+    """
     try:
         d = int(r.dep_time[:2]) * 60 + int(r.dep_time[2:])
         a = int(r.arr_time[:2]) * 60 + int(r.arr_time[2:])
@@ -93,26 +107,44 @@ def route_duration(r) -> int:
     return m
 
 
+def route_distance_km(r):
+    """Расстояние рейса по большому кругу, км. None — если нет координат."""
+    return G.distance_km(r.dep, r.arr)
+
+
+def route_eta(r) -> int:
+    """Оценка времени в пути, мин (от расстояния). 0 — если координат нет."""
+    km = route_distance_km(r)
+    return G.eta_minutes(km) if km else 0
+
+
 def _fmt_dur(m: int) -> str:
     h, mm = divmod(m, 60)
     return f"{h}ч{mm:02d}м" if mm else f"{h}ч"
 
 
 def _tier_pools():
-    """{tier_key: [Route, ...]} — рейсы каждого тира в санитарных границах. Кэш на процесс."""
+    """{tier_key: [Route, ...]} — рейсы каждого тира по РАССТОЯНИЮ. Кэш на процесс."""
     global _tier_pools_cache
     if _tier_pools_cache is not None:
         return _tier_pools_cache
     pools = {k: [] for k, *_ in CHALLENGE_TIERS}
+    no_coords = 0
     for r in base_routes():
-        m = route_duration(r)
-        if not (SANE_MIN <= m <= SANE_MAX):
+        km = route_distance_km(r)
+        if km is None:
+            no_coords += 1
             continue
         for key, _lbl, lo, hi, _pts in CHALLENGE_TIERS:
-            if lo <= m <= hi:
+            if lo <= km < hi:
                 pools[key].append(r)
                 break
     _tier_pools_cache = pools
+    logger.info(
+        "[Challenge] Пулы по дальности: "
+        + ", ".join(f"{k}={len(v)}" for k, v in pools.items())
+        + f" (без координат пропущено: {no_coords})"
+    )
     return pools
 
 
@@ -143,11 +175,12 @@ def fmt_route(hub=None):
     if not pool:
         return "Маршруты не загружены."
     r = random.choice(pool)
-    dur = route_duration(r)
-    dur_str = f" · {_fmt_dur(dur)}" if dur else ""
+    km  = route_distance_km(r)
+    eta = route_eta(r)
+    meta = f" · {G.fmt_km(km)} · ~{_fmt_dur(eta)}" if km else ""
     return (
         "🗺 <b>Случайный маршрут</b>\n\n"
-        f"✈️ <b>{r.flight_no}</b>: {r.dep} → {r.arr}{dur_str}\n"
+        f"✈️ <b>{r.flight_no}</b>: {r.dep} → {r.arr}{meta}\n"
         f"💰 {r.price}v$\n\n"
         f'<a href="https://metar-taf.com/{r.dep}">METAR {r.dep}</a> · '
         f'<a href="https://metar-taf.com/{r.arr}">METAR {r.arr}</a>'
@@ -161,7 +194,8 @@ def fmt_route(hub=None):
 def daily_challenge():
     """
     Возвращает список пиков на сегодня:
-      [{tier, label, points, duration, route}, ...]
+      [{tier, label, points, distance_km, duration, route}, ...]
+    duration — оценка ОТ РАССТОЯНИЯ (не из расписания).
     Детерминировано по дате (UTC) — стабильно при рестартах.
     """
     pools = _tier_pools()
@@ -172,12 +206,14 @@ def daily_challenge():
         if not pool:
             continue
         r = rng.choice(pool)
+        km = route_distance_km(r) or 0
         picks.append({
-            "tier":     key,
-            "label":    label,
-            "points":   pts,
-            "duration": route_duration(r),
-            "route":    r,
+            "tier":        key,
+            "label":       label,
+            "points":      pts,
+            "distance_km": int(round(km)),
+            "duration":    route_eta(r),
+            "route":       r,
         })
     return picks
 
@@ -197,11 +233,10 @@ def fmt_daily_challenge():
         r = pk["route"]
         lines.append(f"{pk['label']} · <b>+{pk['points']}</b> очков")
         lines.append(f"<b>{r.flight_no}</b> · {A.place_full(r.dep)} → {A.place_full(r.arr)}")
+        lines.append(f"📏 <b>{G.fmt_km(pk['distance_km'])}</b> · ⏱ ~{_fmt_dur(pk['duration'])}")
         hl = A.highlight(r.arr)
         if hl:
-            lines.append(f"⏱ ~{_fmt_dur(pk['duration'])} · 📍 <i>{hl}</i>")
-        else:
-            lines.append(f"⏱ ~{_fmt_dur(pk['duration'])}")
+            lines.append(f"📍 <i>{hl}</i>")
         lines.append("")
     lines.append("━━━━━━━━━━━━━━")
     lines.append("🏅 Лидеры месяца: /challenge_top")
@@ -412,6 +447,7 @@ def api_challenge():
             routes.append({
                 "tier":          pk["tier"],
                 "points":        pk["points"],
+                "distance_km":   pk["distance_km"],
                 "duration_min":  pk["duration"],
                 "duration_str":  _fmt_dur(pk["duration"]),
                 "flight_no":     r.flight_no,
