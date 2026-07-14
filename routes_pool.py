@@ -425,6 +425,332 @@ def post_challenge_results():
 
 
 # ═══════════════════════════════════════════════════════════════
+# 💎 ЗОЛОТОЙ МАРШРУТ
+#
+# Раз в месяц, в случайный день, объявляется один дальний маршрут.
+# Действует РОВНО ЭТИ СУТКИ (UTC). Первому, кто пройдёт — 1000 очков,
+# каждому следующему в тот же день — 200. Один зачёт на пилота.
+#
+# Пул: рейсы на 2–6 часов (1973 маршрута). Верхняя граница стоит затем, чтобы
+# маршрут реально укладывался в один вечер: он действует всего сутки. Дальние
+# и сверхдальние (8ч+, до 20ч) сюда не попадают — их за день не пролететь.
+#
+# ВАЖНО: маршрут и его дата ФИКСИРУЮТСЯ в БД в момент объявления и больше
+# не пересчитываются. Даже если пул маршрутов изменится — приз останется тем,
+# который увидели пилоты. Зачёты пишутся в challenge_completions с
+# tier='golden', поэтому очки автоматически идут в месячный лидерборд.
+# ═══════════════════════════════════════════════════════════════
+
+# Пул: 2–6 часов (1973 маршрута, ~1060–4460 км). Границы заданы по ВРЕМЕНИ,
+# а не по километрам: маршрут действует одни сутки, и он должен реально
+# укладываться в вечер. Всё длиннее 6ч (и сверхдальние на 12–20ч) отсекается.
+GOLDEN_MIN_MIN      = 120      # 2 часа
+GOLDEN_MAX_MIN      = 360      # 6 часов
+GOLDEN_POINTS_FIRST = 1000     # первому, кто пройдёт
+GOLDEN_POINTS_REST  = 200      # каждому следующему в тот же день
+GOLDEN_TIER         = "golden"
+
+# День объявления — случайный, но детерминированный для месяца.
+# Не 1-е (там итоги месяца) и не позже 26-го.
+GOLDEN_DROP_FROM = 2
+GOLDEN_DROP_TO   = 26
+
+
+def golden_drop_day(month=None) -> int:
+    """
+    День месяца, когда падает Золотой Маршрут. Случайный, но одинаковый при
+    любом числе перезапусков: сид — сам месяц (202607 → 17).
+    """
+    month = month or _month_utc()
+    return random.Random(int(month.replace("-", ""))).randint(
+        GOLDEN_DROP_FROM, GOLDEN_DROP_TO
+    )
+
+
+def init_golden_db():
+    """Таблица Золотого Маршрута."""
+    db_execute(
+        """
+        CREATE TABLE IF NOT EXISTS golden_route (
+            month       TEXT PRIMARY KEY,
+            day         DATE NOT NULL,
+            flight_no   TEXT NOT NULL,
+            dep         TEXT NOT NULL,
+            arr         TEXT NOT NULL,
+            distance_km INTEGER NOT NULL,
+            eta_min     INTEGER NOT NULL,
+            price       INTEGER NOT NULL DEFAULT 0,
+            created_at  TIMESTAMP DEFAULT NOW()
+        )
+        """
+    )
+    logger.info("[Golden] Таблица golden_route готова")
+
+
+def _golden_pool():
+    """[(Route, км), ...] — маршруты, укладывающиеся в GOLDEN_MIN_MIN..GOLDEN_MAX_MIN."""
+    out = []
+    for r in base_routes():
+        km = route_distance_km(r)
+        if km is None:
+            continue
+        if GOLDEN_MIN_MIN <= G.eta_minutes(km) <= GOLDEN_MAX_MIN:
+            out.append((r, km))
+    return out
+
+
+def _golden_used_pairs():
+    """{(dep, arr)} всех прошлых Золотых — чтобы не повторяться."""
+    rows = db_execute("SELECT dep, arr FROM golden_route", fetch="all") or []
+    used = set()
+    for r in rows:
+        used.add((r["dep"], r["arr"]))
+        used.add((r["arr"], r["dep"]))   # обратное направление тоже «уже было»
+    return used
+
+
+def db_golden_get(month=None):
+    month = month or _month_utc()
+    return db_execute(
+        "SELECT * FROM golden_route WHERE month = %s", (month,), fetch="one"
+    )
+
+
+def golden_get_or_create(month=None):
+    """
+    Выбирает Золотой Маршрут месяца и СОХРАНЯЕТ его вместе с датой действия.
+    Если уже выбран — возвращает как есть, ничего не меняя.
+    Вызывается ТОЛЬКО при объявлении (не при чтении), иначе сюрприза не будет.
+    """
+    month = month or _month_utc()
+    row = db_golden_get(month)
+    if row:
+        return row
+
+    pool = _golden_pool()
+    if not pool:
+        logger.warning("[Golden] Пул пуст — маршрут не выбран")
+        return None
+
+    used  = _golden_used_pairs()
+    fresh = [(r, km) for r, km in pool if (r.dep, r.arr) not in used]
+    if not fresh:
+        logger.info("[Golden] Все направления уже были — начинаем круг заново")
+        fresh = pool
+
+    r, km = random.choice(fresh)
+    db_execute(
+        """
+        INSERT INTO golden_route
+            (month, day, flight_no, dep, arr, distance_km, eta_min, price)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (month) DO NOTHING
+        """,
+        (month, _today_utc(), r.flight_no, r.dep, r.arr,
+         int(round(km)), G.eta_minutes(km), r.price),
+    )
+    # Перечитываем: если два воркера объявили одновременно — победит один.
+    row = db_golden_get(month)
+    if row:
+        logger.info(
+            f"[Golden] {month}: {row['flight_no']} {row['dep']}→{row['arr']} "
+            f"({row['distance_km']} км), действует {row['day']}"
+        )
+    return row
+
+
+def golden_claims(row):
+    """Кто прошёл Золотой в его день — в порядке выполнения."""
+    if not row:
+        return []
+    return db_execute(
+        """
+        SELECT pilot, points, created_at
+        FROM challenge_completions
+        WHERE tier = %s AND day = %s
+        ORDER BY created_at ASC
+        """,
+        (GOLDEN_TIER, row["day"]), fetch="all",
+    ) or []
+
+
+def fmt_golden_route(month=None) -> str:
+    """
+    ТОЛЬКО ЧТЕНИЕ — маршрут здесь не создаётся, иначе /golden выдал бы
+    сюрприз раньше времени.
+    """
+    month = month or _month_utc()
+    row   = db_golden_get(month)
+    label = _month_label(month)
+
+    if not row:
+        if month != _month_utc():
+            return f"💎 В {label} Золотой Маршрут не объявлялся."
+        return (
+            f"💎 <b>ЗОЛОТОЙ МАРШРУТ</b> · {label}\n"
+            "━━━━━━━━━━━━━━\n"
+            "В этом месяце он ещё не объявлен.\n\n"
+            "Маршрут появится <b>внезапно, в один из дней месяца</b>, "
+            "и будет действовать <b>только эти сутки</b>.\n\n"
+            f"🥇 Первому, кто пройдёт — <b>+{GOLDEN_POINTS_FIRST}</b> очков\n"
+            f"✈️ Каждому следующему в тот же день — <b>+{GOLDEN_POINTS_REST}</b>\n\n"
+            "Следи за каналом 👀\n"
+            "━━━━━━━━━━━━━━"
+        )
+
+    today  = _today_utc()
+    active = row["day"] == today
+    claims = golden_claims(row)
+
+    lines = [
+        f"💎 <b>ЗОЛОТОЙ МАРШРУТ</b> · {label}",
+        "━━━━━━━━━━━━━━",
+        f"<b>{row['flight_no']}</b> · {A.place_full(row['dep'])} → {A.place_full(row['arr'])}",
+        f"📏 <b>{G.fmt_km(row['distance_km'])}</b> · ⏱ ~{_fmt_dur(row['eta_min'])}",
+    ]
+    hl = A.highlight(row["arr"])
+    if hl:
+        lines.append(f"📍 <i>{hl}</i>")
+    lines.append("")
+
+    if active:
+        lines.append("⚡️ <b>ДЕЙСТВУЕТ ТОЛЬКО СЕГОДНЯ</b>")
+        lines.append("")
+        if not claims:
+            lines.append(f"🥇 Первому, кто пройдёт — <b>+{GOLDEN_POINTS_FIRST}</b> очков")
+            lines.append(f"✈️ Каждому следующему — <b>+{GOLDEN_POINTS_REST}</b> очков")
+            lines.append("")
+            lines.append("Его ещё никто не взял. Успеешь? 👀")
+        else:
+            lines.append(f"🥇 <b>{claims[0]['pilot']}</b> — взял первым, +{claims[0]['points']}")
+            for c in claims[1:]:
+                lines.append(f"✈️ {c['pilot']} — +{c['points']}")
+            lines.append("")
+            lines.append(
+                f"Ещё не поздно: <b>+{GOLDEN_POINTS_REST}</b> очков всем, "
+                f"кто пройдёт до конца суток."
+            )
+    else:
+        lines.append(f"🔒 <b>Закрыт</b> · действовал {row['day'].strftime('%d.%m.%Y')}")
+        lines.append("")
+        if not claims:
+            lines.append("Никто так и не взял его 😔")
+        else:
+            lines.append(f"🥇 <b>{claims[0]['pilot']}</b> — взял первым, +{claims[0]['points']}")
+            for c in claims[1:]:
+                lines.append(f"✈️ {c['pilot']} — +{c['points']}")
+        lines.append("")
+        lines.append("Следующий — в случайный день следующего месяца.")
+    lines.append("━━━━━━━━━━━━━━")
+    return "\n".join(lines)
+
+
+def post_golden_route():
+    """Объявление Золотого Маршрута: выбирает (если ещё нет) и публикует."""
+    row = golden_get_or_create()
+    if not row:
+        logger.warning("[Golden] Маршрут не выбран — публикация отменена")
+        return
+    text = fmt_golden_route()
+    tg_send(text)
+    try:
+        discord_send(text)
+    except Exception as e:
+        logger.warning(f"[Golden] Discord post failed: {e}")
+
+
+def golden_daily_check():
+    """
+    Ежедневно в 00:05 UTC: не сегодня ли падает Золотой Маршрут?
+    Условие `>=`, а не `==`: если бот в тот день лежал — объявим при первом
+    же запуске после, а не потеряем месяц. Дважды не объявит: маршрут в БД.
+    """
+    try:
+        month = _month_utc()
+        if db_golden_get(month):
+            return                       # уже объявлен в этом месяце
+        drop  = golden_drop_day(month)
+        today = _now_utc().day
+        if today < drop:
+            return                       # ещё рано
+        logger.info(f"[Golden] День {drop} (сегодня {today}) — объявляем")
+        post_golden_route()
+    except Exception as e:
+        logger.exception(f"[Golden] golden_daily_check error: {e}")
+
+
+def record_golden_if_match(pilot_name, dep, arr):
+    """
+    Вызывается из handle_completed. Засчитывается ТОЛЬКО в день действия
+    маршрута. Первому — GOLDEN_POINTS_FIRST, остальным — GOLDEN_POINTS_REST.
+    Один зачёт на пилота.
+    """
+    try:
+        dep = (dep or "").upper()
+        arr = (arr or "").upper()
+        if len(dep) != 4 or len(arr) != 4:
+            return
+
+        row = db_golden_get()
+        if not row:
+            return
+        if (dep, arr) != (row["dep"], row["arr"]):
+            return
+
+        today = _today_utc()
+        if row["day"] != today:
+            logger.info(f"[Golden] {pilot_name}: маршрут совпал, но день закрыт ({row['day']})")
+            return
+
+        stat = db_execute(
+            """
+            SELECT COUNT(*)                           AS total,
+                   COUNT(*) FILTER (WHERE pilot = %s) AS mine
+            FROM challenge_completions
+            WHERE tier = %s AND day = %s
+            """,
+            (pilot_name, GOLDEN_TIER, today), fetch="one",
+        )
+        if stat and int(stat["mine"]) > 0:
+            return   # этот пилот уже получил Золотой
+
+        is_first = (not stat) or int(stat["total"]) == 0
+        points   = GOLDEN_POINTS_FIRST if is_first else GOLDEN_POINTS_REST
+
+        db_execute(
+            """
+            INSERT INTO challenge_completions (pilot, day, tier, dep, arr, points)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (pilot, day, tier) DO NOTHING
+            """,
+            (pilot_name, today, GOLDEN_TIER, dep, arr, points),
+        )
+        logger.info(
+            f"[Golden] {pilot_name} прошёл {dep}->{arr} +{points} (первый={is_first})"
+        )
+
+        if not ANNOUNCE_COMPLETION:
+            return
+        if is_first:
+            tg_send(
+                "💎🥇 <b>ЗОЛОТОЙ МАРШРУТ ВЗЯТ!</b>\n\n"
+                f"<b>{pilot_name}</b> первым прошёл\n"
+                f"{A.place_full(dep)} → {A.place_full(arr)}\n"
+                f"📏 {G.fmt_km(row['distance_km'])}\n\n"
+                f"🏆 <b>+{points} очков</b>\n\n"
+                f"Маршрут открыт до конца суток — всем остальным "
+                f"+{GOLDEN_POINTS_REST} очков."
+            )
+        else:
+            tg_send(
+                f"💎 <b>{pilot_name}</b> тоже прошёл Золотой Маршрут: "
+                f"{dep} → {arr} ✅ +{points} очков"
+            )
+    except Exception as e:
+        logger.exception(f"[Golden] record_golden_if_match error: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════
 # API ДЛЯ САЙТА (Flask Blueprint)
 # ═══════════════════════════════════════════════════════════════
 
@@ -463,6 +789,45 @@ def api_challenge():
         return _cors(resp)
     except Exception as e:
         logger.exception(f"API /api/challenge error: {e}")
+        return _cors(jsonify({"ok": False, "error": str(e)})), 500
+
+
+@challenge_bp.route("/api/golden")
+def api_golden():
+    try:
+        month = request.args.get("month") or _month_utc()
+        row   = db_golden_get(month)          # только чтение: не создаём заранее
+        if not row:
+            return _cors(jsonify({
+                "ok": True, "month": month, "announced": False,
+                "route": None, "claims": [],
+            }))
+        claims = [
+            {"rank": i + 1, "pilot": c["pilot"], "points": int(c["points"])}
+            for i, c in enumerate(golden_claims(row))
+        ]
+        resp = jsonify({
+            "ok":        True,
+            "month":     month,
+            "announced": True,
+            "day":       row["day"].isoformat(),
+            "active":    row["day"] == _today_utc(),
+            "route": {
+                "flight_no":    row["flight_no"],
+                "departure":    row["dep"],
+                "arrival":      row["arr"],
+                "distance_km":  int(row["distance_km"]),
+                "duration_min": int(row["eta_min"]),
+                "duration_str": _fmt_dur(int(row["eta_min"])),
+                "price":        int(row["price"]),
+            },
+            "points_first": GOLDEN_POINTS_FIRST,
+            "points_rest":  GOLDEN_POINTS_REST,
+            "claims":       claims,
+        })
+        return _cors(resp)
+    except Exception as e:
+        logger.exception(f"API /api/golden error: {e}")
         return _cors(jsonify({"ok": False, "error": str(e)})), 500
 
 
