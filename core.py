@@ -880,6 +880,35 @@ def db_top_pilots_week(limit: int = 10) -> List:
     ) or []
 
 
+def db_weekly_flight_counts() -> List:
+    """Все пилоты и число их рейсов за последние 7 дней (без лимита)."""
+    return db_execute(
+        """
+        SELECT pilot, COUNT(*) AS cnt
+        FROM flights
+        WHERE created_at >= NOW() - INTERVAL '7 days'
+        GROUP BY pilot
+        ORDER BY cnt DESC, pilot ASC
+        """,
+        fetch="all",
+    ) or []
+
+
+def db_best_landing_week() -> Optional[Dict]:
+    """Лучшая (самая мягкая) посадка за последние 7 дней."""
+    return db_execute(
+        """
+        SELECT pilot, landing_rate, departure, arrival, aircraft
+        FROM flights
+        WHERE created_at >= NOW() - INTERVAL '7 days'
+          AND landing_rate < 0
+        ORDER BY ABS(landing_rate) ASC
+        LIMIT 1
+        """,
+        fetch="one",
+    )
+
+
 # ═══════════════════════════════════════════════════════════════
 # DB HELPERS — DAILY ECONOMY
 # ═══════════════════════════════════════════════════════════════
@@ -1762,6 +1791,56 @@ def fmt_top_pilots() -> str:
         for i, row in enumerate(rows, 1)
     ]
     return "🏆 <b>ТОП ПИЛОТЫ (7 дней)</b>\n\n" + "\n".join(lines)
+
+
+def fmt_weekly_challenge(goal: int = 3) -> str:
+    """
+    Единый недельный пост: итоги прошлого вызова + новый вызов.
+    Публикуется по понедельникам.
+    """
+    rows = db_weekly_flight_counts()
+    best = db_best_landing_week()
+
+    sep = "\n➖➖➖➖➖➖➖➖➖➖\n\n"
+    parts = ["🏁 <b>ИТОГИ ПРОШЛОГО ВЫЗОВА</b>\n"]
+
+    if not rows:
+        parts.append("\nЗа неделю рейсов не было — вызов остался без ответа 😔\n")
+    else:
+        winners = [r for r in rows if r["cnt"] >= goal]
+        close   = [r for r in rows if r["cnt"] < goal]
+
+        if winners:
+            parts.append(f"\n✅ <b>Цель взяли ({len(winners)}):</b>\n")
+            medals = ["🥇", "🥈", "🥉"]
+            for i, r in enumerate(winners):
+                mark = medals[i] if i < 3 else "🎖"
+                parts.append(f"{mark} <b>{r['pilot']}</b> — {r['cnt']} рейс(ов)\n")
+        else:
+            parts.append("\n❌ <b>Цель на этой неделе не взял никто.</b>\n")
+
+        if close:
+            parts.append("\n🔸 <b>Немного не хватило:</b>\n")
+            for r in close[:5]:
+                parts.append(f"    • {r['pilot']} — {r['cnt']} из {goal}\n")
+
+        if best:
+            route = ""
+            if best.get("departure") and best.get("arrival"):
+                route = f"  <i>{best['departure']} → {best['arrival']}</i>"
+            parts.append(
+                f"\n🛬 <b>Посадка недели</b>\n"
+                f"🏅 <b>{best['pilot']}</b> — {best['landing_rate']} fpm{route}\n"
+            )
+
+    parts.append(sep)
+    parts.append(
+        "🏆 <b>НОВЫЙ ВЫЗОВ ЭКИПАЖУ!</b>\n\n"
+        f"🔹 Цель: <b>{goal} рейса за 7 дней</b>\n"
+        "🔹 Бонус: лучшая посадка недели\n\n"
+        "Отсчёт пошёл. Готов принять вызов? 💪"
+    )
+    return "".join(parts)
 
 
 def fmt_daily_economy() -> str:
