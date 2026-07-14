@@ -93,6 +93,8 @@ from routes_pool import (
     fmt_route, fmt_daily_challenge, fmt_challenge_leaders,
     post_daily_challenge, record_challenge_if_match,
     init_challenge_db, challenge_bp, post_challenge_results,
+    fmt_golden_route, post_golden_route, record_golden_if_match,
+    golden_daily_check, init_golden_db,
 )
 
 if not BOT_TOKEN or not CHAT_ID:
@@ -215,6 +217,9 @@ def tg_send_menu(chat_id) -> bool:
                             {"text": "🏆 Лидеры челленджа",  "callback_data": "cmd_challenge_top"},
                         ],
                         [
+                            {"text": "💎 Золотой Маршрут",   "callback_data": "cmd_golden"},
+                        ],
+                        [
                             {"text": "✈️ Операция «Тихий Вжух»", "callback_data": "cmd_operation"},
                         ],
                     ]
@@ -245,6 +250,7 @@ MENU_CALLBACKS: Dict[str, callable] = {
     "cmd_operation":   fmt_operation,
     "cmd_challenge":     fmt_daily_challenge,
     "cmd_challenge_top": fmt_challenge_leaders,
+    "cmd_golden":        fmt_golden_route,
 }
 
 
@@ -984,6 +990,9 @@ def handle_completed(data: Dict):
     # ── 3b. Зачёт челленджа дня (если маршрут совпал) ──────────
     record_challenge_if_match(pilot_name, dep, arr)
 
+    # ── 3c. Зачёт Золотого Маршрута (только в день его действия) ─
+    record_golden_if_match(pilot_name, dep, arr)
+
     # ── 4. Сообщение о посадке ─────────────────────────────────
     flight_link = (
         f"\n🔗 <a href='https://fshub.io/flight/{report_id}/report'>Открыть отчёт о рейсе</a>"
@@ -1275,6 +1284,7 @@ COMMANDS = {
     "/route":          fmt_route,
     "/challenge":      fmt_daily_challenge,
     "/challenge_top":  fmt_challenge_leaders,
+    "/golden":         fmt_golden_route,
 }
 
 # Скомпилированный паттерн для валидации YYYY-MM (один раз на уровне модуля)
@@ -1525,6 +1535,10 @@ def handle_tg_command(message: Dict):
             post_daily_challenge()
             tg_send("✅ Челлендж дня переопубликован.", chat_id)
 
+        elif sub == "golden":
+            post_golden_route()
+            tg_send("✅ Золотой Маршрут объявлен.", chat_id)
+
         elif sub == "list":
             pilots = db_op_all_pilots()
             if not pilots:
@@ -1550,6 +1564,8 @@ def handle_tg_command(message: Dict):
                 "/operation_admin digest — отправить дайджест ивента вручную\n"
                 "/operation_admin challenge — переопубликовать челлендж дня "
                 "(пересчитывается по дальности)\n"
+                "/operation_admin golden — объявить Золотой Маршрут досрочно "
+                "(маршрут и дата фиксируются при объявлении)\n"
                 "/operation_admin list",
                 chat_id,
             )
@@ -1719,6 +1735,13 @@ def init_scheduler():
     )
 
     # ─── Ежемесячные задачи ─────────────────────────────────────
+    # Золотой Маршрут падает в случайный день месяца — проверяем каждые сутки.
+    scheduler.add_job(
+        golden_daily_check,
+        "cron", hour=0, minute=5,
+        id="golden_daily_check",
+    )
+
     scheduler.add_job(
         lambda: tg_send(fmt_monthly_economy()),
         "cron", day=1, hour=9, minute=0,
@@ -2001,6 +2024,7 @@ try:
     _create_pool()
     _init_db()
     init_challenge_db()
+    init_golden_db()
     app.register_blueprint(challenge_bp)
     tg_setup_webhook()
     init_scheduler()
