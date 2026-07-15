@@ -1057,6 +1057,8 @@ OPERATION_AIRCRAFT_COEFF: Dict[str, float] = {
     "CRJ7":  1.5,
     "F28":   1.8,   # Fokker F28 Fellowship (ICAO F28)
     "MD11":  1.1,
+    "T154":  2.0,   # Tupolev Tu-154 (ICAO T154) — событие «Тихий Вжух»
+    "TU54":  2.0,   # альтернативный ICAO-код Ту-154, встречается в части сборок
 }
 OPERATION_VATSIM_BONUS = 50
 OPERATION_MAX_POINTS   = sum(pts for _, _, _, pts in OPERATION_LEGS)  # 13520
@@ -1092,6 +1094,11 @@ def op_get_aircraft_coeff(aircraft_icao: str) -> float:
         ("F-28",   1.8),   # Fokker F-28 с дефисом
         ("MD-11",  1.1),   # MD-11
         ("MD11",   1.1),   # MD11
+        ("TU-154", 2.0),   # Tupolev Tu-154 полное название с дефисом
+        ("TU154",  2.0),   # Tupolev Tu154 без дефиса
+        ("T154",   2.0),   # Ту-154 ICAO
+        ("ТУ-154", 2.0),   # кириллическое написание «Ту-154»
+        ("154",    2.0),   # Ту-154 прочие варианты (после специфичных выше)
         ("MAX",    1.3),   # B737 MAX (до 737!)
         ("B38M",   1.3),   # B737 MAX ICAO
         ("738",    1.0),   # B737-800 ICAO (до 737!)
