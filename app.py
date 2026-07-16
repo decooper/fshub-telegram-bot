@@ -30,6 +30,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 
+from events_vatsim import poll_vatsim_events
+
 # ── Вся бизнес-логика из core.py ──────────────────────────────
 from core import (
     # config
@@ -1754,6 +1756,14 @@ def init_scheduler():
         "interval", hours=1,
         id="fsa_pilot_cache_refresh",
         next_run_time=datetime.now(),  # сразу при старте
+    )
+
+    # ─── События VATSIM российского дивизиона (раз в 10 минут) ──
+    scheduler.add_job(
+        poll_vatsim_events,
+        "interval", minutes=10,
+        id="vatsim_events_poll",
+        next_run_time=datetime.now(),  # первый опрос сразу при старте
     )
 
     scheduler.add_listener(_job_listener, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
