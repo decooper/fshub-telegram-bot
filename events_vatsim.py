@@ -24,6 +24,7 @@ core.vk_send_if_channel не срабатывает. VK вызывается з�
 
 import os
 from datetime import datetime, timezone, timedelta
+from urllib.parse import quote_plus
 
 # Транспорт и инфраструктура берём из основного модуля — core.py не меняется.
 from core import session, logger, TG_BASE, db_execute, vk_send, discord_send
@@ -39,6 +40,11 @@ except ValueError:
     EVENTS_TG_THREAD_ID = 5
 
 EVENTS_DISCORD_WEBHOOK = os.environ.get("EVENTS_DISCORD_WEBHOOK", "").strip()
+
+# Публичный адрес бота — для ссылки на .ics (Apple/iOS). По умолчанию — прод-URL.
+EVENTS_PUBLIC_BASE_URL = os.environ.get(
+    "EVENTS_PUBLIC_BASE_URL", "https://fshub-bot.onrender.com"
+).strip().rstrip("/")
 
 _TABLE_READY = False
 
@@ -127,7 +133,7 @@ def _fmt_event(ev) -> str:
 
 
 # ── Отправка в топик Telegram (собственный отправитель, не core.tg_send) ─────
-def _tg_send_topic(text: str, banner: str = "") -> bool:
+def _tg_send_topic(text: str, banner: str = "", reply_markup=None) -> bool:
     if not EVENTS_TG_CHAT:
         return False
 
@@ -142,6 +148,8 @@ def _tg_send_topic(text: str, banner: str = "") -> bool:
         }
         if EVENTS_TG_THREAD_ID:
             photo_payload["message_thread_id"] = EVENTS_TG_THREAD_ID
+        if reply_markup:
+            photo_payload["reply_markup"] = reply_markup
         try:
             r = session.post(f"{TG_BASE}/sendPhoto", json=photo_payload, timeout=20)
             if r.status_code == 200:
@@ -158,6 +166,8 @@ def _tg_send_topic(text: str, banner: str = "") -> bool:
     }
     if EVENTS_TG_THREAD_ID:
         payload["message_thread_id"] = EVENTS_TG_THREAD_ID
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     try:
         r = session.post(f"{TG_BASE}/sendMessage", json=payload, timeout=20)
         if r.status_code != 200:
@@ -167,6 +177,138 @@ def _tg_send_topic(text: str, banner: str = "") -> bool:
     except Exception as e:
         logger.warning(f"[events] TG topic send error: {e}")
         return False
+
+
+def _event_times(ev):
+    """(start_compact, end_compact) в формате UTC YYYYMMDDTHHMMSSZ, либо (None, None)."""
+    s = _parse_iso(ev.get("start_time"))
+    if s is None:
+        return None, None
+    e = _parse_iso(ev.get("end_time")) or (s + timedelta(hours=1))
+    return s.strftime("%Y%m%dT%H%M%SZ"), e.strftime("%Y%m%dT%H%M%SZ")
+
+
+def _icaos(ev) -> str:
+    airports = ev.get("airports") or []
+    return ", ".join(a.get("icao", "") for a in airports if a.get("icao"))
+
+
+def _gcal_url(ev) -> str:
+    """Ссылка «добавить в Google Календарь» (URL-шаблон, без API-ключей)."""
+    start, end = _event_times(ev)
+    if not start:
+        return ""
+    link = ev.get("link") or ""
+    details = (f"{link}\n\n" if link else "") + "VATSIM RUS · VA UP!"
+    params = {
+        "action":   "TEMPLATE",
+        "text":     ev.get("name") or "VATSIM Event",
+        "dates":    f"{start}/{end}",
+        "details":  details,
+        "location": _icaos(ev),
+    }
+    q = "&".join(f"{k}={quote_plus(str(v))}" for k, v in params.items())
+    return f"https://calendar.google.com/calendar/render?{q}"
+
+
+def _ics_url(ev) -> str:
+    """Ссылка на .ics, который отдаёт сам бот (нужно для Apple/iOS)."""
+    eid = str(ev.get("id") or "").strip()
+    if not eid or not EVENTS_PUBLIC_BASE_URL:
+        return ""
+    return f"{EVENTS_PUBLIC_BASE_URL}/events/ics/{eid}.ics"
+
+
+def _tg_calendar_kb(ev):
+    """Inline-клавиатура: короткие кнопки 📅 Google и 🍎 Apple."""
+    row = []
+    gcal = _gcal_url(ev)
+    ics = _ics_url(ev)
+    if gcal:
+        row.append({"text": "📅 Google", "url": gcal})
+    if ics:
+        row.append({"text": "🍎 Apple", "url": ics})
+    return {"inline_keyboard": [row]} if row else None
+
+
+def _discord_start_line(ev) -> str:
+    """Динамическая метка времени Discord — местный пояс зрителя + отсчёт."""
+    dt = _parse_iso(ev.get("start_time"))
+    if dt is None:
+        return f"🕒 Начало: {_fmt_start(ev.get('start_time'))}"
+    unix = int(dt.timestamp())
+    return f"🕒 Начало: <t:{unix}:F> (<t:{unix}:R>)"
+
+
+def _discord_cal_line(ev) -> str:
+    parts = []
+    gcal = _gcal_url(ev)
+    ics = _ics_url(ev)
+    if gcal:
+        parts.append(f"[📅 Google]({gcal})")
+    if ics:
+        parts.append(f"[🍎 Apple]({ics})")
+    return " · ".join(parts)
+
+
+def _ics_esc(s) -> str:
+    return (
+        str(s).replace("\\", "\\\\").replace(";", "\\;")
+        .replace(",", "\\,").replace("\n", "\\n")
+    )
+
+
+def _ics_text(ev):
+    """Собирает валидный .ics (RFC 5545) с напоминанием за 1 час."""
+    start, end = _event_times(ev)
+    if not start:
+        return None
+    name = ev.get("name") or "VATSIM Event"
+    link = ev.get("link") or ""
+    eid = str(ev.get("id") or "").strip()
+    now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    desc = (f"{link} — " if link else "") + "VATSIM RUS · VA UP!"
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//VA UP//VATSIM Events//RU",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        "BEGIN:VEVENT",
+        f"UID:vatsim-{eid}@va-up.ru",
+        f"DTSTAMP:{now}",
+        f"DTSTART:{start}",
+        f"DTEND:{end}",
+        f"SUMMARY:{_ics_esc(name)}",
+        f"DESCRIPTION:{_ics_esc(desc)}",
+        f"LOCATION:{_ics_esc(_icaos(ev))}",
+    ]
+    if link:
+        lines.append(f"URL:{_ics_esc(link)}")
+    lines += [
+        "BEGIN:VALARM",
+        "TRIGGER:-PT1H",
+        "ACTION:DISPLAY",
+        f"DESCRIPTION:{_ics_esc(name)}",
+        "END:VALARM",
+        "END:VEVENT",
+        "END:VCALENDAR",
+    ]
+    return "\r\n".join(lines) + "\r\n"
+
+
+def build_ics_for_event(event_id):
+    """Ищет событие дивизиона по id и возвращает .ics-текст (для роута в app.py)."""
+    eid = str(event_id or "").strip()
+    if not eid:
+        return None
+    try:
+        for ev in _fetch_division_events():
+            if str(ev.get("id") or "").strip() == eid:
+                return _ics_text(ev)
+    except Exception as e:
+        logger.warning(f"[events] build_ics error: {e}")
+    return None
 
 
 def _banner(ev) -> str:
@@ -185,12 +327,15 @@ def _discord_send_event(ev) -> bool:
     link = ev.get("link") or "https://my.vatsim.net/events"
     airports = ev.get("airports") or []
     icaos = ", ".join(a.get("icao", "") for a in airports if a.get("icao")) or "—"
-    start = _fmt_start(ev.get("start_time"))
+    desc = f"🛫 Аэропорты: {icaos}\n{_discord_start_line(ev)}"
+    cal = _discord_cal_line(ev)
+    if cal:
+        desc += f"\n\n{cal}"
     embed = {
         "title": name[:256],
         "url": link,
         "color": _DC_EVENT_COLOR,
-        "description": f"🛫 Аэропорты: {icaos}\n🕒 Начало: {start}",
+        "description": desc,
         "footer": {"text": "VA UP! · VATSIM RUS"},
     }
     banner = _banner(ev)
@@ -271,8 +416,9 @@ def poll_vatsim_events():
 
                 text = _fmt_event(ev)
                 banner = _banner(ev)
+                kb = _tg_calendar_kb(ev)
 
-                if not tg_done and _tg_send_topic(text, banner):
+                if not tg_done and _tg_send_topic(text, banner, kb):
                     tg_done = True
                 if not vk_done and vk_send(text):
                     vk_done = True
