@@ -25,12 +25,12 @@ from collections import Counter
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 
-from events_vatsim import poll_vatsim_events
+from events_vatsim import poll_vatsim_events, build_ics_for_event
 
 # ── Вся бизнес-логика из core.py ──────────────────────────────
 from core import (
@@ -1803,6 +1803,21 @@ def home():
 @app.route("/health")
 def health():
     return jsonify({"ok": True}), 200
+
+
+@app.route("/events/ics/<event_id>.ics")
+def events_ics(event_id):
+    """Отдаёт .ics события VATSIM (для добавления в Apple/iOS-календарь)."""
+    ics = build_ics_for_event(event_id)
+    if not ics:
+        return jsonify({"error": "event not found"}), 404
+    return Response(
+        ics,
+        mimetype="text/calendar",
+        headers={
+            "Content-Disposition": f'attachment; filename="vatsim-{event_id}.ics"'
+        },
+    )
 
 def _verify_fshub_signature(payload: bytes, signature_header: str) -> bool:
     """
