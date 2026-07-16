@@ -201,7 +201,10 @@ def poll_vatsim_events():
                     )
                     tg_done, vk_done, dc_done = False, False, False
                 else:
-                    tg_done, vk_done, dc_done = bool(row[0]), bool(row[1]), bool(row[2])
+                    # Пул создан с RealDictCursor → row это словарь, читаем по именам.
+                    tg_done = bool(row["tg_sent"])
+                    vk_done = bool(row["vk_sent"])
+                    dc_done = bool(row["discord_sent"])
 
                 # Нечего досылать?
                 dc_satisfied = dc_done or not EVENTS_DISCORD_WEBHOOK
