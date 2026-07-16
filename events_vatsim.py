@@ -220,15 +220,11 @@ def _ics_url(ev) -> str:
 
 
 def _tg_calendar_kb(ev):
-    """Inline-клавиатура: короткие кнопки 📅 Google и 🍎 Apple."""
-    row = []
+    """Inline-клавиатура: одна кнопка 📅 Google Календарь."""
     gcal = _gcal_url(ev)
-    ics = _ics_url(ev)
-    if gcal:
-        row.append({"text": "📅 Google", "url": gcal})
-    if ics:
-        row.append({"text": "🍎 Apple", "url": ics})
-    return {"inline_keyboard": [row]} if row else None
+    if not gcal:
+        return None
+    return {"inline_keyboard": [[{"text": "📅 Google Календарь", "url": gcal}]]}
 
 
 def _discord_start_line(ev) -> str:
@@ -241,14 +237,10 @@ def _discord_start_line(ev) -> str:
 
 
 def _discord_cal_line(ev) -> str:
-    parts = []
     gcal = _gcal_url(ev)
-    ics = _ics_url(ev)
-    if gcal:
-        parts.append(f"[📅 Google]({gcal})")
-    if ics:
-        parts.append(f"[🍎 Apple]({ics})")
-    return " · ".join(parts)
+    if not gcal:
+        return ""
+    return f"🗓 Добавь событие в календарь: [📅 Google]({gcal})"
 
 
 def _ics_esc(s) -> str:
@@ -418,7 +410,11 @@ def poll_vatsim_events():
                 banner = _banner(ev)
                 kb = _tg_calendar_kb(ev)
 
-                if not tg_done and _tg_send_topic(text, banner, kb):
+                tg_text = text
+                if kb:
+                    tg_text = text + "\n\n🗓 Добавь событие в календарь 👇"
+
+                if not tg_done and _tg_send_topic(tg_text, banner, kb):
                     tg_done = True
                 if not vk_done and vk_send(text):
                     vk_done = True
