@@ -127,9 +127,29 @@ def _fmt_event(ev) -> str:
 
 
 # ── Отправка в топик Telegram (собственный отправитель, не core.tg_send) ─────
-def _tg_send_topic(text: str) -> bool:
+def _tg_send_topic(text: str, banner: str = "") -> bool:
     if not EVENTS_TG_CHAT:
         return False
+
+    # Есть баннер — шлём фото с подписью (лимит подписи Telegram — 1024 символа).
+    # Если фото не ушло (нет картинки/ошибка) — откатываемся на обычный текст.
+    if banner:
+        photo_payload = {
+            "chat_id": EVENTS_TG_CHAT,
+            "photo": banner,
+            "caption": text[:1024],
+            "parse_mode": "HTML",
+        }
+        if EVENTS_TG_THREAD_ID:
+            photo_payload["message_thread_id"] = EVENTS_TG_THREAD_ID
+        try:
+            r = session.post(f"{TG_BASE}/sendPhoto", json=photo_payload, timeout=20)
+            if r.status_code == 200:
+                return True
+            logger.warning(f"[events] TG sendPhoto failed, fallback to text: {r.text[:300]}")
+        except Exception as e:
+            logger.warning(f"[events] TG sendPhoto error, fallback to text: {e}")
+
     payload = {
         "chat_id": EVENTS_TG_CHAT,
         "text": text[:4096],
@@ -146,6 +166,44 @@ def _tg_send_topic(text: str) -> bool:
         return True
     except Exception as e:
         logger.warning(f"[events] TG topic send error: {e}")
+        return False
+
+
+def _banner(ev) -> str:
+    """URL баннера события, если это валидная http-ссылка, иначе пусто."""
+    b = ev.get("banner") or ""
+    return b if isinstance(b, str) and b.startswith("http") else ""
+
+
+# ── Отправка карточки события в Discord (embed с картинкой) ──────────────────
+_DC_EVENT_COLOR = 0x5865F2  # синий
+
+def _discord_send_event(ev) -> bool:
+    if not EVENTS_DISCORD_WEBHOOK:
+        return False
+    name = ev.get("name") or "СОБЫТИЕ VATSIM (RUS)"
+    link = ev.get("link") or "https://my.vatsim.net/events"
+    airports = ev.get("airports") or []
+    icaos = ", ".join(a.get("icao", "") for a in airports if a.get("icao")) or "—"
+    start = _fmt_start(ev.get("start_time"))
+    embed = {
+        "title": name[:256],
+        "url": link,
+        "color": _DC_EVENT_COLOR,
+        "description": f"🛫 Аэропорты: {icaos}\n🕒 Начало: {start}",
+        "footer": {"text": "VA UP! · VATSIM RUS"},
+    }
+    banner = _banner(ev)
+    if banner:
+        embed["image"] = {"url": banner}
+    try:
+        r = session.post(EVENTS_DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=15)
+        if r.status_code in (200, 204):
+            return True
+        logger.warning(f"[events] Discord embed failed ({r.status_code}): {r.text[:200]}")
+        return False
+    except Exception as e:
+        logger.warning(f"[events] Discord send error: {e}")
         return False
 
 
@@ -212,12 +270,13 @@ def poll_vatsim_events():
                     continue
 
                 text = _fmt_event(ev)
+                banner = _banner(ev)
 
-                if not tg_done and _tg_send_topic(text):
+                if not tg_done and _tg_send_topic(text, banner):
                     tg_done = True
                 if not vk_done and vk_send(text):
                     vk_done = True
-                if EVENTS_DISCORD_WEBHOOK and not dc_done and discord_send(text, EVENTS_DISCORD_WEBHOOK):
+                if EVENTS_DISCORD_WEBHOOK and not dc_done and _discord_send_event(ev):
                     dc_done = True
 
                 db_execute(
