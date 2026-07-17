@@ -2040,6 +2040,58 @@ def api_contest():
 
 
 # ═══════════════════════════════════════════════════════════════
+# DISCORD → TELEGRAM: уведомления о голосовой активности
+# Принимает сигнал от отдельного Discord-бота (voice notifier)
+# и публикует сообщение в тему группы @virtual_avia.
+# Секрет — из env DISCORD_VOICE_SECRET (задать в Render ДО деплоя).
+# ═══════════════════════════════════════════════════════════════
+
+VOICE_TG_CHAT   = "@virtual_avia"   # публичная группа
+VOICE_TG_THREAD = 6131              # ID темы (topic)
+
+
+@app.route("/api/discord_voice", methods=["POST"])
+def api_discord_voice():
+    secret = os.environ.get("DISCORD_VOICE_SECRET", "")
+    if not secret or request.headers.get("X-Voice-Secret", "") != secret:
+        logger.warning("discord_voice: неверный секрет")
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    try:
+        data    = request.get_json(force=True) or {}
+        event   = str(data.get("event", ""))
+        user    = str(data.get("user", "")).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        channel = str(data.get("channel", "")).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        if event == "join":
+            text = f"🔊 <b>{user}</b> зашёл в голосовой канал <b>{channel}</b>"
+        elif event == "stream":
+            text = f"🖥 <b>{user}</b> начал демонстрацию экрана в <b>{channel}</b>"
+        else:
+            return jsonify({"ok": False, "error": "unknown event"}), 400
+
+        r = session.post(
+            f"{TG_BASE}/sendMessage",
+            json={
+                "chat_id":                VOICE_TG_CHAT,
+                "message_thread_id":      VOICE_TG_THREAD,
+                "text":                   text[:4096],
+                "parse_mode":             "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=20,
+        )
+        if r.status_code != 200:
+            logger.warning(f"discord_voice send failed: {r.text}")
+            return jsonify({"ok": False, "error": "telegram send failed"}), 502
+
+        return jsonify({"ok": True})
+    except Exception as e:
+        logger.exception(f"discord_voice error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ═══════════════════════════════════════════════════════════════
 # STARTUP
 # Выполняется один раз при загрузке модуля.
 # Gunicorn с --preload загружает ДО форка воркеров.
